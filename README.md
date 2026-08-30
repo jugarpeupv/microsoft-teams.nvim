@@ -6,9 +6,7 @@ Minimal Neovim Teams chats via Microsoft Graph with a pre-consented first-party 
 
 ```lua
 {
-  "local/ms-teams.nvim",
-  dev = true,
-  dir = "~/projects/ms-teams.nvim",
+  "jugarpeupv/microsoft-teams.nvim",
   cmd = { "MSTeamsChats", "MSTeamsLogin", "MSTeamsNewChat", "MSTeamsFind" },
   keys = { { "<leader>mt", "<cmd>MSTeamsChats<cr>", desc = "Teams chats" } },
   config = function()
