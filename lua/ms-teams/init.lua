@@ -28,11 +28,23 @@ function M.setup(opts)
     end)
   end, 500)
   -- commands
-  vim.api.nvim_create_user_command("MSTeamsLogin", function() auth.login_all() end, { desc = "Teams login (read+send, 2 browser windows)" })
-  vim.api.nvim_create_user_command("MSTeamsLoginRead", function() auth.login("read") end, { desc = "Teams login read (Chat.Read)" })
-  vim.api.nvim_create_user_command("MSTeamsLoginSend", function() auth.login("send") end, { desc = "Teams login send (ChatMessage.Send)" })
+  vim.api.nvim_create_user_command("MSTeamsLogin", function() auth.login_all() end, { desc = "Teams login (single window)" })
+  vim.api.nvim_create_user_command("MSTeamsRegisterProtocol", function()
+    local script = vim.fn.fnamemodify(debug.getinfo(1, "S").source:sub(2), ":p:h:h:h") .. "/scripts/install-protocol-handler.sh"
+    vim.notify("Installing macOS protocol handler for ms-appx-web://...", vim.log.levels.INFO)
+    local out = vim.fn.system({ "bash", script })
+    if vim.v.shell_error == 0 then
+      vim.notify("MSTeams protocol handler registered successfully!", vim.log.levels.INFO)
+    else
+      vim.notify("Failed to register protocol handler: " .. out, vim.log.levels.ERROR)
+    end
+  end, { desc = "Register macOS ms-appx-web:// protocol handler" })
+  vim.api.nvim_create_user_command("MSTeamsCode", function(opts) auth.submit_code(opts.args) end, { nargs = 1, desc = "Submit OAuth code/URL manually" })
+  vim.api.nvim_create_user_command("MSTeamsLoginCancel", function() auth.cancel_login() end, { desc = "Cancel pending login" })
   vim.api.nvim_create_user_command("MSTeamsStatus", function() auth.status() end, { desc = "Teams token status" })
   vim.api.nvim_create_user_command("MSTeamsChats", function() ui.pick_chats() end, { desc = "Teams list chats" })
+  vim.api.nvim_create_user_command("MSTeamsFind", function() ui.find_chats() end, { desc = "Teams fuzzy find chats with Telescope (<C-b> toggle unread/all)" })
+  vim.api.nvim_create_user_command("MSTeamsNewChat", function() ui.new_chat() end, { desc = "Teams new chat with user via Telescope" })
   vim.api.nvim_create_user_command("MSTeamsReply", function() ui.reply() end, { desc = "Teams reply to current chat" })
   vim.api.nvim_create_user_command("MSTeamsWatchStart", function() require("ms-teams.watch").start() end, { desc = "Teams start watch (poll + terminal-notifier)" })
   vim.api.nvim_create_user_command("MSTeamsWatchStop", function() require("ms-teams.watch").stop() end, { desc = "Teams stop watch" })

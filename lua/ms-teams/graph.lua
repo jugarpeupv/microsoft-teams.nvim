@@ -21,27 +21,44 @@ local function graph_request(kind, method, path, body)
 end
 
 local function graph_request_async(kind, method, path, body, cb)
-  local token, err = auth.get_token(kind)
-  if not token then
-    vim.schedule(function() cb(nil, err) end)
-    return
-  end
-  local url = config.options.graph_base .. path
-  local cmd = { "curl", "-s", "--max-time", "30", "-X", method, url, "-H", "Authorization: Bearer " .. token, "-H", "Content-Type: application/json" }
-  if body then
-    table.insert(cmd, "-d")
-    table.insert(cmd, vim.json.encode(body))
-  end
-  vim.system(cmd, { text = true }, function(obj)
-    vim.schedule(function()
-      if obj.code ~= 0 then
-        cb(nil, obj.stderr ~= "" and obj.stderr or obj.stdout)
-        return
-      end
-      local ok, j = pcall(vim.json.decode, obj.stdout)
-      if not ok then cb(nil, obj.stdout); return end
-      if j.error then cb(nil, j.error.message or vim.inspect(j.error)); return end
-      cb(j, nil)
+  auth.ensure_token_async(kind, function(token, err)
+    if not token then
+      vim.schedule(function() cb(nil, err) end)
+      return
+    end
+    local url = config.options.graph_base .. path
+    local cmd = { "curl", "-s", "--max-time", "30", "-X", method, url, "-H", "Authorization: Bearer " .. token, "-H", "Content-Type: application/json" }
+    if body then
+      table.insert(cmd, "-d")
+      table.insert(cmd, vim.json.encode(body))
+    end
+    vim.system(cmd, { text = true }, function(obj)
+      vim.schedule(function()
+        if obj.code ~= 0 then
+          cb(nil, obj.stderr ~= "" and obj.stderr or obj.stdout)
+          return
+        end
+        local ok, j = pcall(vim.json.decode, obj.stdout)
+        if not ok then cb(nil, obj.stdout); return end
+        if j.error then
+          local emsg = j.error.message or vim.inspect(j.error)
+          -- If token was revoked/invalidated on Graph side, clear access_token expiry and trigger auth
+          if emsg:find("InvalidAuthenticationToken") or emsg:find("CompactToken") or emsg:find("Lifetime validation failed") then
+            auth.ensure_token_async(kind, function(new_tok, err_login)
+              if new_tok then
+                -- retry request once
+                graph_request_async(kind, method, path, body, cb)
+              else
+                cb(nil, emsg)
+              end
+            end)
+            return
+          end
+          cb(nil, emsg)
+          return
+        end
+        cb(j, nil)
+      end)
     end)
   end)
 end
@@ -131,6 +148,66 @@ function M.list_messages(chat_id, cb, nextLink)
   end)
 end
 
+function M.list_messages_until_read(chat_id, last_read_iso, cb)
+  local all = {}
+  local max_pages = 10 -- safety limit: up to 500 messages
+
+  local function fetch_page(path, page_num)
+    graph_request_async("read", "GET", path, nil, function(j, err)
+      if not j then
+        if #all > 0 then cb(all, nil, nil) else cb(nil, err, nil) end
+        return
+      end
+      local page_msgs = j.value or {}
+      for _, m in ipairs(page_msgs) do
+        table.insert(all, m)
+      end
+
+      local nextLink = j["@odata.nextLink"]
+      if not nextLink or nextLink == "" or page_num >= max_pages then
+        cb(all, nil, nextLink)
+        return
+      end
+
+      -- If we have last_read_iso, check if the oldest message fetched so far is older than last_read_iso
+      if last_read_iso and last_read_iso ~= "" then
+        local reached_read = false
+        for _, m in ipairs(page_msgs) do
+          local ct = m.createdDateTime
+          if ct and ct <= last_read_iso then
+            reached_read = true
+            break
+          end
+        end
+
+        if reached_read then
+          -- We have fetched past the last_read boundary.
+          -- Fetch 1 more page if available to give context before last_read, then stop.
+          local nextPath = nextLink:gsub("^https://graph.microsoft.com/v1.0", "")
+          graph_request_async("read", "GET", nextPath, nil, function(j_extra, _)
+            if j_extra and j_extra.value then
+              for _, m in ipairs(j_extra.value) do
+                table.insert(all, m)
+              end
+              cb(all, nil, j_extra["@odata.nextLink"])
+            else
+              cb(all, nil, nextLink)
+            end
+          end)
+          return
+        end
+      end
+
+      -- If no last_read or not reached yet, continue fetching next page
+      local nextPath = nextLink:gsub("^https://graph.microsoft.com/v1.0", "")
+      fetch_page(nextPath, page_num + 1)
+    end)
+  end
+
+  local initial_path = string.format("/chats/%s/messages?$top=50", chat_id)
+  fetch_page(initial_path, 1)
+end
+
 function M.get_chat(chat_id, cb)
   -- 48:notes y oneOnOne con members truncado (limit=500 quita $expand) necesitan fetch directo
   graph_request_async("read", "GET", "/chats/" .. chat_id .. "?$expand=members", nil, function(j, err)
@@ -158,25 +235,21 @@ end
 local function get_user_identity(cb)
   -- saca id/tenant del JWT (oid/tid) sin llamada extra; si falla usa /me
   local auth = require("ms-teams.auth")
-  local _ = auth.get_token("read")
-  local path = config.options.data_dir .. "/read.json"
+  local token = auth.get_token("read")
+  local path = config.options.data_dir .. "/token.json"
   if vim.fn.filereadable(path) == 1 then
     local data = vim.fn.readfile(path)
     local ok, j = pcall(vim.json.decode, table.concat(data, "\n"))
-    local tid, oid
     if ok and j and j.access_token then
       local parts = vim.split(j.access_token, ".", { plain = true })
       if #parts >= 2 then
         local b64 = parts[2]:gsub("-", "+"):gsub("_", "/")
         local pad = #b64 % 4
         if pad > 0 then b64 = b64 .. string.rep("=", 4 - pad) end
-        local ok2, js = pcall(vim.json.decode, vim.fn.system({ "python3", "-c", "import base64,sys,json;print(base64.b64decode(sys.argv[1]).decode())", b64 }))
-        if ok2 and js then
-          local ok3, pj = pcall(vim.json.decode, js)
-          if ok3 and pj and pj.tid and (pj.oid or pj.sub) then
-            cb(pj.oid or pj.sub, pj.tid, nil)
-            return
-          end
+        local ok2, js = pcall(vim.json.decode, vim.fn.system({ "python3", "-c", "import base64,sys;print(base64.b64decode(sys.argv[1]).decode())", b64 }))
+        if ok2 and js and js.tid and (js.oid or js.sub) then
+          cb(js.oid or js.sub, js.tid, nil)
+          return
         end
       end
     end
@@ -217,21 +290,150 @@ function M.mark_chat_read(chat_id, cb)
   end)
 end
 
+local function escape_html(str)
+  return str:gsub("&", "&amp;"):gsub("<", "&lt;"):gsub(">", "&gt;"):gsub('"', "&quot;")
+end
+
+local function markdown_to_teams_html(md)
+  if not md or md == "" or md == vim.NIL then return "" end
+
+  local codeblocks = {}
+  -- 1. Match multiline code blocks: ```[lang]\n[code]\n```
+  local text = md:gsub("```([%w_-]*)\n?(.-)```", function(lang, code)
+    local l = lang:gsub("^%s+", ""):gsub("%s+$", ""):lower()
+    if l == "bash" or l == "sh" or l == "zsh" or l == "shell" then
+      l = "bash"
+    elseif l == "json" then
+      l = "json"
+    elseif l == "html" or l == "xml" then
+      l = "html"
+    elseif l == "js" or l == "javascript" then
+      l = "javascript"
+    elseif l == "ts" or l == "typescript" then
+      l = "typescript"
+    elseif l == "py" or l == "python" then
+      l = "python"
+    elseif l == "cs" or l == "csharp" then
+      l = "csharp"
+    elseif l == "sql" then
+      l = "sql"
+    elseif l == "lua" then
+      l = "lua"
+    elseif l == "" then
+      l = "plaintext"
+    end
+
+    local clean_code = escape_html(code:gsub("^\n+", ""):gsub("\n+$", ""))
+    clean_code = clean_code:gsub("\n", "<br>")
+    table.insert(codeblocks, string.format('<codeblock class="%s"><code>%s</code></codeblock>', l, clean_code))
+    return "\001CB" .. #codeblocks .. "\001"
+  end)
+
+  -- 2. Inline code: `code`
+  local inlines = {}
+  text = text:gsub("`([^`\n]+)`", function(code)
+    table.insert(inlines, "<code>" .. escape_html(code) .. "</code>")
+    return "\002IN" .. #inlines .. "\002"
+  end)
+
+  -- 3. Escape normal text
+  text = escape_html(text)
+
+  -- 4. Convert newlines to <br>
+  text = text:gsub("\n", "<br>")
+
+  -- 5. Restore inline code
+  text = text:gsub("\002IN(%d+)\002", function(idx)
+    return inlines[tonumber(idx)] or ""
+  end)
+
+  -- 6. Restore codeblocks
+  text = text:gsub("\001CB(%d+)\001", function(idx)
+    return codeblocks[tonumber(idx)] or ""
+  end)
+
+  return text
+end
+
 function M.send_message(chat_id, content, cb)
-  local body = { body = { contentType = "text", content = content } }
+  local html_content = markdown_to_teams_html(content)
+  local body = { body = { contentType = "html", content = html_content } }
   graph_request_async("send", "POST", string.format("/chats/%s/messages", chat_id), body, function(j, err)
     if not j then cb(nil, err); return end
     cb(j, nil)
   end)
 end
 
-function M.mark_chat_unread(chat_id, cb)
+function M.mark_chat_unread(chat_id, last_read_time, cb)
+  if type(last_read_time) == "function" then
+    cb = last_read_time
+    last_read_time = nil
+  end
   get_user_identity(function(user_id, tenant_id, err)
     if not user_id then cb(nil, err or "could not retrieve user identity"); return end
-    local body = { user = { id = user_id, tenantId = tenant_id } }
+    local user_obj = {
+      id = user_id,
+      ["@odata.type"] = "#microsoft.graph.teamworkUserIdentity",
+      userIdentityType = "aadUser",
+    }
+    if tenant_id and tenant_id ~= "" then
+      user_obj.tenantId = tenant_id
+    end
+    local body = { user = user_obj }
+    if last_read_time and last_read_time ~= "" then
+      body.lastMessageReadDateTime = last_read_time
+    end
     graph_request_async("read", "POST", "/chats/" .. chat_id .. "/markChatUnreadForUser", body, function(j, err2)
       if j or not err2 then cb(j or {}, nil); return end
       cb(nil, err2)
+    end)
+  end)
+end
+
+function M.list_users(query, cb)
+  local path = "/users?$top=50&$select=id,displayName,mail,userPrincipalName"
+  if query and query ~= "" then
+    -- Graph search or filter
+    local q_enc = vim.fn.system({ "python3", "-c", "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))", query }):gsub("%s+", "")
+    path = string.format("/users?$top=50&$filter=startswith(displayName,'%s') or startswith(mail,'%s') or startswith(userPrincipalName,'%s')&$select=id,displayName,mail,userPrincipalName", q_enc, q_enc, q_enc)
+  end
+  graph_request_async("send", "GET", path, nil, function(j, err)
+    if not j then
+      -- fallback try with 'read' client
+      graph_request_async("read", "GET", path, nil, function(j2, err2)
+        if not j2 then cb(nil, err2 or err); return end
+        cb(j2.value or {}, nil)
+      end)
+      return
+    end
+    cb(j.value or {}, nil)
+  end)
+end
+
+function M.create_chat(target_user_id, cb)
+  get_user_identity(function(my_user_id, _, err)
+    if not my_user_id then
+      cb(nil, err or "could not get current user id")
+      return
+    end
+    local body = {
+      chatType = "oneOnOne",
+      members = {
+        {
+          ["@odata.type"] = "#microsoft.graph.aadUserConversationMember",
+          roles = { "owner" },
+          ["user@odata.bind"] = "https://graph.microsoft.com/v1.0/users('" .. my_user_id .. "')",
+        },
+        {
+          ["@odata.type"] = "#microsoft.graph.aadUserConversationMember",
+          roles = { "owner" },
+          ["user@odata.bind"] = "https://graph.microsoft.com/v1.0/users('" .. target_user_id .. "')",
+        },
+      },
+    }
+    graph_request_async("send", "POST", "/chats", body, function(j, err2)
+      if not j then cb(nil, err2); return end
+      cb(j, nil)
     end)
   end)
 end

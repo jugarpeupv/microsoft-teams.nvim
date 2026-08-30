@@ -3,30 +3,12 @@ local M = {}
 M.defaults = {
   -- single source for storage
   data_dir = vim.fn.stdpath("data") .. "/ms-teams",
-  -- two first-party clients: read (Chat.Read) + send (ChatMessage.Send)
-  -- change to own Entra ID app for write+read single token if admin consent granted
-  clients = {
-    read = {
-      client_id = "eea619ad-603a-4b03-a386-860fcc7410d1", -- Microsoft Mesh, pre-consented Chat.ReadWrite (SPA, needs Origin)
-      redirect_uri = "https://mesh.df.onecdn.static.microsoft/AuthEnd",
-      scope = "offline_access openid profile Chat.ReadWrite",
-      name = "ms-teams-read",
-      is_spa = true,
-      origin = "https://mesh.df.onecdn.static.microsoft",
-    },
-    send = {
-      client_id = "1fec8e78-bce4-4aaf-ab1b-5451cc387264", -- Microsoft Teams, pre-consented ChatMessage.Send
-      redirect_uri = "https://login.microsoftonline.com/common/oauth2/nativeclient",
-      scope = "offline_access openid profile ChatMessage.Send",
-      name = "ms-teams-send",
-    },
-    -- fallback read-only (if Mesh SPA blocked, use SalesInsights Chat.Read)
-    read_fallback = {
-      client_id = "b20d0d3a-dc90-485b-ad11-6031e769e221",
-      redirect_uri = "https://login.microsoftonline.com/common/oauth2/nativeclient",
-      scope = "offline_access openid profile Chat.Read",
-      name = "ms-teams-read-fallback",
-    },
+  -- unified first-party client: single token for read + write + send + create + mark read/unread
+  client = {
+    client_id = "a8759234-4b8b-4d94-8c0a-ee1ab73af270",
+    redirect_uri = "ms-appx-web://Microsoft.AAD.BrokerPlugin/a8759234-4b8b-4d94-8c0a-ee1ab73af270",
+    scope = "offline_access openid profile Chat.Create Chat.ReadWrite ChatMessage.Send User.Read User.ReadBasic.All",
+    name = "ms-teams",
   },
   graph_base = "https://graph.microsoft.com/v1.0",
   -- Teams: 50 chats, 50 messages per page, scroll to load more

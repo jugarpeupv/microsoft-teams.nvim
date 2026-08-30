@@ -124,6 +124,12 @@ end
 
 local function do_poll()
   if polling then return end
+  local auth = require("ms-teams.auth")
+  -- Don't trigger background watch polling if user hasn't logged in yet
+  local tok = auth.get_token("read")
+  if not tok then
+    return
+  end
   polling = true
   local graph = require("ms-teams.graph")
   local cache = require("ms-teams.cache")
@@ -209,7 +215,7 @@ function M.start(opts)
   -- vim.uv timers siguen disparando mientras el proceso nvim esté vivo (no necesita focus)
   timer:start(0, interval, vim.schedule_wrap(do_poll))
 
-  vim.notify(string.format("MSTeams watch iniciado (cada %ds) — terminal-notifier %s", interval / 1000, get_notifier() or "vim.notify"), vim.log.levels.INFO)
+  vim.notify(string.format("MSTeams watch iniciado (cada %ds) — notifier: %s", interval / 1000, get_notifier() or "vim.notify"), vim.log.levels.INFO)
   return timer
 end
 
