@@ -51,7 +51,7 @@ Requiere `brew install terminal-notifier` (fallback a `notify-send` en Linux o `
 * `:MSTeamsChats` - Lista de chats recientes con búsqueda y detalles (`gS` para mostrar más/menos)
 * `:MSTeamsFind` - Fuzzy find sobre el top 50 de chats con Telescope (por defecto todos los chats, `<C-b>` para conmutar a no leídos)
 * `:MSTeamsNewChat` - Crear / abrir un nuevo chat seleccionando usuario vía Telescope
-* `:MSTeamsReply` / `S` - Responder en el buffer de chat
+* `:MSTeamsReply` / `S` - Responder en el buffer de chat (`<C-p>` para pegar imagen del portapapeles, `<C-s>` para enviar)
 * `:MSTeamsWatchStart` / `Stop` / `Status` / `Poll` - Watch polling + notificaciones
 
 ## Storage

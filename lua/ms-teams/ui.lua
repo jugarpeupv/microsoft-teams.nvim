@@ -210,10 +210,12 @@ local function build_message_lines(m, chat)
   local b = nv(m.body) and nv(m.body.content)
   if b then body = b end
   if body == vim.NIL then body = "" end
-  -- detect <img> for image.nvim (Teams hostedContents) before stripping tags
+  -- detect <img> and replace with placeholders in-place to preserve position relative to text
   local img_srcs = {}
-  for src in body:gmatch('<img[^>]+src="([^"]+)"') do table.insert(img_srcs, src) end
-  for src in body:gmatch("<img[^>]+src='([^']+)'") do table.insert(img_srcs, src) end
+  body = body:gsub("<img[^>]+src=[\"']([^\"']+)[\"'][^>]*>", function(src)
+    table.insert(img_srcs, src)
+    return "\n\003IMG" .. #img_srcs .. "\003\n"
+  end)
 
   -- 1. Extract and preserve codeblocks: <codeblock class="Language"><code>...</code></codeblock>
   local codeblocks = {}
@@ -300,6 +302,17 @@ local function build_message_lines(m, chat)
     return "\n```" .. lang .. "\n" .. code .. "\n```\n"
   end)
 
+  -- 6. Restore image tags in their exact position
+  body = body:gsub("\003IMG(%d+)\003", function(idx)
+    local i = tonumber(idx)
+    local src = img_srcs[i] or ""
+    local b64 = src:match("/hostedContents/([^/]+)/")
+    local name = "image"
+    if b64 then name = b64:sub(1, 20) end
+    if src:lower():find("%.gif") then name = "gif" end
+    return string.format("[Image: %s - press gx to open]", name)
+  end)
+
   body = body:gsub("^%s+", ""):gsub("%s+$", "")
   local dt = format_date(nv(m.createdDateTime) or "")
   local is_unread = is_message_unread(m, chat)
@@ -333,15 +346,6 @@ local function build_message_lines(m, chat)
       for line in body:gmatch("[^\n]+") do
         table.insert(lines, "  " .. line)
       end
-    end
-    for _, src in ipairs(img_srcs) do
-      local b64 = src:match("/hostedContents/([^/]+)/")
-      local name = "image"
-      if b64 then
-        name = b64:sub(1,20)
-      end
-      if src:lower():find("%.gif") then name="gif" end
-      table.insert(lines, string.format("  [Image: %s - press gx to open]", name))
     end
   else
     if deleted then
@@ -947,7 +951,7 @@ function M.show_messages(chat, open)
     end
     table.insert(lines, "---")
     table.insert(lines, "Chat: " .. format_chat(chat) .. " | " .. #msgs .. " messages")
-    table.insert(lines, "Hints: q close | S reply | R refresh | g? participants | mr mark read | mu mark unread | gR load 50 older | <CR> jump to original")
+    table.insert(lines, "Hints: q close | S reply (<C-p> paste img) | R refresh | g? participants | mr mark read | mu mark unread | gR load 50 older | <CR> jump to original")
 
     vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
     local ns = vim.api.nvim_create_namespace("ms_teams_msg_unread")
@@ -1120,6 +1124,61 @@ function M.show_messages(chat, open)
         end)
       end)
     end
+    local function paste_image_to_compose()
+      if not compose_buf or not vim.api.nvim_buf_is_valid(compose_buf) then return end
+      local attach_dir = vim.fn.stdpath("cache") .. "/ms-teams/attachments"
+      vim.fn.mkdir(attach_dir, "p")
+      local filename = "image_" .. os.date("%Y%m%d_%H%M%S") .. ".png"
+      local filepath = attach_dir .. "/" .. filename
+
+      -- 1. Try pngpaste (fastest on macOS)
+      local out = vim.fn.system({ "pngpaste", filepath })
+      local ok_save = (vim.v.shell_error == 0 and vim.fn.filereadable(filepath) == 1 and vim.fn.getfsize(filepath) > 100)
+
+      -- 2. Fallback to osascript on macOS if pngpaste failed
+      if not ok_save then
+        local apple_script = string.format([[
+          set targetPath to POSIX file "%s"
+          try
+            set theImage to the clipboard as «class PNGf»
+            set theFile to open for access targetPath with write permission
+            set eof theFile to 0
+            write theImage to theFile
+            close access theFile
+            return "OK"
+          on error
+            try
+              close access targetPath
+            end try
+            return "ERROR"
+          end try
+        ]], filepath)
+        local osa_out = vim.fn.system({ "osascript", "-e", apple_script })
+        ok_save = (vim.v.shell_error == 0 and osa_out:find("OK") and vim.fn.filereadable(filepath) == 1 and vim.fn.getfsize(filepath) > 100)
+      end
+
+      if not ok_save then
+        vim.notify("No valid PNG image found in system clipboard (copy an image first)", vim.log.levels.WARN)
+        return
+      end
+
+      local image_markdown = string.format("![image](%s)", filepath)
+      local cur_win = vim.fn.bufwinid(compose_buf)
+      local cur_pos = cur_win ~= -1 and vim.api.nvim_win_get_cursor(cur_win) or { 1, 0 }
+      local row = cur_pos[1]
+      local cur_line = vim.api.nvim_buf_get_lines(compose_buf, row - 1, row, false)[1] or ""
+
+      if cur_line == "" then
+        vim.api.nvim_buf_set_lines(compose_buf, row - 1, row, false, { image_markdown })
+      else
+        vim.api.nvim_buf_set_lines(compose_buf, row, row, false, { image_markdown })
+        if cur_win ~= -1 then
+          pcall(vim.api.nvim_win_set_cursor, cur_win, { row + 1, 0 })
+        end
+      end
+      vim.notify("Pasted image from clipboard: " .. filename, vim.log.levels.INFO)
+    end
+
     local function open_compose()
       local cname = "ms-teams://compose/" .. safe_id_cache
       for _, b in ipairs(vim.api.nvim_list_bufs()) do
@@ -1134,6 +1193,7 @@ function M.show_messages(chat, open)
         vim.api.nvim_buf_set_option(compose_buf, "filetype", "markdown")
         vim.api.nvim_buf_set_var(compose_buf, "ms_teams_compose_chat_id", chat_id)
         vim.keymap.set({ "n", "i" }, "<C-s>", send_compose, { buffer = compose_buf, desc = "Teams send compose" })
+        vim.keymap.set({ "n", "i" }, "<C-p>", paste_image_to_compose, { buffer = compose_buf, desc = "Teams paste clipboard image" })
         vim.keymap.set("n", "q", function() vim.api.nvim_buf_delete(compose_buf, { force = true }) end, { buffer = compose_buf, desc = "Close compose" })
         vim.api.nvim_create_autocmd("BufWriteCmd", { buffer = compose_buf, callback = send_compose })
         vim.api.nvim_buf_set_lines(compose_buf, 0, -1, false, { "" })
@@ -1185,8 +1245,9 @@ function M.show_messages(chat, open)
     end, { buffer = buf, desc = "Open image or default gx" })
     vim.keymap.set("n", "mr", function()
       local cur_pos = vim.api.nvim_win_get_cursor(0)
-      vim.ui.input({ prompt = string.format("Mark whole chat '%s' as read? (y/N): ", format_chat(chat)) }, function(ans)
-        if not ans or ans:lower() ~= "y" then vim.notify("cancelled", vim.log.levels.INFO); return end
+      vim.ui.input({ prompt = string.format("Mark whole chat '%s' as read? (Y/n): ", format_chat(chat)) }, function(ans)
+        if ans and (ans:lower() == "n" or ans:lower() == "no") then vim.notify("cancelled", vim.log.levels.INFO); return end
+        if not ans then vim.notify("cancelled", vim.log.levels.INFO); return end
         require("ms-teams.graph").mark_chat_read(chat_id, function(_, err)
           local function do_local()
             require("ms-teams.cache").clear_last_read(chat_id)
@@ -1257,8 +1318,9 @@ function M.show_messages(chat, open)
         end
       end
       if is_on_message and target_msg_id then
-        vim.ui.input({ prompt = string.format("Mark message %s as unread? (y/N): ", target_msg_id:sub(1,8)) }, function(ans)
-          if not ans or ans:lower() ~= "y" then vim.notify("cancelled", vim.log.levels.INFO); return end
+        vim.ui.input({ prompt = string.format("Mark message %s as unread? (Y/n): ", target_msg_id:sub(1,8)) }, function(ans)
+          if ans and (ans:lower() == "n" or ans:lower() == "no") then vim.notify("cancelled", vim.log.levels.INFO); return end
+          if not ans then vim.notify("cancelled", vim.log.levels.INFO); return end
           local target_created = nil
           for _, m in ipairs(msgs) do
             if m ~= vim.NIL and nv(m.id) == target_msg_id then

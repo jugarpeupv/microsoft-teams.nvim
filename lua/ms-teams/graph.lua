@@ -294,12 +294,58 @@ local function escape_html(str)
   return str:gsub("&", "&amp;"):gsub("<", "&lt;"):gsub(">", "&gt;"):gsub('"', "&quot;")
 end
 
-local function markdown_to_teams_html(md)
-  if not md or md == "" or md == vim.NIL then return "" end
+local function expand_image_path(path)
+  if path:sub(1,1) == "~" then
+    local home = os.getenv("HOME") or ""
+    return home .. path:sub(2)
+  end
+  return path
+end
 
+local function read_image_base64(filepath)
+  local full_path = expand_image_path(filepath)
+  if vim.fn.filereadable(full_path) ~= 1 then return nil, "file not found" end
+  local out = vim.fn.system({"python3", "-c", "import base64,sys; sys.stdout.write(base64.b64encode(open(sys.argv[1],'rb').read()).decode())", full_path})
+  if vim.v.shell_error ~= 0 or out == "" then return nil, "base64 encoding failed" end
+  return out:gsub("%s+", ""), nil
+end
+
+local function markdown_to_teams_html(md)
+  if not md or md == "" or md == vim.NIL then return "", {} end
+
+  local hosted_contents = {}
+  local images = {}
+
+  -- 1. Match images: ![alt](filepath)
+  local text = md:gsub("!%[([^%]]*)%]%(([^%)]+)%)", function(alt, img_path)
+    local clean_path = img_path:gsub("^%s+", ""):gsub("%s+$", "")
+    local b64, _ = read_image_base64(clean_path)
+    if b64 then
+      local temp_id = tostring(#hosted_contents + 1)
+      local ext = clean_path:match("%.([%w]+)$") or "png"
+      ext = ext:lower()
+      local mime = "image/png"
+      if ext == "jpg" or ext == "jpeg" then mime = "image/jpeg"
+      elseif ext == "gif" then mime = "image/gif"
+      elseif ext == "webp" then mime = "image/webp"
+      end
+
+      table.insert(hosted_contents, {
+        ["@microsoft.graph.temporaryId"] = temp_id,
+        contentType = mime,
+        contentBytes = b64,
+      })
+
+      local img_alt = alt ~= "" and escape_html(alt) or ("image." .. ext)
+      table.insert(images, string.format('<img src="../hostedContents/%s/$value" alt="%s">', temp_id, img_alt))
+      return "\003IMG" .. #images .. "\003"
+    end
+    return string.format("![%s](%s)", alt, img_path)
+  end)
+
+  -- 2. Match multiline code blocks: ```[lang]\n[code]\n```
   local codeblocks = {}
-  -- 1. Match multiline code blocks: ```[lang]\n[code]\n```
-  local text = md:gsub("```([%w_-]*)\n?(.-)```", function(lang, code)
+  text = text:gsub("```([%w_-]*)\n?(.-)```", function(lang, code)
     local l = lang:gsub("^%s+", ""):gsub("%s+$", ""):lower()
     if l == "bash" or l == "sh" or l == "zsh" or l == "shell" then
       l = "bash"
@@ -329,35 +375,43 @@ local function markdown_to_teams_html(md)
     return "\001CB" .. #codeblocks .. "\001"
   end)
 
-  -- 2. Inline code: `code`
+  -- 3. Inline code: `code`
   local inlines = {}
   text = text:gsub("`([^`\n]+)`", function(code)
     table.insert(inlines, "<code>" .. escape_html(code) .. "</code>")
     return "\002IN" .. #inlines .. "\002"
   end)
 
-  -- 3. Escape normal text
+  -- 4. Escape normal text
   text = escape_html(text)
 
-  -- 4. Convert newlines to <br>
+  -- 5. Convert newlines to <br>
   text = text:gsub("\n", "<br>")
 
-  -- 5. Restore inline code
+  -- 6. Restore inline code
   text = text:gsub("\002IN(%d+)\002", function(idx)
     return inlines[tonumber(idx)] or ""
   end)
 
-  -- 6. Restore codeblocks
+  -- 7. Restore codeblocks
   text = text:gsub("\001CB(%d+)\001", function(idx)
     return codeblocks[tonumber(idx)] or ""
   end)
 
-  return text
+  -- 8. Restore image tags
+  text = text:gsub("\003IMG(%d+)\003", function(idx)
+    return images[tonumber(idx)] or ""
+  end)
+
+  return text, hosted_contents
 end
 
 function M.send_message(chat_id, content, cb)
-  local html_content = markdown_to_teams_html(content)
+  local html_content, hosted_contents = markdown_to_teams_html(content)
   local body = { body = { contentType = "html", content = html_content } }
+  if hosted_contents and #hosted_contents > 0 then
+    body.hostedContents = hosted_contents
+  end
   graph_request_async("send", "POST", string.format("/chats/%s/messages", chat_id), body, function(j, err)
     if not j then cb(nil, err); return end
     cb(j, nil)
