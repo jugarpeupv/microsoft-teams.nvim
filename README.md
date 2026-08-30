@@ -9,10 +9,14 @@ Minimal Neovim Teams chats via Microsoft Graph with a pre-consented first-party 
   "local/ms-teams.nvim",
   dev = true,
   dir = "~/projects/ms-teams.nvim",
-  cmd = { "MSTeamsChats", "MSTeamsLogin", "MSTeamsNewChat" },
+  cmd = { "MSTeamsChats", "MSTeamsLogin", "MSTeamsNewChat", "MSTeamsFind" },
   keys = { { "<leader>mt", "<cmd>MSTeamsChats<cr>", desc = "Teams chats" } },
   config = function()
-    require("ms-teams").setup()
+    require("ms-teams").setup({
+      highlights = {
+        unread = "DiagnosticInfo", -- grupo de highlight para mensajes/chats no leídos
+      },
+    })
   end,
 }
 ```

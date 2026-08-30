@@ -18,6 +18,10 @@ M.defaults = {
   -- date display for messages, e.g. Madrid HH:MM DD/MM/YYYY (Europe/Madrid UTC+2 summer, UTC+1 winter)
   date_format = "%H:%M %d/%m/%Y",
   timezone = "Europe/Madrid", -- nil = local, "UTC", or IANA like "Europe/Madrid"
+  -- highlights: group used for unread chats/messages (defaults to "DiagnosticInfo")
+  highlights = {
+    unread = "DiagnosticInfo",
+  },
   -- watch: polling while nvim is open (works even if focus is on Chrome)
   watch = {
     enabled = false, -- set true to autostart on setup()
