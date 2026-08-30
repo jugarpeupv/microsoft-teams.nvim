@@ -199,6 +199,56 @@ local function set_listed_scratch(buf, name)
   end
 end
 
+local function parse_html_table_to_markdown(tbl_html)
+  local rows = {}
+  for tr in tbl_html:gmatch("<tr[^>]*>(.-)</tr>") do
+    local cells = {}
+    for td in tr:gmatch("<t[hd][^>]*>(.-)</t[hd]>") do
+      local c = td
+      c = c:gsub("<strong[^>]*>(.-)</strong>", "**%1**")
+      c = c:gsub("<b[^>]*>(.-)</b>", "**%1**")
+      c = c:gsub("<em[^>]*>(.-)</em>", "_%1_")
+      c = c:gsub("<i[^>]*>(.-)</i>", "_%1_")
+      c = c:gsub("<code[^>]*>(.-)</code>", "`%1`")
+      c = c:gsub("<br%s*/?>", " ")
+      c = c:gsub("<[^>]+>", "")
+      c = c:gsub("&nbsp;", " "):gsub("&amp;", "&"):gsub("&lt;", "<"):gsub("&gt;", ">"):gsub("&quot;", '"')
+      c = c:gsub("\226\128\131", " ")
+      c = c:gsub("\n", " "):gsub("|", "\\|")
+      c = c:gsub("^%s+", ""):gsub("%s+$", "")
+      table.insert(cells, c)
+    end
+    if #cells > 0 then
+      table.insert(rows, cells)
+    end
+  end
+
+  if #rows == 0 then return "" end
+
+  local max_cols = 0
+  for _, r in ipairs(rows) do
+    if #r > max_cols then max_cols = #r end
+  end
+  if max_cols == 0 then return "" end
+
+  for _, r in ipairs(rows) do
+    while #r < max_cols do table.insert(r, "") end
+  end
+
+  local md_lines = {}
+  local header = rows[1]
+  table.insert(md_lines, "| " .. table.concat(header, " | ") .. " |")
+  local seps = {}
+  for _ = 1, max_cols do table.insert(seps, "---") end
+  table.insert(md_lines, "| " .. table.concat(seps, " | ") .. " |")
+
+  for i = 2, #rows do
+    table.insert(md_lines, "| " .. table.concat(rows[i], " | ") .. " |")
+  end
+
+  return "\n" .. table.concat(md_lines, "\n") .. "\n"
+end
+
 -- helper: build lines for a single message, returns { lines, is_unread, id, reply_target }
 local function build_message_lines(m, chat)
   if m == vim.NIL or m == nil then return nil end
@@ -217,7 +267,15 @@ local function build_message_lines(m, chat)
     return "\n\003IMG" .. #img_srcs .. "\003\n"
   end)
 
-  -- 1. Extract and preserve codeblocks: <codeblock class="Language"><code>...</code></codeblock>
+  -- 1. Extract and preserve tables: <table>...</table>
+  local tables = {}
+  body = body:gsub("<table[^>]*>(.-)</table>", function(tbl_content)
+    local md_table = parse_html_table_to_markdown("<table>" .. tbl_content .. "</table>")
+    table.insert(tables, md_table)
+    return "\n\004TBL" .. #tables .. "\004\n"
+  end)
+
+  -- 2. Extract and preserve codeblocks: <codeblock class="Language"><code>...</code></codeblock>
   local codeblocks = {}
   body = body:gsub("<codeblock%s*class=[\"']([^\"']*)[\"'][^>]*>%s*<code>(.-)</code>%s*</codeblock>", function(lang, code)
     table.insert(codeblocks, { lang = lang or "", code = code })
@@ -228,14 +286,14 @@ local function build_message_lines(m, chat)
     return "\001CB" .. #codeblocks .. "\001"
   end)
 
-  -- 2. Extract and preserve inline code: <code>...</code>
+  -- 3. Extract and preserve inline code: <code>...</code>
   local inline_codes = {}
   body = body:gsub("<code>(.-)</code>", function(code)
     table.insert(inline_codes, code)
     return "\002IN" .. #inline_codes .. "\002"
   end)
 
-  -- 3. Handle emojis & structure tags
+  -- 4. Handle emojis & structure tags
   body = body:gsub('<emoji[^>]+alt="([^"]+)"[^>]*></emoji>', "%1")
   body = body:gsub("<emoji[^>]+alt='([^']+)'[^>]*></emoji>", "%1")
   body = body:gsub('<emoji[^>]+alt="([^"]+)"[^>]*/>', "%1")
@@ -245,7 +303,7 @@ local function build_message_lines(m, chat)
   body = body:gsub("&nbsp;", " "):gsub("&amp;", "&"):gsub("&lt;", "<"):gsub("&gt;", ">"):gsub("&quot;", '"')
   body = body:gsub("\226\128\131", " ") -- U+2003 em space
 
-  -- 4. Restore inline codes
+  -- 5. Restore inline codes
   body = body:gsub("\002IN(%d+)\002", function(idx)
     local code = inline_codes[tonumber(idx)] or ""
     code = code:gsub("<[^>]+>", "")
@@ -255,7 +313,7 @@ local function build_message_lines(m, chat)
     return "`" .. code .. "`"
   end)
 
-  -- 5. Restore codeblocks with markdown triple backticks
+  -- 6. Restore codeblocks with markdown triple backticks
   body = body:gsub("\001CB(%d+)\001", function(idx)
     local item = codeblocks[tonumber(idx)]
     if not item then return "" end
@@ -302,7 +360,7 @@ local function build_message_lines(m, chat)
     return "\n```" .. lang .. "\n" .. code .. "\n```\n"
   end)
 
-  -- 6. Restore image tags in their exact position
+  -- 7. Restore image tags in their exact position
   body = body:gsub("\003IMG(%d+)\003", function(idx)
     local i = tonumber(idx)
     local src = img_srcs[i] or ""
@@ -311,6 +369,11 @@ local function build_message_lines(m, chat)
     if b64 then name = b64:sub(1, 20) end
     if src:lower():find("%.gif") then name = "gif" end
     return string.format("[Image: %s - press gx to open]", name)
+  end)
+
+  -- 8. Restore Markdown tables
+  body = body:gsub("\004TBL(%d+)\004", function(idx)
+    return tables[tonumber(idx)] or ""
   end)
 
   body = body:gsub("^%s+", ""):gsub("%s+$", "")
@@ -575,7 +638,7 @@ function M.pick_chats()
       .. (current_filter and current_filter ~= "" and ' | filter: "' .. current_filter .. '"' or "")
       .. (show_unread_only and " - unread only" or "")
       .. (is_cached and " - cached" or "") .. (is_filtering and " - meeting included" or (vim.g.ms_teams_show_meeting and "" or " - meeting hidden, M to show")) .. ")"
-    local lines = { header, "", "Press <CR> replace, <C-s> split, <C-v> vsplit, / search, U unread, M meeting, gS show more/less, R refresh, <C-x> hide, q close", "" }
+    local lines = { header, "", "Press <CR> replace, <C-s> split, <C-v> vsplit, g/ search, U unread, M meeting, gS show more/less, R refresh, <C-x> hide, q close", "" }
     local line_to_chat = {}
     local unread_lines = {}
     for _, chat in ipairs(display) do
@@ -604,7 +667,7 @@ function M.pick_chats()
     vim.keymap.set("n", "<CR>", function() open_for(vim.api.nvim_win_get_cursor(0)[1],"current") end, {buffer=buf})
     vim.keymap.set("n", "<C-s>", function() open_for(vim.api.nvim_win_get_cursor(0)[1],"split") end, {buffer=buf})
     vim.keymap.set("n", "<C-v>", function() open_for(vim.api.nvim_win_get_cursor(0)[1],"vsplit") end, {buffer=buf})
-    vim.keymap.set("n", "/", function()
+    vim.keymap.set("n", "g/", function()
       vim.ui.input({prompt="Search chats (name): "}, function(q)
         if not q then return end
         local q_raw = q

@@ -1,4 +1,4 @@
-# ms-teams.nvim
+# microsoft-teams.nvim
 
 Minimal Neovim Teams chats via Microsoft Graph with a pre-consented first-party client (`a8759234-4b8b-4d94-8c0a-ee1ab73af270`), single login with `Chat.ReadWrite`, `ChatMessage.Send`, `Chat.Create` and `User.ReadBasic.All`.
 
