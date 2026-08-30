@@ -110,11 +110,14 @@ local function format_chat(chat)
         local email = nv(valid[1].email) or ""
         local short = nv(chat.id) and nv(chat.id):sub(1,8) or ""
         -- Graph con $expand=members y limit=500 trunca a 1 miembro en muchos oneOnOne
-        -- en vez de "Julio (You)" confuso, mostramos shortId y el plugin lo enriquecerá async vía GET /chats/{id}
-        local me_tmp2 = get_me(); local me_n2 = me_tmp2 and me_tmp2.displayName; if n == me_n2 then
-          if email:lower() == "user@example.com" then
-            -- si ya enriquecido, valid==1 real es self; si no, es incompleto -> hint
-            -- el enriquecimiento async lo corregirá a "Harut ..." si corresponde
+        -- si el único miembro coincide con el usuario actual autenticado (get_me), mostramos shortId
+        -- y el plugin lo enriquecerá async vía GET /chats/{id}
+        local me_tmp2 = get_me()
+        local me_n2 = me_tmp2 and me_tmp2.displayName
+        local me_mail = me_tmp2 and (me_tmp2.mail or me_tmp2.userPrincipalName)
+        if n == me_n2 or (me_mail and email ~= "" and email:lower() == me_mail:lower()) then
+          if me_mail and email ~= "" and email:lower() == me_mail:lower() then
+            -- si ya enriquecido o mail coincide, es self chat; si no, es incompleto -> hint
             return n .. " (You) [" .. short .. "]"
           else
             return n .. " [" .. short .. "]"
