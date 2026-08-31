@@ -2,6 +2,19 @@ local config = require("ms-teams.config")
 
 local M = {}
 
+local function auth_log(msg, lvl)
+  local cfg = config.options or {}
+  if not (cfg.debug or cfg.auth_debug) then return end
+  lvl = lvl or vim.log.levels.DEBUG
+  local line = string.format("[%s] %s", os.date("%H:%M:%S"), msg)
+  pcall(vim.notify, "[ms-teams auth] " .. msg, lvl)
+  local path = (cfg.data_dir or vim.fn.stdpath("data") .. "/ms-teams") .. "/auth_debug.log"
+  pcall(function()
+    local f = io.open(path, "a")
+    if f then f:write(line .. "\n"); f:close() end
+  end)
+end
+
 local function get_client(_)
   return config.options.client or (config.options.clients and (config.options.clients.read or config.options.clients.send))
 end
@@ -45,6 +58,7 @@ local function auth_url(client, verifier, challenge)
 end
 
 local function exchange_code(client, code, verifier)
+  auth_log("exchange_code start code_len=" .. #code, vim.log.levels.DEBUG)
   local curl = {
     "curl", "-s", "--max-time", "30", "-X", "POST", "https://login.microsoftonline.com/common/oauth2/v2.0/token",
     "-d", "client_id=" .. client.client_id,
@@ -61,6 +75,7 @@ local function exchange_code(client, code, verifier)
     table.insert(curl, 6, "Referer: " .. client.redirect_uri)
   end
   local out = vim.fn.system(curl)
+  auth_log("exchange curl exit=" .. vim.v.shell_error .. " out_len=" .. #out .. " out=" .. out:sub(1,200), vim.log.levels.DEBUG)
   if vim.v.shell_error ~= 0 then return nil, out end
   local ok, j = pcall(vim.json.decode, out)
   if not ok then return nil, out end
@@ -199,8 +214,12 @@ function M.login(kind, cb)
   end
 
   local verifier, challenge = gen_pkce()
+  auth_log(string.format("login start kind=%s client=%s redirect=%s scope=%s", kind, client.client_id, client.redirect_uri, client.scope), vim.log.levels.INFO)
+  auth_log("pkce verifier=" .. verifier:sub(1,10) .. "... challenge=" .. challenge:sub(1,10) .. "...", vim.log.levels.DEBUG)
   local url = auth_url(client, verifier, challenge)
-  vim.fn.jobstart({ "open", url }, { detach = true })
+  auth_log("auth_url=" .. url, vim.log.levels.DEBUG)
+  local jid = vim.fn.jobstart({ "open", url }, { detach = true })
+  auth_log("jobstart open jid=" .. tostring(jid), vim.log.levels.DEBUG)
 
   vim.notify(
     string.format(
@@ -236,14 +255,18 @@ function M.login(kind, cb)
   end
 
   local function process_input_code(raw_input)
+    auth_log("process_input_code raw_len=" .. #raw_input .. " raw=" .. raw_input:sub(1,80), vim.log.levels.DEBUG)
     local code = extract_code_from_string(raw_input)
-    if not code then return false end
+    if not code then auth_log("extract_code failed", vim.log.levels.DEBUG); return false end
+    auth_log("code extracted len=" .. #code .. " prefix=" .. code:sub(1,10) .. "...", vim.log.levels.INFO)
     vim.notify(string.format("ms-teams (%s): Code detected, exchanging token...", kind), vim.log.levels.INFO)
     local tok, err = exchange_code(client, code, verifier)
     if not tok then
+      auth_log("exchange_code failed: " .. tostring(err), vim.log.levels.ERROR)
       finish(nil, err)
       return true
     end
+    auth_log("exchange_code ok scope=" .. (tok.scope or ""), vim.log.levels.INFO)
     finish(tok, nil)
     return true
   end
@@ -260,10 +283,14 @@ function M.login(kind, cb)
   }
 
   -- Poll clipboard & auth_code.txt asynchronously every 300ms without blocking Neovim
+  local poll_n = 0
   timer:start(0, 300, vim.schedule_wrap(function()
     if done then return end
+    poll_n = poll_n + 1
+    if poll_n % 20 == 0 then auth_log(string.format("poll tick %d elapsed=%ds", poll_n, os.time()-start_time), vim.log.levels.DEBUG) end
     -- Timeout after 5 minutes
     if os.time() - start_time > 300 then
+      auth_log("login timeout 5m", vim.log.levels.WARN)
       vim.notify(string.format("ms-teams (%s): Login timed out (5m)", kind), vim.log.levels.WARN)
       finish(nil, "timeout")
       return
@@ -271,13 +298,18 @@ function M.login(kind, cb)
 
     -- 1. Check auth_code.txt (written directly by MSTeamsAuthHandler.app)
     if vim.fn.filereadable(auth_code_file) == 1 then
+      auth_log("auth_code.txt readable", vim.log.levels.DEBUG)
       local lines = vim.fn.readfile(auth_code_file)
       pcall(vim.fn.delete, auth_code_file)
       if #lines > 0 and lines[1] ~= "" then
+        auth_log("auth_code.txt content len=" .. #lines[1], vim.log.levels.DEBUG)
         local matched = extract_code_from_string(lines[1])
         if matched then
+          auth_log("auth_code.txt matched code len=" .. #matched, vim.log.levels.INFO)
           process_input_code(lines[1])
           return
+        else
+          auth_log("auth_code.txt no code extracted", vim.log.levels.DEBUG)
         end
       end
     end
@@ -285,8 +317,10 @@ function M.login(kind, cb)
     -- 2. Check clipboard
     local clip = vim.fn.getreg("+") or ""
     if clip ~= "" and clip ~= initial_clip then
+      if poll_n % 20 == 0 then auth_log("clip changed len=" .. #clip .. " clip=" .. clip:sub(1,60), vim.log.levels.DEBUG) end
       local matched_code = extract_code_from_string(clip)
       if matched_code then
+        auth_log("clip matched", vim.log.levels.INFO)
         process_input_code(clip)
       end
     end

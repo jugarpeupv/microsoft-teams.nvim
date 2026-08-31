@@ -43,6 +43,7 @@ function M.setup(opts)
   vim.api.nvim_create_user_command("MSTeamsLoginCancel", function() auth.cancel_login() end, { desc = "Cancel pending login" })
   vim.api.nvim_create_user_command("MSTeamsStatus", function() auth.status() end, { desc = "Teams token status" })
   vim.api.nvim_create_user_command("MSTeamsChats", function() ui.pick_chats() end, { desc = "Teams list chats" })
+  vim.api.nvim_create_user_command("MSTeamsTeams", function() ui.pick_teams() end, { desc = "Teams list teams and channels" })
   vim.api.nvim_create_user_command("MSTeamsFind", function() ui.find_chats() end, { desc = "Teams fuzzy find chats with Telescope (<C-b> toggle unread/all)" })
   vim.api.nvim_create_user_command("MSTeamsNewChat", function() ui.new_chat() end, { desc = "Teams new chat with user via Telescope" })
   vim.api.nvim_create_user_command("MSTeamsReply", function() ui.reply() end, { desc = "Teams reply to current chat" })
@@ -58,6 +59,24 @@ function M.setup(opts)
   if config.options.watch and config.options.watch.enabled then
     vim.defer_fn(function() pcall(require("ms-teams.watch").start) end, 1000)
   end
+  vim.api.nvim_create_autocmd("VimLeavePre", {
+    callback = function()
+      pcall(function()
+        local w = require("ms-teams.watch")
+        if w.is_running and w.is_running() then w.stop() else
+          -- ensure stale lock owned by this pid is removed even if watch not running
+          local p = (config.options.data_dir or vim.fn.stdpath("data") .. "/ms-teams") .. "/watch.lock"
+          if vim.fn.filereadable(p) == 1 then
+            local ok, data = pcall(vim.fn.readfile, p)
+            if ok and data and #data>0 then
+              local ok2, j = pcall(vim.json.decode, table.concat(data,"\n"))
+              if ok2 and j and tonumber(j.pid) == vim.fn.getpid() then pcall(vim.fn.delete, p) end
+            end
+          end
+        end
+      end)
+    end,
+  })
 end
 
 return M

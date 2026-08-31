@@ -7,8 +7,8 @@ Minimal Neovim Teams chats via Microsoft Graph with a pre-consented first-party 
 ```lua
 {
   "jugarpeupv/microsoft-teams.nvim",
-  cmd = { "MSTeamsChats", "MSTeamsLogin", "MSTeamsNewChat", "MSTeamsFind" },
-  keys = { { "<leader>mt", "<cmd>MSTeamsChats<cr>", desc = "Teams chats" } },
+  cmd = { "MSTeamsChats", "MSTeamsLogin", "MSTeamsNewChat", "MSTeamsFind", "MSTeamsTeams" },
+  keys = { { "<leader>mt", "<cmd>MSTeamsChats<cr>", desc = "Teams chats" }, { "<leader>mtc", "<cmd>MSTeamsTeams<cr>", desc = "Teams & channels" } },
   config = function()
     require("ms-teams").setup({
       highlights = {
@@ -47,6 +47,7 @@ Requiere `brew install terminal-notifier` (fallback a `notify-send` en Linux o `
 * `:MSTeamsLoginCancel` - Cancelar proceso de login activo
 * `:MSTeamsStatus` - Ver estado y expiración del token
 * `:MSTeamsChats` - Lista de chats recientes con búsqueda y detalles (`gS` para mostrar más/menos)
+* `:MSTeamsTeams` - Lista de equipos y canales al estilo Microsoft Teams
 * `:MSTeamsFind` - Fuzzy find sobre el top 50 de chats con Telescope (por defecto todos los chats, `<C-b>` para conmutar a no leídos)
 * `:MSTeamsNewChat` - Crear / abrir un nuevo chat seleccionando usuario vía Telescope
 * `:MSTeamsReply` / `S` - Responder en el buffer de chat (`<C-p>` para pegar imagen del portapapeles, `<C-s>` para enviar)
@@ -60,3 +61,4 @@ Requiere `brew install terminal-notifier` (fallback a `notify-send` en Linux o `
 
 * Read/Write: `GET /me/chats`, `POST /chats/{id}/markChatReadForUser`, `POST /chats/{id}/hideForUser` (`Chat.ReadWrite`)
 * Send: `POST /chats/{id}/messages` (`ChatMessage.Send`)
+* Teams/Channels: `GET /me/joinedTeams`, `GET /teams/{team-id}/channels` (`Team.ReadBasic.All` requerido)

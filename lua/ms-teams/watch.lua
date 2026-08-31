@@ -5,6 +5,70 @@ local timer = nil
 local polling = false
 local seen = {} -- chat_id -> last preview id or createdDateTime
 local initialized = false
+local me_cache = nil
+local me_fetching = false
+local lock_owner = false
+
+local function lock_path()
+  return (config.options.data_dir or vim.fn.stdpath("data") .. "/ms-teams") .. "/watch.lock"
+end
+
+local function is_pid_alive(pid)
+  if not pid or pid <= 0 then return false end
+  local ok, uv = pcall(require, "vim.uv")
+  if not ok then uv = vim.loop end
+  if uv and uv.kill then
+    local ok2, err = pcall(uv.kill, pid, 0)
+    if ok2 then return true end
+    if err and tostring(err):find("ESRCH") then return false end
+    return false
+  end
+  -- fallback: no kill support, assume alive if recent
+  return true
+end
+
+local function read_lock()
+  local p = lock_path()
+  if vim.fn.filereadable(p) ~= 1 then return nil end
+  local ok, data = pcall(vim.fn.readfile, p)
+  if not ok or not data or #data == 0 then return nil end
+  local ok2, j = pcall(vim.json.decode, table.concat(data, "\n"))
+  if ok2 then return j end
+  return nil
+end
+
+local function is_locked()
+  local j = read_lock()
+  if not j or not j.pid then return false, nil end
+  local pid = tonumber(j.pid)
+  if not pid then return false, nil end
+  if pid == vim.fn.getpid() then return false, nil end
+  if is_pid_alive(pid) then
+    local age = os.time() - (tonumber(j.started_at) or 0)
+    local interval = (config.options.watch and config.options.watch.interval_ms or 60000) / 1000
+    if age < interval * 5 then
+      return true, j
+    end
+  end
+  return false, j
+end
+
+local function acquire_lock()
+  local p = lock_path()
+  local data = { pid = vim.fn.getpid(), started_at = os.time() }
+  pcall(vim.fn.mkdir, vim.fn.fnamemodify(p, ":h"), "p")
+  pcall(vim.fn.writefile, { vim.json.encode(data) }, p)
+  lock_owner = true
+end
+
+local function release_lock_if_owner()
+  if not lock_owner then return end
+  local j = read_lock()
+  if j and tonumber(j.pid) == vim.fn.getpid() then
+    pcall(vim.fn.delete, lock_path())
+  end
+  lock_owner = false
+end
 
 local function nv(v)
   if v == vim.NIL then return nil end
@@ -35,7 +99,7 @@ local function format_chat(chat)
 end
 
 local function strip_html(s)
-  if not s or s == "" then return "" end
+  if type(s) ~= "string" or s == "" then return "" end
   s = s:gsub("<[^>]+>", ""):gsub("&nbsp;", " "):gsub("&amp;", "&"):gsub("&lt;", "<"):gsub("&gt;", ">")
   s = s:gsub("^%s+", ""):gsub("%s+$", "")
   if #s > 200 then s = s:sub(1, 197) .. "..." end
@@ -68,6 +132,33 @@ local function has_unread(chat)
   return lu > lr
 end
 
+local function is_mentioned(preview)
+  if not config.options.watch.mentions_only then return true end
+  if not preview then return false end
+  local raw = nv(preview.body)
+  if type(raw) == "table" then raw = nv(raw.content) end
+  raw = raw or nv(preview.summary) or ""
+  local low = type(raw) == "string" and raw:lower() or ""
+  if low:find("everyone",1,true) or low:find("todos",1,true) or low:find("@channel",1,true) or low:find("@general",1,true) then
+    return true
+  end
+  if me_cache and me_cache.displayName and low:find(me_cache.displayName:lower(),1,true) then
+    return true
+  end
+  local mentions = nv(preview.mentions)
+  if mentions and type(mentions)=="table" then
+    for _, m in ipairs(mentions) do
+      if m ~= vim.NIL then
+        local mid = nv(m.id) or (nv(m.mentioned) and nv(nv(m.mentioned).id))
+        if mid and me_cache and mid == me_cache.id then return true end
+        local mname = nv(m.displayName)
+        if mname and me_cache and mname == me_cache.displayName then return true end
+      end
+    end
+  end
+  return false
+end
+
 local function get_notifier()
   local w = config.options.watch or {}
   if w.notifier == false then return nil end
@@ -85,45 +176,81 @@ end
 
 local function notify(chat, preview)
   local title = format_chat(chat)
-  local body = strip_html(nv(preview.body) or nv(preview.summary) or "")
+  local raw = nv(preview.body)
+  if type(raw) == "table" then raw = nv(raw.content) end
+  local body = strip_html(raw or nv(preview.summary) or "")
   if body == "" then body = nv(preview.messageType) or "nuevo mensaje" end
-  local from = ""
-  -- preview may have from? try to extract displayName from preview if present
-  -- fallback: use title as chat name, body as message
+  local sender = nil
+  local pf = nv(preview.from)
+  if pf then
+    local pu = nv(pf.user) or pf
+    sender = nv(pu.displayName) or nv(pf.displayName)
+  end
+  if not sender or sender == "" then
+    local fp = nv(preview.fromUser) or nv(preview.sender)
+    if fp then sender = nv(fp.displayName) or (type(fp)=="string" and fp or nil) end
+  end
+  if sender and sender ~= "" then body = sender .. ": " .. body end
+  local is_meeting = nv(chat.chatType) == "meeting"
+  local joinUrl = nv(chat.webUrl) or nv(chat.onlineMeetingUrl)
+  if is_meeting and joinUrl and joinUrl ~= "" then
+    body = body .. " — Join: " .. joinUrl
+  end
   local w = config.options.watch or {}
   local notifier = get_notifier()
 
-  if notifier == "terminal-notifier" then
-    local args = { "terminal-notifier", "-title", title, "-message", body, "-group", nv(chat.id) or title }
-    if w.sound ~= false then
-      table.insert(args, "-sound")
-      table.insert(args, w.sound or "default")
+  local function do_notify(url)
+    if notifier == "terminal-notifier" then
+      local args = { "terminal-notifier", "-title", title, "-message", body, "-group", nv(chat.id) or title }
+      if url and url ~= "" then
+        table.insert(args, "-open")
+        table.insert(args, url)
+      end
+      if w.sound ~= false then
+        table.insert(args, "-sound")
+        table.insert(args, w.sound or "default")
+      end
+      local obj = vim.system(args, { text = true }, function() end)
+      _ = obj
+    elseif notifier == "notify-send" then
+      vim.system({ "notify-send", title, body }, { text = true }, function() end)
+    else
+      local msg = string.format("%s: %s", title, body)
+      vim.schedule(function()
+        vim.notify(msg, vim.log.levels.INFO)
+      end)
     end
-    -- on click: focus neovim via activate or execute nvim
-    -- use -sender com.apple.Terminal to group; leave default
-    local obj = vim.system(args, { text = true }, function() end)
-    -- non-blocking, ignore result
-    _ = obj
-  elseif notifier == "notify-send" then
-    vim.system({ "notify-send", title, body }, { text = true }, function() end)
-  else
-    -- fallback: vim.notify (visible when back in nvim)
-    local msg = string.format("%s: %s", title, body)
-    vim.schedule(function()
-      vim.notify(msg, vim.log.levels.INFO)
-    end)
+    if w.vim_notify ~= false then
+      vim.schedule(function()
+        vim.notify(string.format("Teams: %s — %s", title, body), vim.log.levels.INFO)
+      end)
+    end
   end
 
-  -- also echo in nvim if option enabled
-  if w.vim_notify ~= false then
-    vim.schedule(function()
-      vim.notify(string.format("Teams: %s — %s", title, body), vim.log.levels.INFO)
+  if is_meeting and not joinUrl then
+    local graph = require("ms-teams.graph")
+    graph.get_chat(nv(chat.id), function(full, _)
+      local u = full and (nv(full.webUrl) or nv(full.onlineMeetingUrl)) or nil
+      if u and u ~= "" then body = body .. " — Join: " .. u end
+      do_notify(u)
     end)
+    return
   end
+  do_notify(joinUrl)
 end
 
 local function do_poll()
   if polling then return end
+  local w0 = config.options.watch or {}
+  if w0.mentions_only and not me_cache and not me_fetching then
+    me_fetching = true
+    require("ms-teams.graph").get_me(function(j, _)
+      if j then me_cache = j end
+      me_fetching = false
+      do_poll()
+    end)
+    return
+  end
   local auth = require("ms-teams.auth")
   -- Don't trigger background watch polling if user hasn't logged in yet
   local tok = auth.get_token("read")
@@ -176,7 +303,7 @@ local function do_poll()
         seen[cid] = pid
         if has_unread(chat) then
           local p = get_preview(chat)
-          if p then notify(chat, p) end
+          if p and is_mentioned(p) then notify(chat, p) end
         end
       elseif prev ~= pid then
         seen[cid] = pid
@@ -189,7 +316,7 @@ local function do_poll()
             -- sin from en preview, no podemos filtrar fiable -> notificar igual; usuario puede activar notify_self=true si quiere
           end
           local p = get_preview(chat)
-          if p then notify(chat, p) end
+          if p and is_mentioned(p) then notify(chat, p) end
         end
       end
       ::continue::
@@ -205,6 +332,11 @@ function M.start(opts)
     vim.notify("MSTeams watch ya activo", vim.log.levels.INFO)
     return timer
   end
+  local locked, info = is_locked()
+  if locked then
+    vim.notify(string.format("MSTeams watch ya activo en PID %s (hace %ds) — no se inicia segundo timer", info.pid, os.time() - (info.started_at or os.time())), vim.log.levels.WARN)
+    return nil
+  end
   local w = config.options.watch or {}
   local interval = w.interval_ms or 60000
   if interval < 10000 then interval = 10000 end -- clamp 10s min to avoid Graph throttling
@@ -214,6 +346,7 @@ function M.start(opts)
   -- Poll lo hace vim.schedule_wrap -> corre en main loop aunque el foco esté en Chrome
   -- vim.uv timers siguen disparando mientras el proceso nvim esté vivo (no necesita focus)
   timer:start(0, interval, vim.schedule_wrap(do_poll))
+  acquire_lock()
 
   vim.notify(string.format("MSTeams watch iniciado (cada %ds) — notifier: %s", interval / 1000, get_notifier() or "vim.notify"), vim.log.levels.INFO)
   return timer
@@ -228,6 +361,7 @@ function M.stop()
   timer:close()
   timer = nil
   polling = false
+  release_lock_if_owner()
   vim.notify("MSTeams watch detenido", vim.log.levels.INFO)
 end
 

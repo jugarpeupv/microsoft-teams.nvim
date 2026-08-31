@@ -35,7 +35,11 @@ local function graph_request_async(kind, method, path, body, cb)
     vim.system(cmd, { text = true }, function(obj)
       vim.schedule(function()
         if obj.code ~= 0 then
-          cb(nil, obj.stderr ~= "" and obj.stderr or obj.stdout)
+          local errmsg = "curl exit " .. tostring(obj.code)
+          if obj.stderr ~= "" then errmsg = errmsg .. " stderr: " .. obj.stderr end
+          if obj.stdout ~= "" then errmsg = errmsg .. " stdout: " .. obj.stdout:sub(1, 200) end
+          vim.notify("ms-teams graph_request_async: " .. errmsg, vim.log.levels.ERROR)
+          cb(nil, errmsg)
           return
         end
         local ok, j = pcall(vim.json.decode, obj.stdout)
@@ -277,6 +281,86 @@ function M.hide_chat(chat_id, cb)
       end)
     end)
   end)
+end
+
+function M.list_teams(cb)
+  local all = {}
+  local function fetch(url)
+    graph_request_async("read", "GET", url, nil, function(j, err)
+      if not j then
+        if #all > 0 then cb(all, nil) else cb(nil, err) end
+        return
+      end
+      for _, t in ipairs(j.value or {}) do table.insert(all, t) end
+      local nextLink = j["@odata.nextLink"]
+      if nextLink and nextLink ~= "" then
+        local path = nextLink:gsub("^https://graph.microsoft.com/v1.0", "")
+        fetch(path)
+      else
+        cb(all, nil)
+      end
+    end)
+  end
+  fetch("/me/joinedTeams?%24select=id,displayName,description,webUrl")
+end
+
+function M.list_groups(cb)
+  -- deprecated: kept for compatibility, delegates to list_teams
+  return M.list_teams(cb)
+end
+
+function M.list_channels(team_id, cb)
+  graph_request_async("read", "GET", "/teams/" .. team_id .. "/channels?$select=id,displayName,description,webUrl", nil, function(j, err)
+    if not j then cb(nil, err); return end
+    cb(j.value or {}, nil)
+  end)
+end
+
+function M.list_channel_messages(team_id, channel_id, cb, nextLink)
+  if nextLink then
+    local path = nextLink:gsub("^https://graph.microsoft.com/v1.0", "")
+    graph_request_async("read", "GET", path, nil, function(j, err)
+      if not j then cb(nil, err, nil); return end
+      cb(j.value or {}, nil, j["@odata.nextLink"])
+    end)
+    return
+  end
+  local want = config.options.message_top or 50
+  local top = math.min(want, 5)
+  local path = string.format("/chats/%s/messages?$top=%d", channel_id, top)
+  graph_request_async("read", "GET", path, nil, function(j, err)
+    if not j then cb(nil, err, nil); return end
+    cb(j.value or {}, nil, j["@odata.nextLink"])
+  end)
+end
+
+function M.list_channel_messages_until_read(team_id, channel_id, last_read_iso, cb)
+  local all = {}
+  local max_pages = 10
+  local function fetch_page(path, page_num)
+    graph_request_async("read", "GET", path, nil, function(j, err)
+      if not j then
+        if #all > 0 then cb(all, nil, nil) else cb(nil, err, nil) end
+        return
+      end
+      local page_msgs = j.value or {}
+      for _, m in ipairs(page_msgs) do table.insert(all, m) end
+      local nextLink = j["@odata.nextLink"]
+      if not nextLink or nextLink == "" or page_num >= max_pages then cb(all, nil, nextLink); return end
+      if last_read_iso and last_read_iso ~= "" then
+        local reached = false
+        for _, m in ipairs(page_msgs) do local ct = m.createdDateTime; if ct and ct <= last_read_iso then reached = true; break end end
+        if reached then
+          local nextPath = nextLink:gsub("^https://graph.microsoft.com/v1.0", "")
+          graph_request_async("read", "GET", nextPath, nil, function(j2, _) if j2 and j2.value then for _, m in ipairs(j2.value) do table.insert(all, m) end cb(all, nil, j2["@odata.nextLink"]) else cb(all, nil, nextLink) end end)
+          return
+        end
+      end
+      local nextPath = nextLink:gsub("^https://graph.microsoft.com/v1.0", "")
+      fetch_page(nextPath, page_num + 1)
+    end)
+  end
+  fetch_page(string.format("/chats/%s/messages?$top=5", channel_id), 1)
 end
 
 function M.mark_chat_read(chat_id, cb)
