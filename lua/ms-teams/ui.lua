@@ -199,6 +199,17 @@ local function set_listed_scratch(buf, name)
   end
 end
 
+local function to_ascii(s)
+  s = s:gsub("á","a"):gsub("à","a"):gsub("ä","a"):gsub("â","a"):gsub("ã","a"):gsub("å","a")
+       :gsub("Á","A"):gsub("À","A"):gsub("Ä","A"):gsub("Â","A"):gsub("Ã","A"):gsub("Å","A")
+  s = s:gsub("é","e"):gsub("è","e"):gsub("ë","e"):gsub("ê","e"):gsub("É","E"):gsub("È","E"):gsub("Ë","E"):gsub("Ê","E")
+  s = s:gsub("í","i"):gsub("ì","i"):gsub("ï","i"):gsub("î","i"):gsub("Í","I"):gsub("Ì","I"):gsub("Ï","I"):gsub("Î","I")
+  s = s:gsub("ó","o"):gsub("ò","o"):gsub("ö","o"):gsub("ô","o"):gsub("õ","o"):gsub("Ó","O"):gsub("Ò","O"):gsub("Ö","O"):gsub("Ô","O"):gsub("Õ","O")
+  s = s:gsub("ú","u"):gsub("ù","u"):gsub("ü","u"):gsub("û","u"):gsub("Ú","U"):gsub("Ù","U"):gsub("Ü","U"):gsub("Û","U")
+  s = s:gsub("ñ","n"):gsub("Ñ","N"):gsub("ç","c"):gsub("Ç","C")
+  return s
+end
+
 local function parse_html_table_to_markdown(tbl_html)
   local rows = {}
   for tr in tbl_html:gmatch("<tr[^>]*>(.-)</tr>") do
@@ -553,14 +564,62 @@ function M.pick_chats()
   local cache = require("ms-teams.cache")
   local buf = vim.api.nvim_create_buf(true, false)
   vim.api.nvim_buf_set_option(buf, "filetype", "markdown")
-  set_listed_scratch(buf, "ms-teams://chats")
+  set_listed_scratch(buf, "ms-teams://list-chats")
   local cached = cache.load("chats", 300)
   local current_filter = nil -- shown in header
   local show_all_limit = false -- toggled by gS
   local show_unread_only = false -- toggled by U
   if vim.g.ms_teams_show_meeting == nil then vim.g.ms_teams_show_meeting = true end
   local enriching = false
-  local function render_and_bind(chats, all_chats, is_cached, filter_term)
+  local teams_data = nil
+  local channels_map = {}
+  local function clean(s) local t = (nv(s) or ""):gsub("\n"," "):gsub("\r"," "); return t end
+  local function load_all_channels(teams, cb)
+    local pending = #teams
+    if pending == 0 then if cb then cb() end; return end
+    for _, team in ipairs(teams) do
+      require("ms-teams.graph").list_channels(team.id, function(channels, err)
+        channels_map[team.id] = channels or {}
+        pending = pending - 1
+        if pending == 0 and cb then cb() end
+      end)
+    end
+  end
+  local render_and_bind
+  do
+    local tc = cache.load("teams", 300)
+    if tc and tc.teams then teams_data = tc.teams; channels_map = cache.load("teams_channels") or {} end
+  end
+  vim.defer_fn(function()
+    if not teams_data then
+      require("ms-teams.graph").list_teams(function(nt, err)
+        if nt and #nt>0 then
+          teams_data = nt
+          cache.save("teams", {teams=nt})
+          load_all_channels(nt, function()
+            cache.save("teams_channels", channels_map)
+            vim.schedule(function()
+              if vim.api.nvim_buf_is_valid(buf) then
+                local ok, all = pcall(vim.api.nvim_buf_get_var, buf, "ms_teams_all_chats")
+                if ok and all then render_and_bind(all, all, false, current_filter or "") end
+              end
+            end)
+          end)
+        end
+      end)
+    else
+      load_all_channels(teams_data, function()
+        cache.save("teams_channels", channels_map)
+        vim.schedule(function()
+          if vim.api.nvim_buf_is_valid(buf) then
+            local ok, all = pcall(vim.api.nvim_buf_get_var, buf, "ms_teams_all_chats")
+            if ok and all then render_and_bind(all, all, false, current_filter or "") end
+          end
+        end)
+      end)
+    end
+  end, 300)
+  render_and_bind = function(chats, all_chats, is_cached, filter_term)
     if filter_term ~= nil then current_filter = filter_term end
     if not chats or #chats == 0 then
       -- keep header with filter info even when empty
@@ -645,20 +704,50 @@ function M.pick_chats()
       for i=1,30 do t[i]=display[i] end
       display = t
     end
+    -- teams section at top (only teams, no ##, highlight team if any channel unread)
+    local unread_by_id = {}
+    for _, c in ipairs(all_for_search) do if has_unread(c) then unread_by_id[nv(c.id)] = true end end
+    local teams_lines = {}
+    local teams_line_to_entry = {}
+    local teams_unread_lines = {}
+    if teams_data and #teams_data > 0 then
+      table.insert(teams_lines, "# Teams (" .. #teams_data .. ")")
+      local sorted_teams = vim.deepcopy(teams_data)
+      table.sort(sorted_teams, function(a,b) return (a.displayName or ""):lower() < (b.displayName or ""):lower() end)
+      for _, team in ipairs(sorted_teams) do
+        local channels = channels_map[team.id] or {}
+        local team_has_unread = false
+        for _, ch in ipairs(channels) do if ch ~= vim.NIL and unread_by_id[nv(ch.id)] then team_has_unread = true; break end end
+        table.insert(teams_lines, clean(team.displayName) .. " (" .. #channels .. ")")
+        teams_line_to_entry[#teams_lines] = {type="team", team=team}
+        if team_has_unread then teams_unread_lines[#teams_lines] = true end
+      end
+      table.insert(teams_lines, "")
+    end
     local header = "# Teams chats (" .. #display .. "/" .. #all_for_search .. " shown"
       .. (current_filter and current_filter ~= "" and ' | filter: "' .. current_filter .. '"' or "")
       .. (show_unread_only and " - unread only" or "")
       .. (is_cached and " - cached" or "") .. (is_filtering and " - meeting included" or (vim.g.ms_teams_show_meeting and "" or " - meeting hidden, M to show")) .. ")"
-    local lines = { header, "", "Press <CR> replace, <C-s> split, <C-v> vsplit, g/ search, U unread, M meeting, gS show more/less, R refresh, <C-x> hide, q close", "" }
+    local lines = {}
+    for _, l in ipairs(teams_lines) do table.insert(lines, l) end
+    table.insert(lines, header)
+    table.insert(lines, "")
+    table.insert(lines, "Press <CR> replace, <C-s> split, <C-v> vsplit, g/ search, U unread, M meeting, gS show more/less, R refresh, <C-x> hide, q close")
+    table.insert(lines, "")
     local line_to_chat = {}
+    local line_to_entry = {}
+    for lnum, entry in pairs(teams_line_to_entry) do line_to_entry[lnum] = entry end
     local unread_lines = {}
     for _, chat in ipairs(display) do
       local line = format_chat(chat)
       if nv(chat.chatType) == "meeting" then line = line .. " (meeting)" end
       table.insert(lines, line)
-      line_to_chat[#lines] = chat
-      if has_unread(chat) then unread_lines[#lines] = true end
+      local lnum = #lines
+      line_to_chat[lnum] = chat
+      line_to_entry[lnum] = {type="chat", chat=chat}
+      if has_unread(chat) then unread_lines[lnum] = true end
     end
+    for lnum,_ in pairs(teams_unread_lines) do unread_lines[lnum] = true end
     vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
     local ns = vim.api.nvim_create_namespace("ms_teams_unread")
     vim.api.nvim_buf_clear_namespace(buf, ns, 0, -1)
@@ -666,12 +755,33 @@ function M.pick_chats()
     for lnum,_ in pairs(unread_lines) do vim.api.nvim_buf_add_highlight(buf, ns, hl_group, lnum-1,0,-1) end
     vim.api.nvim_buf_set_var(buf, "ms_teams_chats", display)
     vim.api.nvim_buf_set_var(buf, "ms_teams_line_to_chat", line_to_chat)
+    vim.api.nvim_buf_set_var(buf, "ms_teams_line_to_entry", line_to_entry)
     vim.api.nvim_buf_set_var(buf, "ms_teams_all_chats", all_for_search)
     vim.api.nvim_buf_set_var(buf, "ms_teams_render_and_bind", render_and_bind)
+    vim.api.nvim_buf_set_var(buf, "ms_teams_teams", teams_data)
     if vim.api.nvim_get_current_buf() == buf then
       pcall(vim.api.nvim_win_set_cursor, 0, {5,0})
     end
     local function open_for(lnum, open)
+      local entry = line_to_entry[lnum]
+      if entry then
+        if entry.type == "channel" then
+          local ch = entry.channel
+          local team = entry.team
+          local topic = nv(ch.displayName) or ch.id
+          local chat = {id=ch.id, chatType="channel", topic=topic, teamId=nv(team.id), members={}, displayName=topic}
+          M.show_messages(chat, open)
+          return
+        elseif entry.type == "team" then
+          if open == "split" then vim.cmd("split")
+          elseif open == "vsplit" then vim.cmd("vsplit") end
+          M.pick_teams()
+          return
+        elseif entry.type == "chat" then
+          local chat = entry.chat
+          if chat and nv(chat.id) then M.show_messages(chat, open); return end
+        end
+      end
       local chat = line_to_chat[lnum]
       if not chat or nv(chat.id)==nil then vim.notify("no chat on this line",vim.log.levels.WARN); return end
       M.show_messages(chat, open)
@@ -740,8 +850,20 @@ function M.pick_chats()
       require("ms-teams.graph").list_chats(function(nc,err)
         if err then vim.notify("refresh failed: "..err,vim.log.levels.ERROR); return end
         cache.save("chats",{chats=nc})
-        render_and_bind(nc,nc,false,"")
-        vim.notify(string.format("refreshed %d chats", #nc), vim.log.levels.INFO)
+        require("ms-teams.graph").list_teams(function(nt, err2)
+          if nt and #nt>0 and not err2 then
+            teams_data = nt
+            cache.save("teams",{teams=nt})
+            load_all_channels(nt, function()
+              cache.save("teams_channels", channels_map)
+              render_and_bind(nc,nc,false,"")
+              vim.notify(string.format("refreshed %d chats + %d teams", #nc, #nt), vim.log.levels.INFO)
+            end)
+          else
+            render_and_bind(nc,nc,false,"")
+            vim.notify(string.format("refreshed %d chats", #nc), vim.log.levels.INFO)
+          end
+        end)
       end,{all=true,limit=100})
     end, {buffer=buf})
     vim.keymap.set("n", "<C-x>", function()
@@ -836,7 +958,7 @@ function M.pick_chats()
         if changed then
           cache.save("chats",{chats=new_chats})
           vim.schedule(function()
-            if vim.api.nvim_buf_is_valid(buf) and vim.api.nvim_buf_get_name(buf):find("ms%-teams://chats") then
+            if vim.api.nvim_buf_is_valid(buf) and vim.api.nvim_buf_get_name(buf):find("ms%-teams://.*chats") then
               vim.notify("chats updated (press R)",vim.log.levels.INFO)
             end
           end)
@@ -870,7 +992,7 @@ function M.update_chat_list_unread_state(chat_id, is_unread)
   local ns = vim.api.nvim_create_namespace("ms_teams_unread")
   local hl_group = get_unread_hl_group()
   for _, b in ipairs(vim.api.nvim_list_bufs()) do
-    if vim.api.nvim_buf_is_valid(b) and vim.api.nvim_buf_get_name(b):find("ms%-teams://chats") then
+    if vim.api.nvim_buf_is_valid(b) and vim.api.nvim_buf_get_name(b):find("ms%-teams://.*chats") then
       local ok_map, line_to_chat = pcall(vim.api.nvim_buf_get_var, b, "ms_teams_line_to_chat")
       if ok_map and line_to_chat then
         for lnum, c in pairs(line_to_chat) do
@@ -932,7 +1054,7 @@ function M.refresh_chats_background(cb)
       cache.save("chats", { chats = all_chats })
       vim.schedule(function()
         for _, b in ipairs(vim.api.nvim_list_bufs()) do
-          if vim.api.nvim_buf_is_valid(b) and vim.api.nvim_buf_get_name(b):find("ms%-teams://chats") then
+          if vim.api.nvim_buf_is_valid(b) and vim.api.nvim_buf_get_name(b):find("ms%-teams://.*chats") then
             local ok_render, render_fn = pcall(vim.api.nvim_buf_get_var, b, "ms_teams_render_and_bind")
             if ok_render and type(render_fn) == "function" then
               render_fn(all_chats, all_chats, false)
@@ -995,7 +1117,9 @@ function M.show_messages(chat, open)
     end
     local title = nv(chat.topic) or nv(chat.chatType) or chat_id
     local safe_id = safe_id_cache
-    set_listed_scratch(buf, "ms-teams://chat/" .. safe_id)
+    local chat_name = format_chat(chat) or title
+    local safe_name = to_ascii(chat_name):gsub("[^%w%-_ %.]", "_"):gsub("%s+", "-"):sub(1, 40)
+    set_listed_scratch(buf, "ms-teams://chat/" .. safe_name .. "__" .. safe_id)
     local HEADER_LINES = 6
     local header_suffix = is_cached and " (cached)" or ""
     local lines = { "# " .. title, "", string.format("Chat: %s | %d messages%s", chat_id, #msgs, header_suffix), "", "Press g? participants | S reply | R refresh | gR load 50 older | mr mark read | mu mark unread | q close | <CR> jump reply", "" }
@@ -1549,7 +1673,9 @@ function M.show_messages(chat, open)
   -- cache miss: show loading then fetch
   local loading_buf = vim.api.nvim_create_buf(true, false)
   vim.api.nvim_buf_set_option(loading_buf, "filetype", "markdown")
-  set_listed_scratch(loading_buf, "ms-teams://chat/" .. safe_id_cache)
+  local chat_name2 = format_chat(chat) or (nv(chat.topic) or nv(chat.chatType) or chat_id)
+  local safe_name2 = to_ascii(chat_name2):gsub("[^%w%-_ %.]", "_"):gsub("%s+", "-"):sub(1, 40)
+  set_listed_scratch(loading_buf, "ms-teams://chat/" .. safe_name2 .. "__" .. safe_id_cache)
   vim.api.nvim_buf_set_lines(loading_buf, 0, -1, false, {"# " .. (nv(chat.topic) or nv(chat.chatType) or chat_id), "", "Loading messages...", ""})
   if open == "current" then vim.api.nvim_win_set_buf(0, loading_buf)
   elseif open == "vsplit" then vim.cmd("vsplit"); vim.api.nvim_win_set_buf(0, loading_buf)
@@ -1668,43 +1794,24 @@ function M.new_chat()
     return
   end
 
-  vim.notify("Loading users from organization...", vim.log.levels.INFO)
-  graph.list_users(nil, function(users, err)
-    if err then
-      vim.notify("Failed to list users: " .. tostring(err), vim.log.levels.ERROR)
-      return
-    end
-    if not users or #users == 0 then
-      vim.notify("No users found in organization", vim.log.levels.WARN)
-      return
-    end
-
+  -- live server-side search (official Teams does typeahead via /users $filter/$search)
+  local debounce = nil
+  local cached_items = {}
+  local function to_items(users)
     local items = {}
-    for _, u in ipairs(users) do
+    for _, u in ipairs(users or {}) do
       if u ~= vim.NIL and nv(u.id) then
         local name = nv(u.displayName) or "Unknown"
         local mail = nv(u.mail) or nv(u.userPrincipalName) or ""
-        table.insert(items, {
-          id = nv(u.id),
-          name = name,
-          mail = mail,
-          display = string.format("%-30s | %s", name, mail),
-        })
+        table.insert(items, { id = nv(u.id), name = name, mail = mail, display = string.format("%-30s | %s", name, mail) })
       end
     end
-
-    pickers.new({}, {
-      prompt_title = "Teams New Chat (Select User)",
-      finder = finders.new_table({
-        results = items,
-        entry_maker = function(entry)
-          return {
-            value = entry,
-            display = entry.display,
-            ordinal = entry.name .. " " .. entry.mail,
-          }
-        end,
-      }),
+    return items
+  end
+  local finder = finders.new_table({ results = {}, entry_maker = function(entry) return { value = entry, display = entry.display, ordinal = entry.name .. " " .. entry.mail } end })
+  local picker = pickers.new({}, {
+      prompt_title = "Teams New Chat (escribe para buscar en servidor)",
+      finder = finder,
       sorter = conf.values.generic_sorter({}),
       attach_mappings = function(prompt_bufnr, map)
         actions.select_default:replace(function()
@@ -1722,10 +1829,38 @@ function M.new_chat()
             M.show_messages(chat, "split")
           end)
         end)
+        -- live server-side search as you type (like Teams typeahead)
+        local function refresh_picker(query)
+          graph.list_users(query ~= "" and query or nil, function(users, err)
+            if err then return end
+            local items = to_items(users)
+            cached_items = items
+            local picker = action_state.get_current_picker(prompt_bufnr)
+            if picker then
+              picker:refresh(finders.new_table({
+                results = items,
+                entry_maker = function(entry) return { value = entry, display = entry.display, ordinal = entry.name .. " " .. entry.mail } end,
+              }), { reset_prompt = false })
+            end
+          end)
+        end
+        vim.api.nvim_create_autocmd({ "TextChangedI", "TextChanged" }, {
+          buffer = prompt_bufnr,
+          callback = vim.schedule_wrap(function()
+            local line = action_state.get_current_line()
+            if debounce then debounce:stop(); debounce:close() end
+            debounce = vim.uv.new_timer()
+            debounce:start(300, 0, vim.schedule_wrap(function()
+              refresh_picker(line)
+              if debounce then debounce:stop(); debounce:close(); debounce=nil end
+            end))
+          end),
+        })
+        -- initial load top 50
+        refresh_picker(nil)
         return true
       end,
     }):find()
-  end)
 end
 
 function M.find_chats(opts)
@@ -1881,7 +2016,8 @@ function M.pick_teams()
   local teams_data = nil
   local channels_map = {}
   local function clean(s)
-    return (nv(s) or ""):gsub("\n", " "):gsub("\r", " ")
+    local t = (nv(s) or ""):gsub("\n", " "):gsub("\r", " ")
+    return t
   end
   local function load_all_channels(teams, cb)
     local pending = #teams
@@ -1926,33 +2062,43 @@ function M.pick_teams()
     table.sort(sorted, function(a, b)
       return (a.displayName or ""):lower() < (b.displayName or ""):lower()
     end)
+    local unread_by_id = {}
+    local cc = cache.load("chats", 300)
+    if cc and cc.chats then for _, c in ipairs(cc.chats) do if has_unread(c) then unread_by_id[nv(c.id)] = true end end end
+    local unread_lines = {}
     local count = 0
     local max_teams = show_all_limit and #sorted or math.min(#sorted, 20)
     local lnum = #lines
     for _, team in ipairs(sorted) do
       if count >= max_teams then break end
       local channels = channels_map[team.id] or {}
-      lnum = lnum + 1
+      local team_has_unread = false
+      for _, ch in ipairs(channels) do if ch ~= vim.NIL and unread_by_id[nv(ch.id)] then team_has_unread = true; break end end
       table.insert(lines, "## " .. clean(team.displayName) .. " (" .. #channels .. ")")
-      line_map[#lines] = { type = "team", team = team }
-      -- description oculto para evitar líneas largas/fuertes
+      lnum = #lines
+      line_map[lnum] = { type = "team", team = team }
+      if team_has_unread then unread_lines[lnum] = true end
       for _, ch in ipairs(channels) do
         if ch ~= vim.NIL and nv(ch.id) then
-          lnum = lnum + 1
-          table.insert(lines, "  - " .. clean(ch.displayName))
-          line_map[#lines] = { type = "channel", team = team, channel = ch }
+          table.insert(lines, clean(ch.displayName))
+          lnum = #lines
+          line_map[lnum] = { type = "channel", team = team, channel = ch }
+          if unread_by_id[nv(ch.id)] then unread_lines[lnum] = true end
         end
       end
       if #channels == 0 then
-        lnum = lnum + 1
         table.insert(lines, "  _no channels_")
         line_map[#lines] = { type = "team", team = team }
       end
-      lnum = lnum + 1
       table.insert(lines, "")
+      lnum = #lines
       count = count + 1
     end
     vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+    local ns = vim.api.nvim_create_namespace("ms_teams_unread")
+    vim.api.nvim_buf_clear_namespace(buf, ns, 0, -1)
+    local hl_group = get_unread_hl_group()
+    for l, _ in pairs(unread_lines) do vim.api.nvim_buf_add_highlight(buf, ns, hl_group, l-1, 0, -1) end
     vim.api.nvim_buf_set_var(buf, "ms_teams_teams", teams)
     vim.api.nvim_buf_set_var(buf, "ms_teams_render_and_bind", render_and_bind)
   end

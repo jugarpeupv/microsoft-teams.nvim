@@ -5,6 +5,7 @@ local ui = require("ms-teams.ui")
 local M = {}
 
 function M.setup(opts)
+  vim.opt.hidden = true
   config.setup(opts)
   -- cache /me for is_from_me (no hardcode)
   vim.defer_fn(function()

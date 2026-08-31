@@ -3,6 +3,15 @@ local auth = require("ms-teams.auth")
 
 local M = {}
 
+local function url_encode(s)
+  if not s then return "" end
+  s = tostring(s)
+  s = s:gsub("[^%w%-%.%_~]", function(c)
+    return string.format("%%%02X", string.byte(c))
+  end)
+  return s
+end
+
 local function graph_request(kind, method, path, body)
   local token, err = auth.get_token(kind)
   if not token then return nil, err end
@@ -35,7 +44,7 @@ local function graph_request_async(kind, method, path, body, cb)
     vim.system(cmd, { text = true }, function(obj)
       vim.schedule(function()
         if obj.code ~= 0 then
-          local errmsg = "curl exit " .. tostring(obj.code)
+          local errmsg = "curl exit " .. tostring(obj.code) .. " url: " .. url:sub(1, 300)
           if obj.stderr ~= "" then errmsg = errmsg .. " stderr: " .. obj.stderr end
           if obj.stdout ~= "" then errmsg = errmsg .. " stdout: " .. obj.stdout:sub(1, 200) end
           vim.notify("ms-teams graph_request_async: " .. errmsg, vim.log.levels.ERROR)
@@ -531,9 +540,8 @@ end
 function M.list_users(query, cb)
   local path = "/users?$top=50&$select=id,displayName,mail,userPrincipalName"
   if query and query ~= "" then
-    -- Graph search or filter
-    local q_enc = vim.fn.system({ "python3", "-c", "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))", query }):gsub("%s+", "")
-    path = string.format("/users?$top=50&$filter=startswith(displayName,'%s') or startswith(mail,'%s') or startswith(userPrincipalName,'%s')&$select=id,displayName,mail,userPrincipalName", q_enc, q_enc, q_enc)
+    local q_enc = url_encode(query)
+    path = "/users?$top=50&$filter=startswith(displayName,'" .. q_enc .. "')%20or%20startswith(mail,'" .. q_enc .. "')%20or%20startswith(userPrincipalName,'" .. q_enc .. "')&$select=id,displayName,mail,userPrincipalName"
   end
   graph_request_async("send", "GET", path, nil, function(j, err)
     if not j then
