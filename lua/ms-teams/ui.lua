@@ -571,6 +571,7 @@ function M.pick_chats()
   local show_unread_only = false -- toggled by U
   if vim.g.ms_teams_show_meeting == nil then vim.g.ms_teams_show_meeting = true end
   local enriching = false
+  local enriched = {}
   local teams_data = nil
   local channels_map = {}
   local function clean(s) local t = (nv(s) or ""):gsub("\n"," "):gsub("\r"," "); return t end
@@ -620,6 +621,7 @@ function M.pick_chats()
     end
   end, 300)
   render_and_bind = function(chats, all_chats, is_cached, filter_term)
+    local cur_lnum = vim.api.nvim_win_get_cursor(0)[1]
     if filter_term ~= nil then current_filter = filter_term end
     if not chats or #chats == 0 then
       -- keep header with filter info even when empty
@@ -760,7 +762,41 @@ function M.pick_chats()
     vim.api.nvim_buf_set_var(buf, "ms_teams_render_and_bind", render_and_bind)
     vim.api.nvim_buf_set_var(buf, "ms_teams_teams", teams_data)
     if vim.api.nvim_get_current_buf() == buf then
-      pcall(vim.api.nvim_win_set_cursor, 0, {5,0})
+      pcall(vim.api.nvim_win_set_cursor, 0, {math.max(1, math.min(cur_lnum, #lines)), 0})
+    end
+    -- enrich oneOnOne chats that still show as oneOnOne due to $expand=lastMessagePreview only (no members)
+    do
+      local to_fetch = {}
+      for _, c in ipairs(all_for_search) do
+        if nv(c.chatType) == "oneOnOne" then
+          local fmt = format_chat(c)
+          if fmt:match("^oneOnOne") and not enriched[nv(c.id)] then table.insert(to_fetch, c) end
+        end
+      end
+      if #to_fetch > 0 and not enriching then
+        enriching = true
+        local pending = #to_fetch
+        for _, c in ipairs(to_fetch) do
+          enriched[nv(c.id)] = true
+          require("ms-teams.graph").get_chat(nv(c.id), function(full, err)
+            if full and nv(full.members) and type(nv(full.members)) == "table" then c.members = nv(full.members)
+            elseif full and full.members then c.members = full.members end
+            pending = pending - 1
+            if pending == 0 then
+              enriching = false
+              vim.schedule(function()
+                if vim.api.nvim_buf_is_valid(buf) then
+                  local okAll, _ = pcall(vim.api.nvim_buf_get_var, buf, "ms_teams_all_chats")
+                  if okAll then
+                    pcall(require("ms-teams.cache").save, "chats", {chats=all_for_search})
+                    render_and_bind(all_for_search, all_for_search, false, current_filter or "")
+                  end
+                end
+              end)
+            end
+          end)
+        end
+      end
     end
     local function open_for(lnum, open)
       local entry = line_to_entry[lnum]
@@ -991,6 +1027,7 @@ end
 function M.update_chat_list_unread_state(chat_id, is_unread)
   local ns = vim.api.nvim_create_namespace("ms_teams_unread")
   local hl_group = get_unread_hl_group()
+  local now_iso = os.date("!%Y-%m-%dT%H:%M:%SZ")
   for _, b in ipairs(vim.api.nvim_list_bufs()) do
     if vim.api.nvim_buf_is_valid(b) and vim.api.nvim_buf_get_name(b):find("ms%-teams://.*chats") then
       local ok_map, line_to_chat = pcall(vim.api.nvim_buf_get_var, b, "ms_teams_line_to_chat")
@@ -1003,7 +1040,7 @@ function M.update_chat_list_unread_state(chat_id, is_unread)
             if is_unread then
               c.viewpoint.lastMessageReadDateTime = "1970-01-01T00:00:00Z"
             else
-              c.viewpoint.lastMessageReadDateTime = os.date("!%Y-%m-%dT%H:%M:%SZ")
+              c.viewpoint.lastMessageReadDateTime = now_iso
             end
             vim.api.nvim_buf_clear_namespace(b, ns, lnum - 1, lnum)
             if is_unread then
@@ -1022,11 +1059,31 @@ function M.update_chat_list_unread_state(chat_id, is_unread)
             if is_unread then
               c.viewpoint.lastMessageReadDateTime = "1970-01-01T00:00:00Z"
             else
-              c.viewpoint.lastMessageReadDateTime = os.date("!%Y-%m-%dT%H:%M:%SZ")
+              c.viewpoint.lastMessageReadDateTime = now_iso
             end
           end
         end
       end
+    end
+  end
+  -- Persist to chats cache so reopening MSTeamsChats keeps the new state
+  local ok_cache, cache = pcall(require, "ms-teams.cache")
+  if ok_cache and cache then
+    local ok_load, loaded = pcall(cache.load, "chats")
+    if ok_load and loaded and loaded.chats then
+      local changed = false
+      for _, c in ipairs(loaded.chats) do
+        if nv(c.id) == chat_id then
+          c.viewpoint = c.viewpoint or {}
+          if c.viewpoint == vim.NIL then c.viewpoint = {} end
+          local new_val = is_unread and "1970-01-01T00:00:00Z" or now_iso
+          if nv(c.viewpoint.lastMessageReadDateTime) ~= new_val then
+            c.viewpoint.lastMessageReadDateTime = new_val
+            changed = true
+          end
+        end
+      end
+      if changed then pcall(cache.save, "chats", loaded) end
     end
   end
 end
@@ -1500,10 +1557,11 @@ function M.show_messages(chat, open)
         if not ans then vim.notify("cancelled", vim.log.levels.INFO); return end
         require("ms-teams.graph").mark_chat_read(chat_id, function(_, err)
           local function do_local()
-            require("ms-teams.cache").clear_last_read(chat_id)
+            local now_iso = os.date("!%Y-%m-%dT%H:%M:%SZ")
+            require("ms-teams.cache").set_last_read(chat_id, now_iso)
             chat.viewpoint = chat.viewpoint or {}
             if chat.viewpoint == vim.NIL then chat.viewpoint = {} end
-            chat.viewpoint.lastMessageReadDateTime = os.date("!%Y-%m-%dT%H:%M:%SZ")
+            chat.viewpoint.lastMessageReadDateTime = now_iso
             -- Immediately update highlight on existing chats list buffer
             M.update_chat_list_unread_state(chat_id, false)
             vim.schedule(function()

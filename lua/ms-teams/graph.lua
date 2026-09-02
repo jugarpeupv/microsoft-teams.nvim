@@ -16,7 +16,7 @@ local function graph_request(kind, method, path, body)
   local token, err = auth.get_token(kind)
   if not token then return nil, err end
   local url = config.options.graph_base .. path
-  local curl = { "curl", "-s", "--max-time", "30", "-X", method, url, "-H", "Authorization: Bearer " .. token, "-H", "Content-Type: application/json" }
+  local curl = { "curl", "-s", "--max-time", "60", "-X", method, url, "-H", "Authorization: Bearer " .. token, "-H", "Content-Type: application/json" }
   if body then
     table.insert(curl, "-d")
     table.insert(curl, vim.json.encode(body))
@@ -36,7 +36,7 @@ local function graph_request_async(kind, method, path, body, cb)
       return
     end
     local url = config.options.graph_base .. path
-    local cmd = { "curl", "-s", "--max-time", "30", "-X", method, url, "-H", "Authorization: Bearer " .. token, "-H", "Content-Type: application/json" }
+    local cmd = { "curl", "-s", "--max-time", "60", "-X", method, url, "-H", "Authorization: Bearer " .. token, "-H", "Content-Type: application/json" }
     if body then
       table.insert(cmd, "-d")
       table.insert(cmd, vim.json.encode(body))
@@ -80,7 +80,7 @@ function M.list_chats(cb, opts)
   opts = opts or {}
   local top = opts.top or config.options.chat_top
   local do_all = opts.all or false
-  local expand = "$expand=members,lastMessagePreview"
+  local expand = "$expand=lastMessagePreview"
   if not do_all then
     graph_request_async("read", "GET", "/me/chats?$top=" .. top .. "&" .. expand, nil, function(j, err)
       if not j then cb(nil, err); return end

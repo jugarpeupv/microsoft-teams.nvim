@@ -1,4 +1,5 @@
 local config = require("ms-teams.config")
+local ui = require("ms-teams.ui")
 local M = {}
 
 local timer = nil
@@ -297,28 +298,23 @@ local function do_poll()
       if not cid then goto continue end
       local pid = preview_id(chat)
       if not pid then goto continue end
-      local prev = seen[cid]
-      if prev == nil then
-        -- new chat apareció
-        seen[cid] = pid
-        if has_unread(chat) then
-          local p = get_preview(chat)
-          if p and is_mentioned(p) then notify(chat, p) end
-        end
-      elseif prev ~= pid then
-        seen[cid] = pid
-        -- sólo notificar si realmente es unread y no es nuestro propio mensaje si se desea filtrar
-        if has_unread(chat) then
-          -- opcional: filtrar mensajes propios si we can detect sender
-          -- preview doesn't contain full from, but we can check if viewpoint changed? para v1 no filtramos
-          if w.notify_self == false then
-            -- heuristic: if lastMessagePreview from self, lastMessagePreview is still > lr but we sent it
-            -- sin from en preview, no podemos filtrar fiable -> notificar igual; usuario puede activar notify_self=true si quiere
-          end
-          local p = get_preview(chat)
-          if p and is_mentioned(p) then notify(chat, p) end
-        end
-      end
+       local prev = seen[cid]
+       if prev == nil then
+         -- new chat apareció
+         seen[cid] = pid
+         if has_unread(chat) then
+           ui.update_chat_list_unread_state(cid, true)
+           local p = get_preview(chat)
+           if p and is_mentioned(p) then notify(chat, p) end
+         end
+       elseif prev ~= pid then
+         seen[cid] = pid
+         if has_unread(chat) then
+           ui.update_chat_list_unread_state(cid, true)
+           local p = get_preview(chat)
+           if p and is_mentioned(p) then notify(chat, p) end
+         end
+       end
       ::continue::
     end
   end, { all = true, limit = limit, top = top })
