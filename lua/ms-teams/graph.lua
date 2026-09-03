@@ -52,7 +52,14 @@ local function graph_request_async(kind, method, path, body, cb)
           return
         end
         local ok, j = pcall(vim.json.decode, obj.stdout)
-        if not ok then cb(nil, obj.stdout); return end
+        if not ok then
+          if (not obj.stdout or obj.stdout == "" or vim.trim(obj.stdout) == "") and obj.code == 0 then
+            cb({}, nil)
+            return
+          end
+          cb(nil, obj.stdout)
+          return
+        end
         if j.error then
           local emsg = j.error.message or vim.inspect(j.error)
           -- If token was revoked/invalidated on Graph side, clear access_token expiry and trigger auth
@@ -246,27 +253,24 @@ function M.get_me(cb)
 end
 
 local function get_user_identity(cb)
-  -- saca id/tenant del JWT (oid/tid) sin llamada extra; si falla usa /me
+  -- 1. Intentar decodificar directamente del token actual en memoria (sin llamadas extra a Graph)
   local auth = require("ms-teams.auth")
   local token = auth.get_token("read")
-  local path = config.options.data_dir .. "/token.json"
-  if vim.fn.filereadable(path) == 1 then
-    local data = vim.fn.readfile(path)
-    local ok, j = pcall(vim.json.decode, table.concat(data, "\n"))
-    if ok and j and j.access_token then
-      local parts = vim.split(j.access_token, ".", { plain = true })
-      if #parts >= 2 then
-        local b64 = parts[2]:gsub("-", "+"):gsub("_", "/")
-        local pad = #b64 % 4
-        if pad > 0 then b64 = b64 .. string.rep("=", 4 - pad) end
-        local ok2, js = pcall(vim.json.decode, vim.fn.system({ "python3", "-c", "import base64,sys;print(base64.b64decode(sys.argv[1]).decode())", b64 }))
-        if ok2 and js and js.tid and (js.oid or js.sub) then
-          cb(js.oid or js.sub, js.tid, nil)
-          return
-        end
+  if token and type(token) == "string" then
+    local parts = vim.split(token, ".", { plain = true })
+    if #parts >= 2 then
+      local b64 = parts[2]:gsub("-", "+"):gsub("_", "/")
+      local pad = #b64 % 4
+      if pad > 0 then b64 = b64 .. string.rep("=", 4 - pad) end
+      local ok2, js = pcall(vim.json.decode, vim.fn.system({ "python3", "-c", "import base64,sys;sys.stdout.write(base64.b64decode(sys.argv[1]).decode())", b64 }))
+      if ok2 and js and js.tid and (js.oid or js.sub) then
+        cb(js.oid or js.sub, js.tid, nil)
+        return
       end
     end
   end
+
+  -- 2. Fallback: llamadas API /me y /organization (si davmail está deshabilitado o token opaco)
   graph_request_async("read", "GET", "/me?$select=id", nil, function(me, err)
     if not me or not me.id then cb(nil, nil, err or "no user id"); return end
     graph_request_async("read", "GET", "/organization?$select=id", nil, function(org, _)

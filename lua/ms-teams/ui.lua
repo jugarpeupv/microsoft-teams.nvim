@@ -789,6 +789,12 @@ function M.pick_chats()
     if vim.api.nvim_get_current_buf() == buf then
       pcall(vim.api.nvim_win_set_cursor, 0, {math.max(1, math.min(cur_lnum, #lines)), 0})
     end
+    -- :e detaches treesitter synchronously before BufReadCmd; re-assert after every render
+    vim.defer_fn(function()
+      if vim.api.nvim_buf_is_valid(buf) and vim.bo[buf].filetype == "markdown" then
+        pcall(vim.treesitter.start, buf)
+      end
+    end, 50)
     -- enrich oneOnOne chats that still show as oneOnOne due to $expand=lastMessagePreview only (no members)
     do
       local to_fetch = {}
@@ -1025,6 +1031,20 @@ function M.pick_chats()
         vim.notify("refreshing...", vim.log.levels.INFO)
         require("ms-teams.graph").list_chats(function(nc, err)
           if err then vim.notify("refresh failed: " .. err, vim.log.levels.ERROR); return end
+          -- Preservar members ya enriquecidos si el nuevo fetch no los trae
+          local old_mem = {}
+          if ok and old_all then
+            for _, oc in ipairs(old_all) do
+              if oc ~= vim.NIL and nv(oc.id) and oc.members and type(oc.members) == "table" and #oc.members > 0 then
+                old_mem[nv(oc.id)] = oc.members
+              end
+            end
+          end
+          for _, c in ipairs(nc or {}) do
+            if c ~= vim.NIL and nv(c.id) and (not c.members or type(c.members) ~= "table" or #c.members == 0) then
+              if old_mem[nv(c.id)] then c.members = old_mem[nv(c.id)] end
+            end
+          end
           cache.save("chats", { chats = nc })
           vim.schedule(function()
             if not vim.api.nvim_buf_is_valid(buf) then return end
@@ -1680,6 +1700,9 @@ function M.show_messages(chat, open)
         if ans and (ans:lower() == "n" or ans:lower() == "no") then vim.notify("cancelled", vim.log.levels.INFO); return end
         if not ans then vim.notify("cancelled", vim.log.levels.INFO); return end
         require("ms-teams.graph").mark_chat_read(chat_id, function(_, err)
+          if err then
+            vim.notify("mark_chat_read remote failed: " .. tostring(err), vim.log.levels.WARN)
+          end
           local function do_local()
             local now_iso = os.date("!%Y-%m-%dT%H:%M:%SZ")
             require("ms-teams.cache").set_last_read(chat_id, now_iso)
@@ -1770,6 +1793,9 @@ function M.show_messages(chat, open)
           -- Immediately update highlight on existing chats list buffer
           M.update_chat_list_unread_state(chat_id, true)
           require("ms-teams.graph").mark_chat_unread(chat_id, new_last_read, function(_, err_graph)
+            if err_graph then
+              vim.notify("mark_chat_unread remote failed: " .. tostring(err_graph), vim.log.levels.WARN)
+            end
             vim.defer_fn(function()
               if vim.api.nvim_buf_is_valid(buf) then
                 do_list_messages(chat_id, function(fresh, err2, freshNext)
@@ -1818,6 +1844,26 @@ function M.show_messages(chat, open)
         vim.notify("original message not in buffer (beyond 50 loaded - press R to load more)", vim.log.levels.WARN)
       end
     end, { buffer = buf, desc = "Jump to replied message" })
+    -- :e refreshes in place instead of wiping the nofile buffer
+    local e_grp = vim.api.nvim_create_augroup("MsTeamsChatDetail" .. buf, { clear = true })
+    vim.api.nvim_create_autocmd("BufReadCmd", { group = e_grp, buffer = buf, callback = function()
+      if not vim.api.nvim_buf_is_valid(buf) then return end
+      local cur = vim.api.nvim_win_get_cursor(0)[1]
+      -- :e detaches treesitter synchronously before BufReadCmd fires; restore after re-render
+      vim.notify("refreshing messages...", vim.log.levels.INFO)
+      do_list_messages(chat_id, function(fresh, err, freshNext)
+        if err then vim.notify("refresh failed: "..err, vim.log.levels.ERROR); return end
+        vim.schedule(function()
+          if not vim.api.nvim_buf_is_valid(buf) then return end
+          cache.save(cache_key, {messages=fresh, nextLink=freshNext})
+          render_buffer(fresh, freshNext, {is_cached=false, buf=buf, no_open=true, target_cursor=cur})
+          vim.defer_fn(function()
+            if vim.api.nvim_buf_is_valid(buf) then pcall(vim.treesitter.start, buf) end
+          end, 50)
+          vim.notify(string.format("refreshed %d messages", #fresh), vim.log.levels.INFO)
+        end)
+      end)
+    end })
   end
 
   -- try cache first (Teams-like instant open)
