@@ -319,9 +319,50 @@ function M.list_groups(cb)
 end
 
 function M.list_channels(team_id, cb)
-  graph_request_async("read", "GET", "/teams/" .. team_id .. "/channels?$select=id,displayName,description,webUrl", nil, function(j, err)
-    if not j then cb(nil, err); return end
-    cb(j.value or {}, nil)
+  local cache = require("ms-teams.cache")
+  local etag_cache = cache.load("teams_channels_etags") or {}
+  local etag = etag_cache[team_id]
+  local cached_map = cache.load("teams_channels") or {}
+  local cached = cached_map[team_id]
+  auth.ensure_token_async("read", function(token, err)
+    if not token then cb(nil, err); return end
+    local url = config.options.graph_base .. "/teams/" .. team_id .. "/channels?$select=id,displayName,description,webUrl"
+    local cmd = {"curl","-s","--max-time","60","-X","GET", url, "-H","Authorization: Bearer "..token, "-H","Content-Type: application/json", "-w","\n%{http_code}", "-D","-"}
+    if etag then
+      table.insert(cmd, "-H")
+      table.insert(cmd, "If-None-Match: "..etag)
+    end
+    vim.system(cmd, {text=true}, function(obj)
+      vim.schedule(function()
+        if obj.code ~= 0 then cb(nil, "curl exit "..obj.code); return end
+        -- split body and http_code (last line is code, headers before)
+        local body, code = obj.stdout:match("^(.*)\n(%d%d%d)%s*$")
+        if not code then body, code = obj.stdout, "200" end
+        -- headers are in body when -D -, need to extract json part
+        local json_start = body:find("{")
+        if json_start then body = body:sub(json_start) end
+        if code == "304" and cached then cb(cached, nil); return end
+        if code ~= "200" and code ~= "304" then
+          local ok, j = pcall(vim.json.decode, body)
+          if ok and j and j.error then cb(nil, j.error.message or vim.inspect(j.error)); return end
+          if body == "" then cb(cached or {}, nil); return end
+        end
+        local ok, j = pcall(vim.json.decode, body)
+        if not ok or not j then cb(cached or {}, nil); return end
+        local chans = j.value or {}
+        -- save etag from headers if present
+        local new_etag = obj.stdout:match("[Ee][Tt][Aa][Gg]:%s*([^\r\n]+)")
+        if new_etag then
+          etag_cache[team_id] = new_etag:gsub("^%s+",""):gsub("%s+$","")
+          pcall(cache.save, "teams_channels_etags", etag_cache)
+        end
+        -- update channels_map cache
+        local map = cache.load("teams_channels") or {}
+        map[team_id] = chans
+        pcall(cache.save, "teams_channels", map)
+        cb(chans, nil)
+      end)
+    end)
   end)
 end
 

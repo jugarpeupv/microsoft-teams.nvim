@@ -39,6 +39,22 @@ local function write_json(path, tbl)
   vim.fn.system({ "chmod", "600", path })
 end
 
+local function get_davmail_token_sync()
+  local dav = config.options.davmail
+  if not dav or not dav.enabled then return nil end
+  local ok, dm = pcall(require, "ms-teams.davmail_token")
+  if not ok then return nil, "no davmail module" end
+  return dm.get_access_token_sync()
+end
+
+local function get_davmail_token_async(cb)
+  local dav = config.options.davmail
+  if not dav or not dav.enabled then cb(nil, "davmail disabled"); return end
+  local ok, dm = pcall(require, "ms-teams.davmail_token")
+  if not ok then cb(nil, "no davmail module"); return end
+  dm.get_access_token({}, cb)
+end
+
 local function gen_pkce()
   local verifier = vim.fn.system({ "python3", "-c", "import secrets; print(secrets.token_urlsafe(64))" }):gsub("%s+", "")
   local challenge = vim.fn.system({ "python3", "-c", "import hashlib,base64,sys; print(base64.urlsafe_b64encode(hashlib.sha256(sys.argv[1].encode()).digest()).decode().rstrip('='))", verifier }):gsub("%s+", "")
@@ -106,6 +122,13 @@ local function refresh_token(client, refresh_tok)
 end
 
 function M.get_token(kind)
+  -- davmail single token governs all kinds when enabled (exclusive, no legacy fallback)
+  local dav = config.options.davmail
+  if dav and dav.enabled then
+    local dtok, derr = get_davmail_token_sync()
+    if dtok then return dtok, nil end
+    return nil, derr or "davmail token missing - run davmail-token"
+  end
   local client = get_client(kind)
   if not client then return nil, "no OAuth client configured" end
   local path = token_path(kind)
@@ -132,7 +155,7 @@ end
 
 local is_logging_in = false
 
-function M.ensure_token_async(kind, cb)
+local function legacy_ensure_token_async(kind, cb)
   local client = get_client(kind)
   if not client then
     cb(nil, "no OAuth client configured")
@@ -162,6 +185,17 @@ function M.ensure_token_async(kind, cb)
       cb(nil, "login failed or cancelled: " .. (err or "no token"))
     end
   end)
+end
+
+function M.ensure_token_async(kind, cb)
+  local dav = config.options.davmail
+  if dav and dav.enabled then
+    get_davmail_token_async(function(dtok, derr)
+      if dtok then cb(dtok, nil) else cb(nil, derr) end
+    end)
+    return
+  end
+  legacy_ensure_token_async(kind, cb)
 end
 
 local function extract_code_from_string(input)
@@ -368,6 +402,17 @@ function M.login_all(cb)
 end
 
 function M.status()
+  local dav = config.options.davmail
+  if dav and dav.enabled then
+    local ok, dm = pcall(require, "ms-teams.davmail_token")
+    local tok_file = dav.token_file or (function() local p=require("ms-teams.config").options.davmail; local prop_path=vim.fn.expand("~/.davmail.properties"); if vim.fn.filereadable(prop_path)~=1 then prop_path=vim.fn.expand("~/.config/davmail/davmail.properties") end; if vim.fn.filereadable(prop_path)~=1 then prop_path=vim.fn.expand("~/dotfiles/davmail/.davmail.properties") end; return prop_path end)()
+    local msg = "davmail enabled: client="..(dav.client_id or "?").." file="..(dav.token_file or "auto")
+    local dtok, derr = ok and dm.load_davmail_token() or nil
+    local atok = ok and dm.get_access_token_sync() or nil
+    local info = dtok and ("refresh len "..#dtok) or ("no refresh: "..tostring(derr))
+    local ainfo = atok and ("access len "..#atok) or "no access"
+    vim.notify("ms-teams davmail: "..msg.."\n"..info.."\n"..ainfo, vim.log.levels.INFO)
+  end
   if config.options.client then
     local tok = read_json(token_path())
     local function fmt(t)

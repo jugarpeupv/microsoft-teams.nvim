@@ -3,7 +3,20 @@ local M = {}
 M.defaults = {
   -- single source for storage
   data_dir = vim.fn.stdpath("data") .. "/ms-teams",
-  -- unified first-party client: single token for read + write + send + create + mark read/unread
+  -- davmail reuse: single token governed by davmail (no second device_code)
+  -- reads refresh_token from davmail.oauth.tokenFilePath and refreshes via common/oauth2/v2.0/token
+  davmail = {
+    enabled = true,
+    token_file = nil, -- nil -> auto from davmail.oauth.tokenFilePath or ~/.config/davmail/oauth_tokens.env
+    username = "user@example.com",
+    client_id = "d3590ed6-52b3-4102-aeff-aad2292ab01c",
+    tenant_id = "common",
+    redirect_uri = "urn:ietf:wg:oauth:2.0:oob",
+    fingerprint = "davmailgateway!&",
+    password = "", -- for {AES} decrypt; "" when davmail stores plain (password empty at creation)
+    auth_cmd = nil, -- nil | string | string[] to run when token file missing, e.g. "davmail-token" alias or {"bash","-c","davmail-token"}
+  },
+  -- fallback legacy first-party client (used when davmail.enabled=false or file missing)
   client = {
     client_id = "a8759234-4b8b-4d94-8c0a-ee1ab73af270",
     redirect_uri = "ms-appx-web://Microsoft.AAD.BrokerPlugin/a8759234-4b8b-4d94-8c0a-ee1ab73af270",

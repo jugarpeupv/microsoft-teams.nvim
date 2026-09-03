@@ -438,14 +438,28 @@ local function build_message_lines(m, chat)
       for _, a in ipairs(atts) do
         if a == vim.NIL then goto ac end
         local ct = nv(a.contentType) or "attachment"
-        if ct == "reference" then table.insert(lines, "  [Image/File attachment - hostedContent]")
+        if ct == "reference" then
+          local hid = hosted and hosted[1] and (nv(hosted[1].id) or nv(hosted[1].contentId)) or "0"
+          local contentUrl = nv(a.contentUrl) or ""
+          local src = contentUrl ~= "" and contentUrl or (is_channel and string.format("https://graph.microsoft.com/v1.0/teams/%s/channels/%s/messages/%s/hostedContents/%s/$value", team_id or "", chat_id, mid or "", hid) or string.format("https://graph.microsoft.com/v1.0/chats/%s/messages/%s/hostedContents/%s/$value", chat_id, mid or "", hid))
+          table.insert(img_srcs, src)
+          local fname = nv(a.name) or ""
+          if fname == "" and contentUrl ~= "" then fname = contentUrl:match("/([^/%?]+)%??") or "" end
+          fname = fname:gsub("%%20"," "):gsub("%%2E","."):gsub("%%5F","_")
+          if fname == "" then fname = hid ~= "0" and hid:sub(1,20) or "file" end
+          local host = contentUrl:match("https://([^/]+)/") or src:match("https://([^/]+)/") or "graph.microsoft.com"
+          table.insert(lines, string.format("  [File: %s (%s) - press gx to open]", fname, host))
         elseif ct == "messageReference" then table.insert(lines, "  [Reference to message]")
         else table.insert(lines, "  " .. string.format("[Attachment: %s]", ct)) end
         ::ac::
       end
       if #atts == 0 then table.insert(lines, "  [Attachment with no body]") end
     elseif hosted and type(hosted) == "table" and #hosted > 0 then
-      table.insert(lines, "  [Multimedia content - hostedContents, requires GET /chats/{id}/messages/{id}/hostedContents/{id}/$value]")
+      local hid = nv(hosted[1].id) or nv(hosted[1].contentId) or "0"
+      local src = is_channel and string.format("https://graph.microsoft.com/v1.0/teams/%s/channels/%s/messages/%s/hostedContents/%s/$value", team_id or "", chat_id, mid or "", hid) or string.format("https://graph.microsoft.com/v1.0/chats/%s/messages/%s/hostedContents/%s/$value", chat_id, mid or "", hid)
+      table.insert(img_srcs, src)
+      local host = src:match("https://([^/]+)/") or "graph.microsoft.com"
+      table.insert(lines, string.format("  [File: %s (%s) - press gx to open]", hid:sub(1,20), host))
     elseif mtype and mtype ~= "message" then
       local otype = edetail and nv(edetail["@odata.type"]) or ""
       if otype:find("callStarted") then
@@ -591,6 +605,15 @@ function M.pick_chats()
     local tc = cache.load("teams", 300)
     if tc and tc.teams then teams_data = tc.teams; channels_map = cache.load("teams_channels") or {} end
   end
+  -- render inmediato con cache (sin red), highlight async después
+  if teams_data and next(channels_map) ~= nil then
+    vim.schedule(function()
+      if vim.api.nvim_buf_is_valid(buf) then
+        local ok, all = pcall(vim.api.nvim_buf_get_var, buf, "ms_teams_all_chats")
+        if ok and all then render_and_bind(all, all, false, current_filter or "") end
+      end
+    end)
+  end
   vim.defer_fn(function()
     if not teams_data then
       require("ms-teams.graph").list_teams(function(nt, err)
@@ -609,17 +632,21 @@ function M.pick_chats()
         end
       end)
     else
-      load_all_channels(teams_data, function()
-        cache.save("teams_channels", channels_map)
-        vim.schedule(function()
-          if vim.api.nvim_buf_is_valid(buf) then
-            local ok, all = pcall(vim.api.nvim_buf_get_var, buf, "ms_teams_all_chats")
-            if ok and all then render_and_bind(all, all, false, current_filter or "") end
-          end
+      -- cache hit: no bloquear render, refresco en background solo para highlight
+      vim.defer_fn(function()
+        -- solo refresca channels si hace falta (R fuerza, aquí es best-effort)
+        load_all_channels(teams_data, function()
+          cache.save("teams_channels", channels_map)
+          vim.schedule(function()
+            if vim.api.nvim_buf_is_valid(buf) then
+              local ok, all = pcall(vim.api.nvim_buf_get_var, buf, "ms_teams_all_chats")
+              if ok and all then render_and_bind(all, all, false, current_filter or "") end
+            end
+          end)
         end)
-      end)
+      end, 5000)
     end
-  end, 300)
+  end, 0)
   render_and_bind = function(chats, all_chats, is_cached, filter_term)
     local cur_lnum = vim.api.nvim_win_get_cursor(0)[1]
     if filter_term ~= nil then current_filter = filter_term end
@@ -706,39 +733,16 @@ function M.pick_chats()
       for i=1,30 do t[i]=display[i] end
       display = t
     end
-    -- teams section at top (only teams, no ##, highlight team if any channel unread)
     local unread_by_id = {}
     for _, c in ipairs(all_for_search) do if has_unread(c) then unread_by_id[nv(c.id)] = true end end
-    local teams_lines = {}
-    local teams_line_to_entry = {}
-    local teams_unread_lines = {}
-    if teams_data and #teams_data > 0 then
-      table.insert(teams_lines, "# Teams (" .. #teams_data .. ")")
-      local sorted_teams = vim.deepcopy(teams_data)
-      table.sort(sorted_teams, function(a,b) return (a.displayName or ""):lower() < (b.displayName or ""):lower() end)
-      for _, team in ipairs(sorted_teams) do
-        local channels = channels_map[team.id] or {}
-        local team_has_unread = false
-        for _, ch in ipairs(channels) do if ch ~= vim.NIL and unread_by_id[nv(ch.id)] then team_has_unread = true; break end end
-        table.insert(teams_lines, clean(team.displayName) .. " (" .. #channels .. ")")
-        teams_line_to_entry[#teams_lines] = {type="team", team=team}
-        if team_has_unread then teams_unread_lines[#teams_lines] = true end
-      end
-      table.insert(teams_lines, "")
-    end
     local header = "# Teams chats (" .. #display .. "/" .. #all_for_search .. " shown"
       .. (current_filter and current_filter ~= "" and ' | filter: "' .. current_filter .. '"' or "")
       .. (show_unread_only and " - unread only" or "")
       .. (is_cached and " - cached" or "") .. (is_filtering and " - meeting included" or (vim.g.ms_teams_show_meeting and "" or " - meeting hidden, M to show")) .. ")"
     local lines = {}
-    for _, l in ipairs(teams_lines) do table.insert(lines, l) end
     table.insert(lines, header)
-    table.insert(lines, "")
-    table.insert(lines, "Press <CR> replace, <C-s> split, <C-v> vsplit, g/ search, U unread, M meeting, gS show more/less, R refresh, <C-x> hide, q close")
-    table.insert(lines, "")
     local line_to_chat = {}
     local line_to_entry = {}
-    for lnum, entry in pairs(teams_line_to_entry) do line_to_entry[lnum] = entry end
     local unread_lines = {}
     for _, chat in ipairs(display) do
       local line = format_chat(chat)
@@ -749,7 +753,28 @@ function M.pick_chats()
       line_to_entry[lnum] = {type="chat", chat=chat}
       if has_unread(chat) then unread_lines[lnum] = true end
     end
-    for lnum,_ in pairs(teams_unread_lines) do unread_lines[lnum] = true end
+    -- Teams section at bottom
+    if teams_data and #teams_data > 0 then
+      table.insert(lines, "")
+      table.insert(lines, "# Teams (" .. #teams_data .. ")")
+      local teams_header_lnum = #lines - 1
+      local sorted_teams = vim.deepcopy(teams_data)
+      table.sort(sorted_teams, function(a,b) return (a.displayName or ""):lower() < (b.displayName or ""):lower() end)
+      for _, team in ipairs(sorted_teams) do
+        local channels = channels_map[team.id] or {}
+        local team_has_unread = false
+        for _, c in ipairs(all_for_search) do
+          if nv(c.chatType) == "channel" and nv(c.teamId) == nv(team.id) and unread_by_id[nv(c.id)] then team_has_unread = true; break end
+        end
+        if not team_has_unread then
+          for _, ch in ipairs(channels) do if ch ~= vim.NIL and unread_by_id[nv(ch.id)] then team_has_unread = true; break end end
+        end
+        table.insert(lines, clean(team.displayName) .. " (" .. #channels .. ")")
+        local lnum = #lines
+        line_to_entry[lnum] = {type="team", team=team}
+        if team_has_unread then unread_lines[lnum] = true end
+      end
+    end
     vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
     local ns = vim.api.nvim_create_namespace("ms_teams_unread")
     vim.api.nvim_buf_clear_namespace(buf, ns, 0, -1)
@@ -866,6 +891,41 @@ function M.pick_chats()
         end
       end)
     end, {buffer=buf})
+    vim.keymap.set("n", "g?", function()
+      local hb = vim.api.nvim_create_buf(false, true)
+      vim.api.nvim_buf_set_option(hb, "filetype", "markdown")
+      vim.api.nvim_buf_set_option(hb, "buftype", "nofile")
+      vim.api.nvim_buf_set_lines(hb, 0, -1, false, {
+        "# Teams Help",
+        "",
+        "<CR> open in place",
+        "<C-s> open in horizontal split",
+        "<C-v> open in vertical split",
+        "g/ search",
+        "U unread",
+        "M meeting",
+        "gS show more/less",
+        "R refresh",
+        "<C-x> hide",
+        "q close",
+      })
+      local width = 30
+      local height = 13
+      local row = math.floor((vim.o.lines - height) / 2)
+      local col = math.floor((vim.o.columns - width) / 2)
+      local win = vim.api.nvim_open_win(hb, true, {
+        relative = "editor",
+        width = width,
+        height = height,
+        row = row,
+        col = col,
+        style = "minimal",
+        border = "rounded",
+      })
+      vim.api.nvim_buf_set_keymap(hb, "n", "q", "<cmd>close<cr>", {silent=true})
+      vim.api.nvim_buf_set_keymap(hb, "n", "<Esc>", "<cmd>close<cr>", {silent=true})
+      vim.api.nvim_win_set_option(win, "cursorline", true)
+    end, {buffer=buf, desc="Teams help"})
     vim.keymap.set("n", "U", function()
       show_unread_only = not show_unread_only
       render_and_bind(all_for_search, all_for_search, false, current_filter or "")
@@ -1172,14 +1232,34 @@ function M.show_messages(chat, open)
       buf = vim.api.nvim_create_buf(true, false)
       vim.api.nvim_buf_set_option(buf, "filetype", "markdown")
     end
-    local title = nv(chat.topic) or nv(chat.chatType) or chat_id
+    local title = format_chat(chat) or nv(chat.topic) or nv(chat.chatType) or chat_id
     local safe_id = safe_id_cache
-    local chat_name = format_chat(chat) or title
+    local chat_name = title
     local safe_name = to_ascii(chat_name):gsub("[^%w%-_ %.]", "_"):gsub("%s+", "-"):sub(1, 40)
     set_listed_scratch(buf, "ms-teams://chat/" .. safe_name .. "__" .. safe_id)
     local HEADER_LINES = 6
     local header_suffix = is_cached and " (cached)" or ""
-    local lines = { "# " .. title, "", string.format("Chat: %s | %d messages%s", chat_id, #msgs, header_suffix), "", "Press g? participants | S reply | R refresh | gR load 50 older | mr mark read | mu mark unread | q close | <CR> jump reply", "" }
+    local lines = { "# " .. chat_name, "", string.format("Chat: %s | %d messages%s", chat_id, #msgs, header_suffix), "", "Press g? participants | S reply | R refresh | gR load 50 older | mr mark read | mu mark unread | q close | <CR> jump reply", "" }
+    -- enrich header for oneOnOne with missing members (was oneOnOne)
+    if nv(chat.chatType) == "oneOnOne" and chat_name:match("^oneOnOne") then
+      require("ms-teams.graph").get_chat(chat_id, function(full)
+        if full and full.members then
+          chat.members = full.members
+          local new_name = format_chat(chat)
+          if new_name and not new_name:match("^oneOnOne") then
+            vim.schedule(function()
+              if vim.api.nvim_buf_is_valid(buf) then
+                local cur = vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1] or ""
+                if cur:match("^# oneOnOne") then
+                  vim.api.nvim_buf_set_lines(buf, 0, 1, false, {"# " .. new_name})
+                  pcall(vim.api.nvim_buf_set_name, buf, "ms-teams://chat/"..to_ascii(new_name):gsub("[^%w%-_ %.]","_"):gsub("%s+","-"):sub(1,40).."__"..safe_id)
+                end
+              end
+            end)
+          end
+        end
+      end)
+    end
     local unread_msg_lines = {}
     local id_to_lnum = {}
     local reply_to_target = {}
@@ -1240,11 +1320,11 @@ function M.show_messages(chat, open)
         if res.reply_target and #lines == header_lnum + 1 and res.reply_preview then
           reply_to_target[#lines] = res.reply_target
         end
-        if l:find("%[Image:") and res.img_srcs and #res.img_srcs > 0 then
+        if (l:find("%[Image:") or l:find("%[File:")) and res.img_srcs and #res.img_srcs > 0 then
           -- map this image line to its src (by order, nth image line -> nth src)
           local img_idx = 0
           for _, ll in ipairs(res.lines) do
-            if ll:find("%[Image:") then
+            if ll:find("%[Image:") or ll:find("%[File:") then
               img_idx = img_idx + 1
               if ll == l then
                 image_map[#lines] = res.img_srcs[img_idx]
@@ -1349,19 +1429,19 @@ function M.show_messages(chat, open)
                if res.reply_target and idx == 2 and res.reply_preview then
                  new_reply_map[abs_lnum] = res.reply_target
                end
-               if l:find("%[Image:") and res.img_srcs and #res.img_srcs > 0 then
-                 -- map this image line to its src (nth image)
-                 local img_idx = 0
-                 for _, ll in ipairs(res.lines) do
-                   if ll:find("%[Image:") then
-                     img_idx = img_idx + 1
-                     if ll == l then
-                       new_image_map[abs_lnum] = res.img_srcs[img_idx]
-                       break
-                     end
-                   end
-                 end
-               end
+                if (l:find("%[Image:") or l:find("%[File:")) and res.img_srcs and #res.img_srcs > 0 then
+                  -- map this image line to its src (nth image)
+                  local img_idx = 0
+                  for _, ll in ipairs(res.lines) do
+                    if ll:find("%[Image:") or ll:find("%[File:") then
+                      img_idx = img_idx + 1
+                      if ll == l then
+                        new_image_map[abs_lnum] = res.img_srcs[img_idx]
+                        break
+                      end
+                    end
+                  end
+                end
              end
              ::cont2::
            end
@@ -1516,7 +1596,7 @@ function M.show_messages(chat, open)
     vim.keymap.set("n", "gx", function()
       local lnum = vim.api.nvim_win_get_cursor(0)[1]
       local line = vim.api.nvim_get_current_line()
-      if not line:find("%[Image:") then
+      if not (line:find("%[Image:") or line:find("%[File:")) then
         -- Default gx fallback: open URL / file under cursor
         local cfile = vim.fn.expand("<cfile>")
         if cfile and cfile ~= "" then
@@ -1538,13 +1618,28 @@ function M.show_messages(chat, open)
         vim.notify("image src not found, try reopening chat", vim.log.levels.WARN)
         return
       end
-      vim.notify("downloading image...", vim.log.levels.INFO)
+      -- SharePoint files (personal docs) need browser, not Bearer token (aud mismatch)
+      if src:find("sharepoint%.com") then
+        vim.notify("opening SharePoint file in browser...", vim.log.levels.INFO)
+        if vim.ui and vim.ui.open then vim.ui.open(src) else vim.fn.jobstart({"open", src}, {detach=true}) end
+        return
+      end
+      vim.notify("downloading image... src="..src:sub(1,120), vim.log.levels.DEBUG)
       local token = require("ms-teams.auth").get_token("read")
       if not token then vim.notify("no token", vim.log.levels.ERROR); return end
       local tmp = vim.fn.tempname() .. ".png"
-      local out = vim.fn.system({"curl","-s","--max-time","30","-H","Authorization: Bearer "..token, src, "-o", tmp})
-      if vim.v.shell_error ~= 0 or vim.fn.getfsize(tmp) < 100 then
-        vim.notify("download failed: " .. out, vim.log.levels.ERROR)
+      local tmp_hdrs = vim.fn.tempname()
+      local out = vim.fn.system({"curl","-sL","--max-time","30","-D",tmp_hdrs,"-H","Authorization: Bearer "..token, src, "-o", tmp, "-w","\n%{http_code}"})
+      local sz = vim.fn.getfsize(tmp)
+      local hdrs = vim.fn.readfile(tmp_hdrs)
+      local code = out:match("(%d%d%d)%s*$") or "000"
+      pcall(vim.fn.delete, tmp_hdrs)
+      if vim.v.shell_error ~= 0 or sz < 100 or code ~= "200" then
+        local err = (out ~= "" and out or "") .. " http:"..code.." hdrs:"..table.concat(hdrs or {}, " "):sub(1,200).." src:"..src:sub(1,120)
+        vim.notify("download failed: " .. err, vim.log.levels.ERROR)
+        pcall(vim.fn.delete, tmp)
+        -- fallback: open in browser
+        if vim.ui and vim.ui.open then vim.ui.open(src) else vim.fn.jobstart({"open", src}, {detach=true}) end
         return
       end
       vim.notify("opening with Preview...", vim.log.levels.INFO)
@@ -1552,7 +1647,7 @@ function M.show_messages(chat, open)
     end, { buffer = buf, desc = "Open image or default gx" })
     vim.keymap.set("n", "mr", function()
       local cur_pos = vim.api.nvim_win_get_cursor(0)
-      vim.ui.input({ prompt = string.format("Mark whole chat '%s' as read? (Y/n): ", format_chat(chat)) }, function(ans)
+      vim.ui.input({ prompt = string.format("Mark whole chat '%s' as read? (Y/n) [<CR>=y]: ", format_chat(chat)) }, function(ans)
         if ans and (ans:lower() == "n" or ans:lower() == "no") then vim.notify("cancelled", vim.log.levels.INFO); return end
         if not ans then vim.notify("cancelled", vim.log.levels.INFO); return end
         require("ms-teams.graph").mark_chat_read(chat_id, function(_, err)
@@ -1626,7 +1721,7 @@ function M.show_messages(chat, open)
         end
       end
       if is_on_message and target_msg_id then
-        vim.ui.input({ prompt = string.format("Mark message %s as unread? (Y/n): ", target_msg_id:sub(1,8)) }, function(ans)
+        vim.ui.input({ prompt = string.format("Mark message %s as unread? (Y/n) [<CR>=y]: ", target_msg_id:sub(1,8)) }, function(ans)
           if ans and (ans:lower() == "n" or ans:lower() == "no") then vim.notify("cancelled", vim.log.levels.INFO); return end
           if not ans then vim.notify("cancelled", vim.log.levels.INFO); return end
           local target_created = nil
@@ -1971,9 +2066,9 @@ function M.find_chats(opts)
       return al > bl
     end)
 
-    -- Top 50 chats
+    local top_n = require("ms-teams.config").options.chat_search_top or 500
     local top50 = {}
-    for i = 1, math.min(50, #valid_chats) do
+    for i = 1, math.min(top_n, #valid_chats) do
       table.insert(top50, valid_chats[i])
     end
 
@@ -2005,14 +2100,14 @@ function M.find_chats(opts)
           return {
             value = entry.chat,
             display = entry.display,
-            ordinal = entry.name,
+            ordinal = to_ascii(entry.name) .. " " .. entry.name,
           }
         end,
       })
     end
 
     local title_suffix = function()
-      return show_all and " (All Top 50 - <C-b> unread only)" or " (Unread Top 50 - <C-b> show all)"
+      return show_all and (" (All "..#top50.." - <C-b> unread only)") or (" (Unread "..#top50.." - <C-b> show all)")
     end
 
     pickers.new({}, {
@@ -2042,14 +2137,60 @@ function M.find_chats(opts)
           current_picker:refresh(create_finder(show_all), { reset_prompt = false })
           current_picker.prompt_border:change_title("Teams Chats" .. title_suffix())
         end)
+        -- disable quickfix for chat entries (not file-based)
+        map({ "i", "n" }, "<C-q>", function() vim.notify("quickfix not supported for chats", vim.log.levels.INFO) end)
+        map({ "i", "n" }, "<M-q>", function() vim.notify("quickfix not supported for chats", vim.log.levels.INFO) end)
+        -- enrich oneOnOne without members so Rubén etc show real name and are searchable via rub
+        vim.defer_fn(function()
+          local need = {}
+          for _, c in ipairs(valid_chats) do
+            if nv(c.chatType) == "oneOnOne" and format_chat(c):match("^oneOnOne") then table.insert(need, c) end
+          end
+          if #need == 0 then return end
+          local pending = #need
+          for _, c in ipairs(need) do
+            require("ms-teams.graph").get_chat(nv(c.id), function(full)
+              if full and full.members then c.members = full.members end
+              pending = pending - 1
+              if pending == 0 then
+                vim.schedule(function()
+                  if vim.api.nvim_buf_is_valid(prompt_bufnr) then
+                    local picker = action_state.get_current_picker(prompt_bufnr)
+                    if picker then picker:refresh(create_finder(show_all), {reset_prompt=false}) end
+                  end
+                end)
+              end
+            end)
+          end
+        end, 100)
 
         return true
       end,
     }):find()
   end
 
-  if cached and cached.chats and #cached.chats > 0 then
+  if cached and cached.chats and #cached.chats > 0 and #cached.chats >= 50 then
     open_picker(cached.chats)
+    -- background refresh to get full 123 if cached is partial
+    vim.defer_fn(function()
+      graph.list_chats(function(chats, err)
+        if chats and #chats > #cached.chats then
+          cache.save("chats", { chats = chats })
+        end
+      end, { all = true, limit = 100 })
+    end, 500)
+    return
+  elseif cached and cached.chats and #cached.chats > 0 then
+    -- cached but small (e.g., 61), fetch fresh to get all 123
+    vim.notify("Loading chats...", vim.log.levels.INFO)
+    graph.list_chats(function(chats, err)
+      if chats and #chats > 0 then
+        cache.save("chats", { chats = chats })
+        open_picker(chats)
+      else
+        open_picker(cached.chats)
+      end
+    end, { all = true, limit = 100 })
     return
   end
 
