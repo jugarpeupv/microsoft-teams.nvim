@@ -945,6 +945,20 @@ function M.pick_chats()
       vim.notify("refreshing...",vim.log.levels.INFO)
       require("ms-teams.graph").list_chats(function(nc,err)
         if err then vim.notify("refresh failed: "..err,vim.log.levels.ERROR); return end
+        -- Preservar members ya enriquecidos del cache anterior si el nuevo chat no los trae
+        local old_members_by_id = {}
+        for _, oc in ipairs(all_for_search or {}) do
+          if oc ~= vim.NIL and nv(oc.id) and oc.members and type(oc.members) == "table" and #oc.members > 0 then
+            old_members_by_id[nv(oc.id)] = oc.members
+          end
+        end
+        for _, c in ipairs(nc or {}) do
+          if c ~= vim.NIL and nv(c.id) and (not c.members or type(c.members) ~= "table" or #c.members == 0) then
+            if old_members_by_id[nv(c.id)] then
+              c.members = old_members_by_id[nv(c.id)]
+            end
+          end
+        end
         cache.save("chats",{chats=nc})
         require("ms-teams.graph").list_teams(function(nt, err2)
           if nt and #nt>0 and not err2 then
@@ -1067,6 +1081,21 @@ function M.pick_chats()
   vim.api.nvim_win_set_buf(0, buf)
   graph.list_chats(function(chats, err)
     if err then vim.notify("ms-teams list_chats: "..err,vim.log.levels.ERROR); return end
+    -- Preservar members si venían de cache anterior
+    local old_cached = cache.load("chats", 3600)
+    if old_cached and old_cached.chats then
+      local mem_map = {}
+      for _, oc in ipairs(old_cached.chats) do
+        if oc ~= vim.NIL and nv(oc.id) and oc.members and type(oc.members) == "table" and #oc.members > 0 then
+          mem_map[nv(oc.id)] = oc.members
+        end
+      end
+      for _, c in ipairs(chats or {}) do
+        if c ~= vim.NIL and nv(c.id) and (not c.members or type(c.members) ~= "table" or #c.members == 0) then
+          if mem_map[nv(c.id)] then c.members = mem_map[nv(c.id)] end
+        end
+      end
+    end
     -- asegura 48:notes (self real con 123/hola + link 19/01/2024) aunque /me/chats no lo pagina con limit 100
     local has_notes = false
     for _,c in ipairs(chats or {}) do if nv(c.id)=="48:notes" then has_notes=true; break end end

@@ -7,8 +7,8 @@ M.defaults = {
   -- reads refresh_token from davmail.oauth.tokenFilePath and refreshes via common/oauth2/v2.0/token
   davmail = {
     enabled = true,
-    token_file = nil, -- nil -> auto from davmail.oauth.tokenFilePath or ~/.config/davmail/oauth_tokens.env
-    username = "user@example.com",
+    token_file = nil, -- path to DavMail oauth tokens file (or auto-resolved via davmail.oauth.tokenFilePath in ~/.davmail.properties)
+    username = nil, -- username / email in DavMail
     client_id = "d3590ed6-52b3-4102-aeff-aad2292ab01c",
     tenant_id = "common",
     redirect_uri = "urn:ietf:wg:oauth:2.0:oob",

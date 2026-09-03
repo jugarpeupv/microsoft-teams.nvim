@@ -152,24 +152,79 @@ local function run_auth_cmd()
   return true
 end
 
-function M.load_davmail_token(opts)
+local function resolve_token_file(opts)
   opts = opts or {}
-  local token_file = opts.token_file or read_prop("davmail.oauth.tokenFilePath", vim.fn.expand("~/.config/davmail/oauth_tokens.env"))
-  local password = opts.password
-  if password == nil then password = read_prop("davmail.oauth.password", "") end
+  local ok, cfg = pcall(require, "ms-teams.config")
+  local dav = (ok and cfg.options and cfg.options.davmail) or {}
 
-  if vim.fn.filereadable(token_file) ~= 1 then
-    if run_auth_cmd() then return nil, "no token file - auth_cmd launched, re-run after login" end
-    return nil, "no token file"
+  local candidates = {}
+
+  -- 1. Explicit user config in opts or setup
+  local explicit = opts.token_file or opts.davmail_token_file or dav.token_file or dav.davmail_token_file
+  if explicit and explicit ~= "" then
+    table.insert(candidates, { path = vim.fn.expand(explicit), source = "plugin config (davmail.token_file)" })
   end
 
-  local user = (opts.username or read_prop("davmail.username") or "user@example.com"):lower()
+  -- 2. From .davmail.properties (davmail.oauth.tokenFilePath)
+  local prop_path = get_davmail_props()
+  if prop_path and vim.fn.filereadable(prop_path) == 1 then
+    local prop_val = read_prop("davmail.oauth.tokenFilePath", nil)
+    if prop_val and prop_val ~= "" then
+      table.insert(candidates, { path = vim.fn.expand(prop_val), source = prop_path .. " [davmail.oauth.tokenFilePath]" })
+    end
+  end
+
+  -- Check if any candidate exists
+  for _, c in ipairs(candidates) do
+    if vim.fn.filereadable(c.path) == 1 then
+      return c.path, nil
+    end
+  end
+
+  -- Build error message listing expected paths
+  local searched = {}
+  for _, c in ipairs(candidates) do
+    table.insert(searched, string.format("'%s' (%s)", c.path, c.source))
+  end
+
+  local prop_sources = { "~/.davmail.properties", "~/.config/davmail/davmail.properties", "~/dotfiles/davmail/.davmail.properties" }
+  local msg
+  if #searched > 0 then
+    msg = string.format("DavMail token file not found on disk. Checked: [%s]", table.concat(searched, ", "))
+  else
+    msg = string.format(
+      "DavMail token file is not configured. Please set `davmail.token_file` in setup() or configure `davmail.oauth.tokenFilePath` in DavMail properties (searched: %s).",
+      table.concat(prop_sources, ", ")
+    )
+  end
+
+  return nil, msg
+end
+
+function M.load_davmail_token(opts)
+  opts = opts or {}
+  local ok, cfg = pcall(require, "ms-teams.config")
+  local dav = (ok and cfg.options and cfg.options.davmail) or {}
+
+  local token_file, resolve_err = resolve_token_file(opts)
+  if not token_file then
+    vim.notify("ms-teams: " .. resolve_err, vim.log.levels.ERROR)
+    if run_auth_cmd() then
+      return nil, resolve_err .. " - auth_cmd launched, re-run after login"
+    end
+    return nil, resolve_err
+  end
+
+  local password = opts.password or dav.password
+  if password == nil then password = read_prop("davmail.oauth.password", "") end
+
+  local user = (opts.username or dav.username or read_prop("davmail.username") or ""):lower()
   local raw_val = nil
   for _, line in ipairs(vim.fn.readfile(token_file)) do
     local trimmed = vim.trim(line)
     if not trimmed:match("^#") and trimmed:match("=") then
       local k, v = trimmed:match("^([^=]+)=(.*)$")
-      if k and vim.trim(k):lower() == user then
+      if k and user ~= "" and vim.trim(k):lower() == user then
         raw_val = vim.trim(v)
         break
       end
@@ -188,8 +243,10 @@ function M.load_davmail_token(opts)
   end
 
   if not raw_val or raw_val == "" then
-    if run_auth_cmd() then return nil, "no token for " .. user .. " - auth_cmd launched" end
-    return nil, "no token for " .. user
+    local msg = "no token entry found for user '" .. (user ~= "" and user or "<any>") .. "' in " .. token_file
+    vim.notify("ms-teams: " .. msg, vim.log.levels.ERROR)
+    if run_auth_cmd() then return nil, msg .. " - auth_cmd launched" end
+    return nil, msg
   end
 
   if raw_val:match("^{AES}") then
