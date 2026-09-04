@@ -20,7 +20,7 @@ M.defaults = {
   client = {
     client_id = "a8759234-4b8b-4d94-8c0a-ee1ab73af270",
     redirect_uri = "ms-appx-web://Microsoft.AAD.BrokerPlugin/a8759234-4b8b-4d94-8c0a-ee1ab73af270",
-    scope = "offline_access openid profile ChannelMessage.Send Chat.Create Chat.ReadWrite ChatMessage.Send Contacts.Read email Family.Read Files.ReadWrite Files.ReadWrite.All Group.Read.All Mail.ReadWrite Mail.Send openid People.Read profile ProfilePhoto.Read.All Sites.ReadWrite.All User.Read User.Read.All User.ReadBasic.All",
+     scope = "offline_access openid profile ChannelMessage.Send Chat.Create Chat.ReadWrite ChatMessage.Send Contacts.Read email Family.Read Files.ReadWrite Files.ReadWrite.All Group.Read.All Mail.ReadWrite Mail.Send openid People.Read profile ProfilePhoto.Read.All Sites.ReadWrite.All User.Read User.Read.All User.ReadBasic.All",
     name = "ms-teams",
   },
   graph_base = "https://graph.microsoft.com/v1.0",
@@ -35,8 +35,23 @@ M.defaults = {
   highlights = {
     unread = "DiagnosticInfo",
   },
+   -- icons for chats: type (emoji defaults, configurable)
+   icons = {
+    enabled = true,
+    chatType = {
+      meeting = "󰊻",
+      oneOnOne = "",
+      groupChat = "󰭘",
+      channel = "",
+      default = "󰭘",
+    },
+  },
   debug = false, -- global debug for auth/graph logs (auth_debug.log)
   auth_debug = false,
+  -- command used to open URLs in the browser (gx). nil = default (vim.ui.open).
+  -- e.g. pin a Chrome profile that holds the M365 session:
+  -- open_cmd = {"open", "-a", "Google Chrome", "--args", "--profile-directory=Profile 3"}
+  open_cmd = nil,
   -- watch: polling while nvim is open (works even if focus is on Chrome)
   watch = {
     enabled = false, -- set true to autostart on setup()

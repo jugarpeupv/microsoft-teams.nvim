@@ -43,6 +43,16 @@ function M.setup(opts)
   vim.api.nvim_create_user_command("MSTeamsCode", function(opts) auth.submit_code(opts.args) end, { nargs = 1, desc = "Submit OAuth code/URL manually" })
   vim.api.nvim_create_user_command("MSTeamsLoginCancel", function() auth.cancel_login() end, { desc = "Cancel pending login" })
   vim.api.nvim_create_user_command("MSTeamsStatus", function() auth.status() end, { desc = "Teams token status" })
+  vim.api.nvim_create_user_command("MSTeamsTokenScopes", function()
+    local ok, gr = pcall(require, "ms-teams.graph")
+     local scopes = ok and gr.get_token_scopes() or nil
+     if not scopes or #scopes == 0 then
+       vim.notify("ms-teams: no token or scopes not decodable", vim.log.levels.WARN)
+       return
+     end
+     table.sort(scopes)
+     vim.notify("ms-teams token scopes (" .. #scopes .. "):\n" .. table.concat(scopes, " "), vim.log.levels.INFO)
+  end, { desc = "Teams show current access token scopes" })
   vim.api.nvim_create_user_command("MSTeamsChats", function() ui.pick_chats() end, { desc = "Teams list chats" })
   vim.api.nvim_create_user_command("MSTeamsTeams", function() ui.pick_teams() end, { desc = "Teams list teams and channels" })
   vim.api.nvim_create_user_command("MSTeamsFind", function() ui.find_chats() end, { desc = "Teams fuzzy find chats with Telescope (<C-b> toggle unread/all)" })

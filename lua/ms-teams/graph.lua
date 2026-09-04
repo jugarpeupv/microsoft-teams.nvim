@@ -25,7 +25,11 @@ local function graph_request(kind, method, path, body)
   if vim.v.shell_error ~= 0 then return nil, out end
   local ok, j = pcall(vim.json.decode, out)
   if not ok then return nil, out end
-  if j.error then return nil, j.error.message or vim.inspect(j.error) end
+  if j.error then
+    local code = j.error.code and ("[" .. tostring(j.error.code) .. "] ") or ""
+    local detail = (j.error.message and j.error.message ~= "") and j.error.message or vim.inspect(j.error)
+    return nil, code .. detail
+  end
   return j, nil
 end
 
@@ -61,7 +65,9 @@ local function graph_request_async(kind, method, path, body, cb)
           return
         end
         if j.error then
-          local emsg = j.error.message or vim.inspect(j.error)
+          local code = j.error.code and ("[" .. tostring(j.error.code) .. "] ") or ""
+          local detail = (j.error.message and j.error.message ~= "") and j.error.message or vim.inspect(j.error)
+          local emsg = code .. detail
           -- If token was revoked/invalidated on Graph side, clear access_token expiry and trigger auth
           if emsg:find("InvalidAuthenticationToken") or emsg:find("CompactToken") or emsg:find("Lifetime validation failed") then
             auth.ensure_token_async(kind, function(new_tok, err_login)
@@ -600,6 +606,54 @@ function M.list_users(query, cb)
     cb(j.value or {}, nil)
   end)
 end
+
+function M.get_token_scopes()
+  local token = auth.get_token("read")
+  if not token or type(token) ~= "string" then return nil end
+  local parts = vim.split(token, ".", { plain = true })
+  if #parts < 2 then return nil end
+  local b64 = parts[2]:gsub("-", "+"):gsub("_", "/")
+  local pad = #b64 % 4
+  if pad > 0 then b64 = b64 .. string.rep("=", 4 - pad) end
+  local ok, js = pcall(vim.json.decode, vim.fn.system({ "python3", "-c", "import base64,sys;sys.stdout.write(base64.b64decode(sys.argv[1]).decode())", b64 }))
+  if not ok or not js then return nil end
+  local scopes = {}
+  if js.scp and type(js.scp) == "string" then
+    for s in js.scp:gmatch("%S+") do table.insert(scopes, s) end
+  end
+  if js.roles and type(js.roles) == "table" then
+    for _, r in ipairs(js.roles) do if r ~= vim.NIL then table.insert(scopes, tostring(r)) end end
+  end
+  return scopes
+end
+
+function M.list_chat_tabs(chat_id, cb)
+  if not chat_id or chat_id == "" then cb(nil, "no chat id"); return end
+  graph_request_async("read", "GET", "/chats/" .. chat_id .. "/tabs", nil, function(j, err)
+    if not j then cb(nil, err); return end
+    cb(j.value or {}, nil)
+  end)
+end
+
+-- create organization view sharing link for a drive item; returns a
+-- /:x:/...?e=... style webUrl that opens without an interactive login
+function M.create_sharing_link(drive_id, item_id, cb)
+  if not drive_id or drive_id == "" or not item_id or item_id == "" then
+    cb(nil, "no drive/item id")
+    return
+  end
+  graph_request_async("read", "POST",
+    "/drives/" .. drive_id .. "/items/" .. item_id .. "/createLink",
+    { type = "view", scope = "organization" },
+    function(j, err)
+      if not j then cb(nil, err); return end
+      local link = (type(j) == "table" and type(j.link) == "table") and j.link or nil
+      local web_url = (link and link.webUrl) or j.webUrl or j.shareUrl
+      if not web_url or web_url == "" then cb(nil, "no webUrl in createLink response"); return end
+      cb(web_url, nil)
+    end)
+end
+
 
 function M.create_chat(target_user_id, cb)
   get_user_identity(function(my_user_id, _, err)

@@ -7,12 +7,87 @@ local function nv(v)
   return v
 end
 
+-- tabReference attachments carry {"tabId": "..."} JSON in content; the file
+-- URL is resolved via GET /chats/{id}/tabs -> configuration.contentUrl
+local function url_decode(s)
+  if not s or s == "" then return "" end
+  return (s:gsub("%%(%x%x)", function(h) return string.char(tonumber(h, 16)) end))
+end
+-- decode repeatedly until stable (handles double-encoded %2520 etc)
+local function fully_decode(s)
+  local prev, cur = nil, s or ""
+  while cur ~= prev do
+    prev = cur
+    cur = url_decode(cur)
+  end
+  return cur
+end
+-- Teams tab launcher URLs (m365.cloud.microsoft/launch/...) embed the real
+-- file in subEntityId.objectUrl (often double-encoded); unwrap to direct URL.
+-- Also normalizes any double-encoded (%25...) URL to fixpoint.
+local function unwrap_tab_url(url)
+  if not url or url == "" then return url end
+  local sub = url:match("[?&]subEntityId=([^&]+)")
+  if sub then
+    local decoded = url_decode(url_decode(sub))
+    local obj = decoded:match('"objectUrl"%s*:%s*"([^"]+)"')
+    if obj and obj ~= "" then url = obj end
+  end
+  if url:find("%%25") then
+    local prev, cur = nil, url
+    while cur ~= prev do
+      prev = cur
+      cur = url_decode(cur)
+    end
+    url = cur
+  end
+  return url
+end
+local function parse_tab_reference(content)
+  if not content or content == "" then return nil, nil end
+  local ok, j = pcall(vim.json.decode, content)
+  if ok and type(j) == "table" then
+    local tab_id = j.tabId or j.tabid or j.tab_id or j.id
+    local tab_name = j.tabName or j.tabname or j.tab_name or j.name or j.displayName
+    if tab_id == vim.NIL then tab_id = nil end
+    if tab_name == vim.NIL then tab_name = nil end
+    if tab_id then return tab_id, tab_name end
+  end
+  -- fallback: raw content may embed a GUID and/or "tabName":"..."
+  local guid = content:match("(%x%x%x%x%x%x%x%x%-%x%x%x%x%-%x%x%x%x%-%x%x%x%x%-%x%x%x%x%x%x%x%x%x%x%x%x)")
+  local tname = content:match('"tab[Nn]ame"%s*:%s*"([^"]+)"')
+  return guid, tname
+end
+-- extract SharePoint drive/item ids from a Teams launcher websiteUrl
+-- (subEntityId JSON carries driveId/docId)
+local function parse_drive_ids(website_url)
+  if not website_url or website_url == "" then return nil, nil end
+  local sub = website_url:match("[?&]subEntityId=([^&]+)")
+  if not sub then return nil, nil end
+  local decoded = url_decode(url_decode(sub))
+  local drive = decoded:match('"driveId"%s*:%s*"([^"]+)"')
+  local doc = decoded:match('"docId"%s*:%s*"([^"]+)"')
+  if drive == "" then drive = nil end
+  if doc == "" then doc = nil end
+  return drive, doc
+end
+
 local function get_unread_hl_group()
   local cfg = require("ms-teams.config").options
   if cfg and cfg.highlights and cfg.highlights.unread and cfg.highlights.unread ~= "" then
     return cfg.highlights.unread
   end
   return "DiagnosticInfo"
+end
+
+local function get_chat_type_icon(chat)
+  local cfg = require("ms-teams.config").options
+  if not cfg or not cfg.icons or not cfg.icons.enabled then return "" end
+  local ct = nv(chat.chatType) or "default"
+  local icons = cfg.icons.chatType or {}
+  -- meeting takes precedence even if also groupChat
+  if ct == "meeting" then return icons.meeting or "" end
+  return icons[ct] or icons.default or ""
 end
 
 local function is_from_me(fromUser)
@@ -34,6 +109,38 @@ local function is_from_me(fromUser)
   if dname and me_name and dname == me_name then return true end
   -- if no cache, check isOwned flag
   return false
+end
+
+local function get_other_user_id(chat)
+  if nv(chat.chatType) ~= "oneOnOne" then return nil end
+  local members = nv(chat.members)
+  if members and type(members) == "table" and #members > 0 then
+    local me = nil
+    local ok, cache_data = pcall(require("ms-teams.cache").load, "me")
+    if ok and cache_data and cache_data.id then me = cache_data.id end
+    if not me then me = vim.g.ms_teams_me_id end
+    for _, m in ipairs(members) do
+      if m ~= vim.NIL then
+        local uid = nv(m.userId) or nv(m.id)
+        if uid and uid ~= me then return uid end
+        local dname = nv(m.displayName)
+        local me_name = cache_data and cache_data.displayName or vim.g.ms_teams_me_name
+        if dname and me_name and dname ~= me_name then
+          if uid and uid:match("^%x%x%x%x%x%x%x%x%-%x") then return uid end
+        end
+      end
+    end
+  end
+  -- fallback: use lastMessagePreview.from when members not yet enriched (list_chats without $expand=members)
+  local preview = nv(chat.lastMessagePreview)
+  if preview then
+    local from = nv(preview.from) and nv(nv(preview.from).user)
+    if from and not is_from_me(from) then
+      local fid = nv(from.id)
+      if fid and fid:match("^%x%x%x%x%x%x%x%x%-%x") then return fid end
+    end
+  end
+  return nil
 end
 
 local function is_message_unread(msg, chat)
@@ -422,19 +529,9 @@ local function build_message_lines(m, chat)
   local hosted = nv(m.hostedContents)
   local mtype = nv(m.messageType)
   local edetail = nv(m.eventDetail)
-  if body ~= "" or #img_srcs > 0 then
-    if reply_preview then
-      table.insert(lines, "  " .. string.format("_↳ reply to: %s_", reply_preview))
-    end
-    if body ~= "" then
-      for line in body:gmatch("[^\n]+") do
-        table.insert(lines, "  " .. line)
-      end
-    end
-  else
-    if deleted then
-      table.insert(lines, "  " .. string.format("_Message deleted on %s_", format_date(deleted)))
-    elseif atts and type(atts) == "table" and #atts > 0 then
+  local rendered_file = false
+  local function render_attachments()
+    if atts and type(atts) == "table" and #atts > 0 then
       for _, a in ipairs(atts) do
         if a == vim.NIL then goto ac end
         local ct = nv(a.contentType) or "attachment"
@@ -445,21 +542,60 @@ local function build_message_lines(m, chat)
           table.insert(img_srcs, src)
           local fname = nv(a.name) or ""
           if fname == "" and contentUrl ~= "" then fname = contentUrl:match("/([^/%?]+)%??") or "" end
-          fname = fname:gsub("%%20"," "):gsub("%%2E","."):gsub("%%5F","_")
+          fname = fully_decode(fname):gsub("%%20"," "):gsub("%%2E","."):gsub("%%5F","_")
           if fname == "" then fname = hid ~= "0" and hid:sub(1,20) or "file" end
           local host = contentUrl:match("https://([^/]+)/") or src:match("https://([^/]+)/") or "graph.microsoft.com"
           table.insert(lines, string.format("  [File: %s (%s) - press gx to open]", fname, host))
+          rendered_file = true
+        elseif ct == "tabReference" and (nv(a.contentUrl) or "") == "" then
+          local tname = fully_decode(nv(a.name) or "")
+          local tid, ttn = parse_tab_reference(nv(a.content) or "")
+          if tname == "" then tname = (ttn and fully_decode(ttn)) or "tab" end
+          if tid or tname ~= "tab" then
+            table.insert(lines, string.format("  [Tab: %s - resolving file...]", tname))
+          else
+            table.insert(lines, string.format("  [Tab: %s]", tname))
+          end
+        elseif ct ~= "messageReference" and nv(a.contentUrl) ~= "" and nv(a.contentUrl) ~= nil then
+          local contentUrl = nv(a.contentUrl) or ""
+          local src = contentUrl
+          local fname = nv(a.name) or ""
+          if fname == "" and contentUrl ~= "" then fname = contentUrl:match("/([^/%?]+)%??") or "" end
+          fname = fully_decode(fname):gsub("%%20"," "):gsub("%%2E","."):gsub("%%5F","_")
+          local host = contentUrl:match("https://([^/]+)/") or "graph.microsoft.com"
+          table.insert(img_srcs, src)
+          table.insert(lines, string.format("  [File: %s (%s) - press gx to open]", fname, host))
+          rendered_file = true
         elseif ct == "messageReference" then table.insert(lines, "  [Reference to message]")
         else table.insert(lines, "  " .. string.format("[Attachment: %s]", ct)) end
         ::ac::
       end
-      if #atts == 0 then table.insert(lines, "  [Attachment with no body]") end
-    elseif hosted and type(hosted) == "table" and #hosted > 0 then
+    end
+    if hosted and type(hosted) == "table" and #hosted > 0 and not rendered_file then
       local hid = nv(hosted[1].id) or nv(hosted[1].contentId) or "0"
       local src = is_channel and string.format("https://graph.microsoft.com/v1.0/teams/%s/channels/%s/messages/%s/hostedContents/%s/$value", team_id or "", chat_id, mid or "", hid) or string.format("https://graph.microsoft.com/v1.0/chats/%s/messages/%s/hostedContents/%s/$value", chat_id, mid or "", hid)
       table.insert(img_srcs, src)
       local host = src:match("https://([^/]+)/") or "graph.microsoft.com"
       table.insert(lines, string.format("  [File: %s (%s) - press gx to open]", hid:sub(1,20), host))
+    end
+  end
+  if body ~= "" or #img_srcs > 0 then
+    if reply_preview then
+      table.insert(lines, "  " .. string.format("_↳ reply to: %s_", reply_preview))
+    end
+    if body ~= "" then
+      for line in body:gmatch("[^\n]+") do
+        table.insert(lines, "  " .. line)
+      end
+    end
+    render_attachments()
+  else
+    if deleted then
+      table.insert(lines, "  " .. string.format("_Message deleted on %s_", format_date(deleted)))
+    elseif atts and type(atts) == "table" and #atts > 0 then
+      render_attachments()
+    elseif hosted and type(hosted) == "table" and #hosted > 0 then
+      render_attachments()
     elseif mtype and mtype ~= "message" then
       local otype = edetail and nv(edetail["@odata.type"]) or ""
       if otype:find("callStarted") then
@@ -744,10 +880,12 @@ function M.pick_chats()
     local line_to_chat = {}
     local line_to_entry = {}
     local unread_lines = {}
-    for _, chat in ipairs(display) do
-      local line = format_chat(chat)
-      if nv(chat.chatType) == "meeting" then line = line .. " (meeting)" end
-      table.insert(lines, line)
+      for _, chat in ipairs(display) do
+        local base = format_chat(chat)
+        local type_icon = get_chat_type_icon(chat)
+        local line = type_icon ~= "" and (type_icon .. " " .. base) or base
+        if nv(chat.chatType) == "meeting" then line = line .. " (meeting)" end
+        table.insert(lines, line)
       local lnum = #lines
       line_to_chat[lnum] = chat
       line_to_entry[lnum] = {type="chat", chat=chat}
@@ -1407,6 +1545,124 @@ function M.show_messages(chat, open)
     vim.api.nvim_buf_set_var(buf, "ms_teams_total", #msgs)
     vim.api.nvim_buf_set_var(buf, "ms_teams_ns", ns)
     vim.api.nvim_buf_set_var(buf, "ms_teams_cache_key", cache_key)
+    -- resolve tabReference attachments (e.g. Excel added as tab): fetch chat
+    -- tabs once, patch contentUrl on the message objects, re-render silently
+    do
+      local pending = {}
+      for _, m in ipairs(msgs) do
+        if m ~= vim.NIL and m ~= nil then
+          local matts = nv(m.attachments)
+          if matts and type(matts) == "table" then
+            for _, a in ipairs(matts) do
+              if a ~= vim.NIL and nv(a.contentType) == "tabReference" and not a._tab_failed and not a._tab_direct then
+                local existing = nv(a.contentUrl) or ""
+                -- stable sharing links (/:x:/) are reused as-is; direct URLs
+                -- may be stale (cached) so they are always re-resolved
+                if not existing:find("/:[a-z]:/") then
+                  local tid, tname = parse_tab_reference(nv(a.content) or "")
+                  local mname = fully_decode(nv(a.name) or "")
+                  if mname == "" and tname then mname = fully_decode(tname) end
+                  if tid or mname ~= "" then
+                    table.insert(pending, { att = a, tab_id = tid, match_name = mname ~= "" and mname or nil })
+                  end
+                end
+              end
+            end
+          end
+        end
+      end
+      if #pending > 0 then
+        require("ms-teams.graph").list_chat_tabs(chat_id, function(tabs, terr)
+          if not tabs then
+            for _, p in ipairs(pending) do p.att._tab_failed = true end
+            vim.notify("ms-teams: tab file resolve failed: " .. tostring(terr), vim.log.levels.ERROR)
+            return
+          end
+          local by_id = {}
+          if type(tabs) == "table" then
+            for _, t in ipairs(tabs) do
+              if t ~= vim.NIL and nv(t.id) then by_id[nv(t.id)] = t end
+            end
+          end
+          local changed = false
+          local link_pending = {}
+          for _, p in ipairs(pending) do
+            local t = p.tab_id and by_id[p.tab_id] or nil
+            if not t and p.match_name then
+              local want = p.match_name:lower()
+              for _, cand in pairs(by_id) do
+                local dn = nv(cand.displayName) or ""
+                if dn == p.match_name or dn:lower() == want then t = cand; break end
+              end
+            end
+            p.tab = t
+            if t then
+              local cfg = nv(t.configuration) or {}
+              local did, docid = parse_drive_ids(nv(cfg.websiteUrl) or "")
+              if did and docid then
+                p.drive_id, p.doc_id = did, docid
+                table.insert(link_pending, p)
+              else
+                local url = unwrap_tab_url(nv(cfg.contentUrl) or nv(cfg.websiteUrl) or "")
+                if url ~= "" then
+                  if p.att.contentUrl ~= url then p.att.contentUrl = url; changed = true end
+                  if (nv(p.att.name) or "") == "" then
+                    local nn = nv(t.displayName) or p.match_name or "tab file"
+                    if nn ~= "" then p.att.name = nn; changed = true end
+                  end
+                  p.att._tab_direct = true
+                else
+                  p.att._tab_failed = true
+                end
+              end
+            else
+              p.att._tab_failed = true
+            end
+          end
+          local function finish_tabs()
+            if changed then
+              vim.schedule(function()
+                if not vim.api.nvim_buf_is_valid(buf) then return end
+                local win = vim.fn.bufwinid(buf)
+                local cur = win ~= -1 and vim.api.nvim_win_get_cursor(win) or nil
+                render_buffer(msgs, nextLink, { buf = buf, keep_cursor = true, no_open = true, is_cached = opts.is_cached, target_cursor = cur and cur[1] or nil })
+              end)
+            else
+              vim.notify("ms-teams: could not resolve tab file (tab not found or no contentUrl)", vim.log.levels.WARN)
+            end
+          end
+          if #link_pending == 0 then finish_tabs(); return end
+          local remaining = #link_pending
+          for _, p in ipairs(link_pending) do
+            graph.create_sharing_link(p.drive_id, p.doc_id, function(link_url, lerr)
+              if link_url and link_url ~= "" then
+                if p.att.contentUrl ~= link_url then p.att.contentUrl = link_url; changed = true end
+                if (nv(p.att.name) or "") == "" then
+                  local nn = (p.tab and nv(p.tab.displayName)) or p.match_name or "tab file"
+                  if nn ~= "" then p.att.name = nn; changed = true end
+                end
+              else
+                -- fallback to direct file URL (may need interactive login)
+                local cfg = (p.tab and nv(p.tab.configuration)) or {}
+                local url = unwrap_tab_url(nv(cfg.contentUrl) or nv(cfg.websiteUrl) or "")
+                if url ~= "" then
+                  if p.att.contentUrl ~= url then p.att.contentUrl = url; changed = true end
+                  if (nv(p.att.name) or "") == "" then
+                    local nn = (p.tab and nv(p.tab.displayName)) or p.match_name or "tab file"
+                    if nn ~= "" then p.att.name = nn; changed = true end
+                  end
+                  p.att._tab_direct = true
+                else
+                  p.att._tab_failed = true
+                end
+              end
+              remaining = remaining - 1
+              if remaining == 0 then finish_tabs() end
+            end)
+          end
+        end)
+      end
+    end
     if not opts.no_open then
       if open == "current" then
         vim.api.nvim_win_set_buf(0, buf)
@@ -1662,15 +1918,31 @@ function M.show_messages(chat, open)
       local ok, img_map = pcall(vim.api.nvim_buf_get_var, buf, "ms_teams_image_map")
       local src = nil
       if ok and img_map and img_map[lnum] then
-        src = img_map[lnum]
+        src = unwrap_tab_url(img_map[lnum])
       else
         vim.notify("image src not found, try reopening chat", vim.log.levels.WARN)
         return
       end
       -- SharePoint files (personal docs) need browser, not Bearer token (aud mismatch)
+      -- ?web=1 opens in Office for the web (editable, collaborative) instead of downloading
       if src:find("sharepoint%.com") then
-        vim.notify("opening SharePoint file in browser...", vim.log.levels.INFO)
-        if vim.ui and vim.ui.open then vim.ui.open(src) else vim.fn.jobstart({"open", src}, {detach=true}) end
+        -- match Teams' own link shape: fully single-encoded ASCII (spaces AND
+        -- non-ASCII bytes encoded; existing %XX triplets untouched) so nothing
+        -- downstream treats raw UTF-8 as unencoded text and re-encodes it
+        local web_src = src:gsub(" ", "%%20")
+        web_src = web_src:gsub("[\128-\255]", function(c) return string.format("%%%02X", string.byte(c)) end)
+        if not web_src:find("[?&]web=") then
+          web_src = web_src .. (web_src:find("?", 1, true) and "&web=1" or "?web=1")
+        end
+        pcall(vim.fn.setreg, "+", web_src)
+        vim.notify("opening SharePoint file in browser (URL yanked to + register): " .. web_src, vim.log.levels.INFO)
+        local open_cmd = require("ms-teams.config").options.open_cmd
+        if open_cmd and type(open_cmd) == "table" and #open_cmd > 0 then
+          local cmd = {}
+          for _, v in ipairs(open_cmd) do table.insert(cmd, v) end
+          table.insert(cmd, web_src)
+          vim.fn.jobstart(cmd, { detach = true })
+        elseif vim.ui and vim.ui.open then vim.ui.open(web_src) else vim.fn.jobstart({"open", web_src}, {detach=true}) end
         return
       end
       vim.notify("downloading image... src="..src:sub(1,120), vim.log.levels.DEBUG)
@@ -2153,14 +2425,18 @@ function M.find_chats(opts)
       local items = {}
       for _, c in ipairs(top50) do
         local unread = has_unread(c)
-        if include_read or unread then
-          local name = format_chat(c)
+         if include_read or unread then
+           local base = format_chat(c)
+           local type_icon = get_chat_type_icon(c)
+           local icon_prefix = type_icon ~= "" and (type_icon .. " ") or ""
+           local display_name = icon_prefix .. base
           local prefix = unread and "● " or "  "
           table.insert(items, {
             chat = c,
-            name = name,
+            name = base,
+            display_name = display_name,
             unread = unread,
-            display = prefix .. name,
+            display = prefix .. display_name,
           })
         end
       end

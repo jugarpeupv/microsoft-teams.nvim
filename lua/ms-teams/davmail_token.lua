@@ -122,6 +122,22 @@ public class GetDavmailToken {
 end
 
 local auth_cmd_pending = nil
+-- notify-once for missing token state: first failure notifies, repeats are
+-- suppressed until success or a different message / 5 min pass
+local last_missing_notify_at = 0
+local last_missing_msg = nil
+local function notify_missing_once(msg)
+  local now = os.time()
+  if msg ~= last_missing_msg or now - last_missing_notify_at > 300 then
+    last_missing_msg = msg
+    last_missing_notify_at = now
+    vim.notify("ms-teams: " .. msg, vim.log.levels.ERROR)
+  end
+end
+local function reset_missing_notify()
+  last_missing_msg = nil
+  last_missing_notify_at = 0
+end
 local function run_auth_cmd()
   local ok, cfg = pcall(require, "ms-teams.config")
   local dav = ok and cfg.options and cfg.options.davmail or {}
@@ -208,7 +224,7 @@ function M.load_davmail_token(opts)
 
   local token_file, resolve_err = resolve_token_file(opts)
   if not token_file then
-    vim.notify("ms-teams: " .. resolve_err, vim.log.levels.ERROR)
+    notify_missing_once(resolve_err)
     if run_auth_cmd() then
       return nil, resolve_err .. " - auth_cmd launched, re-run after login"
     end
@@ -244,11 +260,12 @@ function M.load_davmail_token(opts)
 
   if not raw_val or raw_val == "" then
     local msg = "no token entry found for user '" .. (user ~= "" and user or "<any>") .. "' in " .. token_file
-    vim.notify("ms-teams: " .. msg, vim.log.levels.ERROR)
+    notify_missing_once(msg)
     if run_auth_cmd() then return nil, msg .. " - auth_cmd launched" end
     return nil, msg
   end
 
+  reset_missing_notify()
   if raw_val:match("^{AES}") then
     return decrypt_aes_token(token_file, user, password)
   else
@@ -287,6 +304,38 @@ local function save_access_cache(tok)
   pcall(vim.fn.system, {"chmod","600",p})
 end
 
+local function read_current_refresh_token()
+  local opts = {}
+  local ok, cfg = pcall(require, "ms-teams.config")
+  if ok and cfg.options and cfg.options.davmail then opts = cfg.options.davmail end
+  local token_file, err = resolve_token_file(opts)
+  if not token_file then return nil end
+  local user = ((opts.username or cfg.options.davmail.username) or read_prop("davmail.username") or ""):lower()
+  for _, line in ipairs(vim.fn.readfile(token_file)) do
+    local trimmed = vim.trim(line)
+    if not trimmed:match("^#") and trimmed:match("=") then
+      local k, v = trimmed:match("^([^=]+)=(.*)$")
+      if k and user ~= "" and vim.trim(k):lower() == user then
+        local val = vim.trim(v)
+        return (val ~= "" and val ~= "") and val or nil
+      end
+    end
+  end
+  return nil
+end
+
+local function access_cache_stale()
+  local cached = load_access_cache()
+  if not cached then return true end
+  local current_rt = read_current_refresh_token()
+  if not current_rt then return false end
+  if cached.refresh_token ~= current_rt then
+    access_cache = nil
+    return true
+  end
+  return false
+end
+
 local function refresh_access_token(refresh_token, opts, cb)
   local cfg_ok, cfg = pcall(require, "ms-teams.config")
   local dav = (cfg_ok and cfg.options and cfg.options.davmail) or {}
@@ -322,7 +371,7 @@ end
 function M.get_access_token(opts, cb)
   opts = opts or {}
   local cached = load_access_cache()
-  if cached then cb(cached.access_token, nil); return end
+  if cached and not access_cache_stale() then cb(cached.access_token, nil); return end
   local refresh, err = M.load_davmail_token(opts)
   if not refresh then cb(nil, err); return end
   refresh_access_token(refresh, opts, cb)
@@ -331,7 +380,7 @@ end
 function M.get_access_token_sync(opts)
   opts = opts or {}
   local cached = load_access_cache()
-  if cached then return cached.access_token end
+  if cached and not access_cache_stale() then return cached.access_token end
   local refresh, err = M.load_davmail_token(opts)
   if not refresh then return nil, err end
   local cfg_ok, cfg = pcall(require, "ms-teams.config")
