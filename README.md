@@ -15,10 +15,15 @@ DavMail OAuth token:
 - You authenticate once with DavMail (`davmail-token`, JavaFX browser
   window), which writes `oauth_tokens.env` (path taken from
   `davmail.oauth.tokenFilePath` in `~/.davmail.properties`).
-- The plugin reads and decrypts that refresh token
-  (`lua/ms-teams/davmail_token.lua`, including `{AES}` values via the
-  DavMail jar) and exchanges it for Graph access tokens, cached in
+- The plugin reads that refresh token (`lua/ms-teams/davmail_token.lua`)
+  and exchanges it for Graph access tokens, cached in
   `vim.fn.stdpath("data")/ms-teams/davmail_access.json` (`chmod 600`).
+- Plaintext tokens are supported and tested. Tokens stored as `{AES}`
+  are decrypted by delegating to DavMail's own `O365Token.load()` via
+  a small Java helper compiled against `davmail.jar` — this path is
+  **untested**. The decryption password comes from `davmail.password`
+  in `setup()`, else `davmail.oauth.password` in `.davmail.properties`,
+  else empty string.
 - Extra Graph scopes (beyond what DavMail requests) go in
   `davmail.oauth.scope` in `.davmail.properties`, then re-run
   `davmail-token` to reconsent.
@@ -79,8 +84,7 @@ config.lua ──► setup() options (scope, icons, watch, open_cmd, davmail)
 
 ```lua
 {
-  dir = "~/projects/ms-teams.nvim",
-  dev = true,
+  "jugarpeupv/microsoft-teams.nvim",
   cmd = { "MSTeamsChats", "MSTeamsLogin", "MSTeamsFind", "MSTeamsTeams" },
   keys = {
     { "<leader>ee", "<cmd>MSTeamsChats<cr>" },
