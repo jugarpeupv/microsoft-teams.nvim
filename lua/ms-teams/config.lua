@@ -34,6 +34,7 @@ M.defaults = {
   -- highlights: group used for unread chats/messages (defaults to "DiagnosticInfo")
   highlights = {
     unread = "DiagnosticInfo",
+    search = "DiagnosticUnderlineError",
   },
    -- icons for chats: type (emoji defaults, configurable)
    icons = {

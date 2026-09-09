@@ -33,7 +33,7 @@ local function graph_request(kind, method, path, body)
   return j, nil
 end
 
-local function graph_request_async(kind, method, path, body, cb)
+local function graph_request_async(kind, method, path, body, cb, extra_headers)
   auth.ensure_token_async(kind, function(token, err)
     if not token then
       vim.schedule(function() cb(nil, err) end)
@@ -41,6 +41,12 @@ local function graph_request_async(kind, method, path, body, cb)
     end
     local url = config.options.graph_base .. path
     local cmd = { "curl", "-s", "--max-time", "60", "-X", method, url, "-H", "Authorization: Bearer " .. token, "-H", "Content-Type: application/json" }
+    if extra_headers then
+      for k, v in pairs(extra_headers) do
+        table.insert(cmd, "-H")
+        table.insert(cmd, k .. ": " .. v)
+      end
+    end
     if body then
       table.insert(cmd, "-d")
       table.insert(cmd, vim.json.encode(body))
@@ -632,6 +638,112 @@ local function is_throttle_err(err)
   if not err then return false end
   local s = tostring(err)
   return s:find("TooManyRequests") ~= nil or s:find("429") ~= nil or s:find("[Tt]hrottl") ~= nil
+end
+
+local search_throttle_until = 0
+
+function M.search_chat_messages(chat_id, query, cb, team_id)
+  if not chat_id or chat_id == "" then cb(nil, "no chat id"); return end
+  if not query or query == "" then cb(nil, "empty query"); return end
+  if os.time() < search_throttle_until then
+    cb(nil, "[TooManyRequests] search throttled, try again later")
+    return
+  end
+  -- $search is not allowed on /chats/{id}/messages (AllowedQueryOptions error),
+  -- so we fetch paginated history and filter client-side with smart-case.
+  local function plain_of(m)
+    if not m or m == vim.NIL then return "" end
+    local parts = {}
+    local from_tbl = m.from
+    if from_tbl and from_tbl ~= vim.NIL then
+      local user_tbl = from_tbl.user
+      if user_tbl and user_tbl ~= vim.NIL then
+        local fu = user_tbl.displayName
+        if fu and fu ~= vim.NIL and fu ~= "" then table.insert(parts, tostring(fu)) end
+      end
+    end
+    local body_tbl = m.body
+    if body_tbl and body_tbl ~= vim.NIL then
+      local b = body_tbl.content
+      if b and b ~= vim.NIL and b ~= "" then
+        local body = tostring(b)
+        body = body:gsub("<[^>]+>", " "):gsub("&nbsp;", " "):gsub("&amp;", "&"):gsub("&lt;", "<"):gsub("&gt;", ">"):gsub("&quot;", '"')
+        body = body:gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
+        if body ~= "" then table.insert(parts, body) end
+      end
+    end
+    if m.attachments and type(m.attachments) == "table" then
+      for _, a in ipairs(m.attachments) do
+        if a ~= vim.NIL and a ~= nil then
+          local n = a.name
+          if n and n ~= vim.NIL and n ~= "" then table.insert(parts, tostring(n)) end
+        end
+      end
+    end
+    return table.concat(parts, " ")
+  end
+  local function matches_plain(plain, q)
+    if not plain or plain == "" then return false end
+    local sensitive = q:find("%u") ~= nil
+    local hay = sensitive and plain or plain:lower()
+    local needle = sensitive and q or q:lower()
+    return hay:find(needle, 1, true) ~= nil
+  end
+  local max_pages = 20 -- up to ~1000 msgs
+  local all_matches = {}
+  local seen_ids = {}
+  local function finish_sorted()
+    -- oldest first: results read chronologically, newest at the bottom
+    -- (ISO dates sort lexicographically)
+    table.sort(all_matches, function(a, b)
+      local at = (a.createdDateTime and a.createdDateTime ~= vim.NIL) and tostring(a.createdDateTime) or ""
+      local bt = (b.createdDateTime and b.createdDateTime ~= vim.NIL) and tostring(b.createdDateTime) or ""
+      return at < bt
+    end)
+    cb(all_matches, nil)
+  end
+  local function fetch_page(path, page_num)
+    local attempts = 0
+    local function attempt()
+      attempts = attempts + 1
+      graph_request_async("read", "GET", path, nil, function(j, err)
+        if not j and is_throttle_err(err) and attempts < 3 then
+          if tostring(err):find("TooManyRequests") then search_throttle_until = os.time() + 300 end
+          vim.defer_fn(attempt, attempts * 10000)
+          return
+        end
+        if not j then
+          -- if we already have matches, return them; otherwise propagate error
+          if #all_matches > 0 then finish_sorted() else cb(nil, err) end
+          return
+        end
+        for _, m in ipairs(j.value or {}) do
+          -- pages can overlap; dedupe by message id
+          local mid = (m ~= vim.NIL and m.id and m.id ~= vim.NIL) and tostring(m.id) or nil
+          if m ~= vim.NIL and mid and not seen_ids[mid] and matches_plain(plain_of(m), query) then
+            seen_ids[mid] = true
+            table.insert(all_matches, m)
+          end
+        end
+        local nl = j["@odata.nextLink"]
+        if nl and nl ~= "" and page_num < max_pages then
+          local path2 = nl:gsub("^https://graph.microsoft.com/v1.0", "")
+          fetch_page(path2, page_num + 1)
+        else
+          finish_sorted()
+        end
+      end)
+    end
+    attempt()
+  end
+  -- start from most recent page; team channel vs chat uses same paginated endpoint as list_messages
+  local start_path
+  if team_id and team_id ~= "" then
+    start_path = string.format("/chats/%s/messages?$top=50", chat_id)
+  else
+    start_path = string.format("/chats/%s/messages?$top=50", chat_id)
+  end
+  fetch_page(start_path, 1)
 end
 
 function M.list_chat_tabs(chat_id, cb)

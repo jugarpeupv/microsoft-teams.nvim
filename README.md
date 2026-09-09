@@ -120,6 +120,22 @@ Requires `telescope.nvim`. For watch notifications:
 * `:MSTeamsReply` / `S` — reply in chat buffer
 * `:MSTeamsWatchStart` / `Stop` / `Status` / `Poll` / `Restart` — watch polling
 
+## Searching in a chat
+
+Inside a chat detail buffer:
+
+* `g/` — search full history (server-side, smart-case: `hello` is
+  case-insensitive, `Hello` is case-sensitive). Results open in a
+  vertical split as snippets; `<CR>` (also `gx`/`gf`) moves the detail
+  cursor to the message — loading older history in the background if
+  needed — while focus stays in results. `<C-q>` sends results to the
+  quickfix list. `q` closes.
+* `gF` — same search in a Telescope picker; `<CR>` jumps to the
+  message, `<C-q>` / `<M-q>` send all / selected results to the
+  quickfix list, then navigate with `:cnext` / `:cprev`.
+* Jumped matches are underlined red (configurable via
+  `setup({ highlights = { search = "DiagnosticUnderlineError" } })`).
+
 ## Storage
 
 * `stdpath("data")/ms-teams/davmail_access.json` — cached Graph access token (`chmod 600`)
