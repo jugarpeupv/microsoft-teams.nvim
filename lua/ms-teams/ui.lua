@@ -7,6 +7,9 @@ local function nv(v)
   return v
 end
 
+-- circuit breaker: after a Graph 429 on tab resolution, stop trying for a while
+local tab_throttle_until = 0
+
 -- tabReference attachments carry {"tabId": "..."} JSON in content; the file
 -- URL is resolved via GET /chats/{id}/tabs -> configuration.contentUrl
 local function url_decode(s)
@@ -566,7 +569,7 @@ local function build_message_lines(m, chat)
           table.insert(img_srcs, src)
           table.insert(lines, string.format("  [File: %s (%s) - press gx to open]", fname, host))
           rendered_file = true
-        elseif ct == "messageReference" then table.insert(lines, "  [Reference to message]")
+        elseif ct == "messageReference" then goto ac
         else table.insert(lines, "  " .. string.format("[Attachment: %s]", ct)) end
         ::ac::
       end
@@ -1571,10 +1574,11 @@ function M.show_messages(chat, open)
           end
         end
       end
-      if #pending > 0 then
+      if #pending > 0 and os.time() >= tab_throttle_until then
         require("ms-teams.graph").list_chat_tabs(chat_id, function(tabs, terr)
           if not tabs then
             for _, p in ipairs(pending) do p.att._tab_failed = true end
+            if tostring(terr):find("TooManyRequests") then tab_throttle_until = os.time() + 300 end
             vim.notify("ms-teams: tab file resolve failed: " .. tostring(terr), vim.log.levels.ERROR)
             return
           end

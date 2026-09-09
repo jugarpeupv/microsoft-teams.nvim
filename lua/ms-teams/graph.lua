@@ -627,12 +627,28 @@ function M.get_token_scopes()
   return scopes
 end
 
+-- Graph throttling (429 TooManyRequests): worth one retry after backoff
+local function is_throttle_err(err)
+  if not err then return false end
+  local s = tostring(err)
+  return s:find("TooManyRequests") ~= nil or s:find("429") ~= nil or s:find("[Tt]hrottl") ~= nil
+end
+
 function M.list_chat_tabs(chat_id, cb)
   if not chat_id or chat_id == "" then cb(nil, "no chat id"); return end
-  graph_request_async("read", "GET", "/chats/" .. chat_id .. "/tabs", nil, function(j, err)
-    if not j then cb(nil, err); return end
-    cb(j.value or {}, nil)
-  end)
+  local attempts = 0
+  local function attempt()
+    attempts = attempts + 1
+    graph_request_async("read", "GET", "/chats/" .. chat_id .. "/tabs", nil, function(j, err)
+      if not j and is_throttle_err(err) and attempts < 3 then
+        vim.defer_fn(attempt, attempts * 10000)
+        return
+      end
+      if not j then cb(nil, err); return end
+      cb(j.value or {}, nil)
+    end)
+  end
+  attempt()
 end
 
 -- create organization view sharing link for a drive item; returns a
@@ -642,16 +658,25 @@ function M.create_sharing_link(drive_id, item_id, cb)
     cb(nil, "no drive/item id")
     return
   end
-  graph_request_async("read", "POST",
-    "/drives/" .. drive_id .. "/items/" .. item_id .. "/createLink",
-    { type = "view", scope = "organization" },
-    function(j, err)
-      if not j then cb(nil, err); return end
-      local link = (type(j) == "table" and type(j.link) == "table") and j.link or nil
-      local web_url = (link and link.webUrl) or j.webUrl or j.shareUrl
-      if not web_url or web_url == "" then cb(nil, "no webUrl in createLink response"); return end
-      cb(web_url, nil)
-    end)
+  local attempts = 0
+  local function attempt()
+    attempts = attempts + 1
+    graph_request_async("read", "POST",
+      "/drives/" .. drive_id .. "/items/" .. item_id .. "/createLink",
+      { type = "view", scope = "organization" },
+      function(j, err)
+        if not j and is_throttle_err(err) and attempts < 3 then
+          vim.defer_fn(attempt, attempts * 10000)
+          return
+        end
+        if not j then cb(nil, err); return end
+        local link = (type(j) == "table" and type(j.link) == "table") and j.link or nil
+        local web_url = (link and link.webUrl) or j.webUrl or j.shareUrl
+        if not web_url or web_url == "" then cb(nil, "no webUrl in createLink response"); return end
+        cb(web_url, nil)
+      end)
+  end
+  attempt()
 end
 
 
