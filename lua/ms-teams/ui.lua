@@ -210,6 +210,9 @@ local function get_last_read_iso(chat)
   return vp and nv(vp.lastMessageReadDateTime)
 end
 
+-- coalesce rapid re-renders (tab resolve + search + watch) into one per tick
+local pending_detail_renders = {}
+local detail_loading_ns = vim.api.nvim_create_namespace("ms_teams_loading")
 -- search in chat (Option B: server-side) helpers
 local search_ns = vim.api.nvim_create_namespace("ms_teams_search_hl")
 local function is_smart_case_sensitive(q)
@@ -965,16 +968,33 @@ function M.pick_chats()
         if team_has_unread then unread_lines[lnum] = true end
       end
     end
-    vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
-    local ns = vim.api.nvim_create_namespace("ms_teams_unread")
-    vim.api.nvim_buf_clear_namespace(buf, ns, 0, -1)
-    local hl_group = get_unread_hl_group()
-    for lnum,_ in pairs(unread_lines) do vim.api.nvim_buf_add_highlight(buf, ns, hl_group, lnum-1,0,-1) end
+    -- dirty check to avoid flicker when content unchanged
+    local do_render_list = true
+    if vim.api.nvim_buf_is_valid(buf) then
+      local ok_old, old = pcall(vim.api.nvim_buf_get_lines, buf, 0, -1, false)
+      if ok_old and old and #old == #lines then
+        local same = true
+        for i = 1, #lines do if old[i] ~= lines[i] then same = false; break end end
+        if same then do_render_list = false end
+      end
+    end
+    if do_render_list then
+      -- preserve view
+      local win_list = vim.fn.bufwinid(buf)
+      local saved = nil
+      if win_list ~= -1 then saved = vim.api.nvim_win_call(win_list, function() return vim.fn.winsaveview() end) end
+      vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+      if saved and win_list ~= -1 then pcall(vim.api.nvim_win_call, win_list, function() vim.fn.winrestview(saved) end) end
+      local ns = vim.api.nvim_create_namespace("ms_teams_unread")
+      vim.api.nvim_buf_clear_namespace(buf, ns, 0, -1)
+      local hl_group = get_unread_hl_group()
+      for lnum,_ in pairs(unread_lines) do vim.api.nvim_buf_add_highlight(buf, ns, hl_group, lnum-1,0,-1) end
+      pcall(vim.api.nvim_buf_set_var, buf, "ms_teams_ns", vim.api.nvim_create_namespace("ms_teams_unread"))
+    end
     vim.api.nvim_buf_set_var(buf, "ms_teams_chats", display)
     vim.api.nvim_buf_set_var(buf, "ms_teams_line_to_chat", line_to_chat)
     vim.api.nvim_buf_set_var(buf, "ms_teams_line_to_entry", line_to_entry)
     vim.api.nvim_buf_set_var(buf, "ms_teams_all_chats", all_for_search)
-    vim.api.nvim_buf_set_var(buf, "ms_teams_render_and_bind", render_and_bind)
     vim.api.nvim_buf_set_var(buf, "ms_teams_teams", teams_data)
     if vim.api.nvim_get_current_buf() == buf then
       pcall(vim.api.nvim_win_set_cursor, 0, {math.max(1, math.min(cur_lnum, #lines)), 0})
@@ -2056,6 +2076,26 @@ function M.show_messages(chat, open)
 
   local function render_buffer(msgs, nextLink, opts)
     opts = opts or {}
+    -- coalesce background re-renders (tab resolve, search jump, watch) — they
+    -- fire in bursts and each full set_lines flickers the cursor
+    if opts.no_cursor and opts.buf and vim.api.nvim_buf_is_valid(opts.buf) and not opts.force then
+      local b = opts.buf
+      if pending_detail_renders[b] then
+        pending_detail_renders[b] = { msgs = msgs, nextLink = nextLink, opts = vim.deepcopy(opts) }
+        return b
+      end
+      pending_detail_renders[b] = { msgs = msgs, nextLink = nextLink, opts = vim.deepcopy(opts) }
+      vim.defer_fn(function()
+        local p = pending_detail_renders[b]
+        pending_detail_renders[b] = nil
+        if p and vim.api.nvim_buf_is_valid(b) then
+          p.opts.force = true
+          -- keep same buf identity; bypass coalesce on this final flush
+          render_buffer(p.msgs, p.nextLink, p.opts)
+        end
+      end, 35)
+      return opts.buf
+    end
     local is_cached = opts.is_cached
     if not msgs then msgs = {} end
     local buf = opts.buf
@@ -2199,12 +2239,35 @@ function M.show_messages(chat, open)
     table.insert(lines, "Chat: " .. format_chat(chat) .. " | " .. #msgs .. " messages")
     table.insert(lines, "Hints: q close | S reply (<C-p> paste img) | R refresh | g/ search | gF telescope search | g? participants | mr mark read | mu mark unread | gR load 50 older | <CR> jump to original")
 
-    vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
-    local ns = vim.api.nvim_create_namespace("ms_teams_msg_unread")
-    local hl_group = get_unread_hl_group()
-    for lnum, _ in pairs(unread_msg_lines) do
-      vim.api.nvim_buf_add_highlight(buf, ns, hl_group, lnum - 1, 0, -1)
+    -- dirty check: skip full set_lines/highlights if content identical (major flicker source)
+    local do_render = true
+    if not opts.force and vim.api.nvim_buf_is_valid(buf) then
+      local ok_old, old = pcall(vim.api.nvim_buf_get_lines, buf, 0, -1, false)
+      if ok_old and old and #old == #lines then
+        local same = true
+        for i = 1, #lines do if old[i] ~= lines[i] then same = false; break end end
+        if same then do_render = false end
+      end
     end
+    local ns = vim.api.nvim_create_namespace("ms_teams_msg_unread")
+    if do_render then
+      -- preserve view for background re-renders (no_cursor)
+      local win_for_view = vim.fn.bufwinid(buf)
+      local saved_view = nil
+      if win_for_view ~= -1 and (opts.no_cursor or opts.keep_cursor) then
+        saved_view = vim.api.nvim_win_call(win_for_view, function() return vim.fn.winsaveview() end)
+      end
+      vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+      if saved_view and win_for_view ~= -1 then
+        pcall(vim.api.nvim_win_call, win_for_view, function() vim.fn.winrestview(saved_view) end)
+      end
+      local hl_group = get_unread_hl_group()
+      for lnum, _ in pairs(unread_msg_lines) do
+        vim.api.nvim_buf_add_highlight(buf, ns, hl_group, lnum - 1, 0, -1)
+      end
+    end
+    -- keep ns var even when skipping render
+    pcall(vim.api.nvim_buf_set_var, buf, "ms_teams_ns", ns)
 
     vim.api.nvim_buf_set_var(buf, "ms_teams_chat_id", chat_id)
     vim.api.nvim_buf_set_var(buf, "ms_teams_chat", chat)
@@ -2386,13 +2449,45 @@ function M.show_messages(chat, open)
         vim.notify("no more messages (top reached)", vim.log.levels.INFO)
         return
       end
+      local win_before = vim.fn.bufwinid(buf)
+      local view_before = nil
+      local lnum_before = nil
+      local col_before = 0
+      local target_id_before = nil
+      local target_lnum_before = nil
+      if win_before ~= -1 then
+        view_before = vim.api.nvim_win_call(win_before, function() return vim.fn.winsaveview() end)
+        local cur = vim.api.nvim_win_get_cursor(win_before)
+        lnum_before = cur[1]
+        col_before = cur[2]
+        -- find message id under cursor (nearest header <= lnum)
+        local ok_map, id_map = pcall(vim.api.nvim_buf_get_var, buf, "ms_teams_id_to_lnum")
+        if ok_map and type(id_map) == "table" and lnum_before then
+          local best_lnum = -1
+          for id, lnum in pairs(id_map) do
+            if lnum <= lnum_before and lnum > best_lnum then
+              best_lnum = lnum
+              target_id_before = id
+              target_lnum_before = lnum
+            end
+          end
+          if not target_id_before then
+            local min_lnum = math.huge
+            for id, lnum in pairs(id_map) do
+              if lnum < min_lnum then min_lnum = lnum; target_id_before = id; target_lnum_before = lnum end
+            end
+          end
+        end
+      end
       loading = true
       vim.notify("loading 50 older messages...", vim.log.levels.INFO)
-      vim.api.nvim_buf_set_lines(buf, HEADER_LINES, HEADER_LINES, false, {"_Loading 50 more..._"})
+      -- virtual progress (no real line insertion → no flicker/layout shift)
+      pcall(vim.api.nvim_buf_clear_namespace, buf, detail_loading_ns, 0, -1)
+      pcall(vim.api.nvim_buf_set_extmark, buf, detail_loading_ns, HEADER_LINES - 1, 0, { virt_text = { { "⟳ Loading 50 more…", "Comment" } }, virt_text_pos = "eol", hl_mode = "combine" })
       do_list_messages(chat_id, function(more, err2, next2)
         vim.schedule(function()
           if not vim.api.nvim_buf_is_valid(buf) then loading=false; return end
-          pcall(vim.api.nvim_buf_set_lines, buf, HEADER_LINES, HEADER_LINES+1, false, {})
+          pcall(vim.api.nvim_buf_clear_namespace, buf, detail_loading_ns, 0, -1)
           if err2 then
             vim.notify("load more failed: "..err2, vim.log.levels.ERROR)
             loading=false; return
@@ -2449,14 +2544,42 @@ function M.show_messages(chat, open)
           pcall(vim.api.nvim_buf_set_var, buf, "ms_teams_raw_msgs", combined)
           cache.save(cache_key, { messages = combined, nextLink = next2 or "" })
 
-          -- Re-render entire buffer with all accumulated messages so sorting & Last read divider are 100% consistent
-          render_buffer(combined, next2, { is_cached = false, buf = buf, no_open = true })
+           -- Re-render entire buffer with all accumulated messages so sorting & Last read divider are 100% consistent
+            render_buffer(combined, next2, { is_cached = false, buf = buf, no_open = true, no_cursor = true, force = true })
 
-          local win = vim.fn.bufwinid(buf)
-          if win ~= -1 then
-            pcall(vim.api.nvim_win_set_cursor, win, { HEADER_LINES + 1, 0 })
-          end
-          vim.notify(string.format("loaded %d older messages (%d total)%s", #more, #combined, (next2 and next2~="" and "" or " - all loaded")), vim.log.levels.INFO)
+            local win = vim.fn.bufwinid(buf)
+            if win ~= -1 and target_id_before then
+              local ok_new, new_map = pcall(vim.api.nvim_buf_get_var, buf, "ms_teams_id_to_lnum")
+              local new_lnum = ok_new and new_map and new_map[target_id_before] or nil
+              if new_lnum then
+                local offset = 0
+                if lnum_before and target_lnum_before then offset = lnum_before - target_lnum_before end
+                local cur_keep = new_lnum + offset
+                if view_before then
+                  local delta = new_lnum - (target_lnum_before or lnum_before or new_lnum)
+                  view_before.topline = view_before.topline + delta
+                  view_before.lnum = cur_keep
+                  view_before.col = col_before
+                  view_before.lnum_add = 0
+                  pcall(vim.api.nvim_win_call, win, function() vim.fn.winrestview(view_before) end)
+                end
+                pcall(vim.api.nvim_win_set_cursor, win, { cur_keep, col_before })
+              elseif view_before and lnum_before then
+                -- fallback: line offset
+                local cur_keep2 = lnum_before + inserted
+                view_before.lnum = cur_keep2
+                pcall(vim.api.nvim_win_call, win, function() vim.fn.winrestview(view_before) end)
+                pcall(vim.api.nvim_win_set_cursor, win, { cur_keep2, col_before })
+              end
+            elseif win ~= -1 and lnum_before then
+              local cur_keep2 = lnum_before + inserted
+              if view_before then
+                view_before.lnum = cur_keep2
+                pcall(vim.api.nvim_win_call, win, function() vim.fn.winrestview(view_before) end)
+              end
+              pcall(vim.api.nvim_win_set_cursor, win, { cur_keep2, col_before })
+            end
+            vim.notify(string.format("50 more messages loaded (%d total)%s", #combined, (next2 and next2~="" and "" or " - all loaded")), vim.log.levels.INFO)
           loading = false
         end)
       end, nl)
