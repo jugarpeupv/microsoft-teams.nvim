@@ -138,7 +138,7 @@ local function reset_missing_notify()
   last_missing_msg = nil
   last_missing_notify_at = 0
 end
-local function run_auth_cmd()
+local function run_auth_cmd(quiet)
   local ok, cfg = pcall(require, "ms-teams.config")
   local dav = ok and cfg.options and cfg.options.davmail or {}
   local cmd = dav.auth_cmd or "davmail-token"
@@ -152,13 +152,26 @@ local function run_auth_cmd()
     -- use zsh -ic to resolve aliases like davmail-token (needs interactive to load ~/.zshrc)
     job_cmd = {"zsh","-ic", cmd}
   end
-  vim.notify("ms-teams davmail: token missing or expired, running auth_cmd...", vim.log.levels.WARN)
+  if not quiet then
+    vim.notify("ms-teams davmail: token missing or expired, running auth_cmd...", vim.log.levels.WARN)
+  end
   pcall(vim.fn.jobstart, job_cmd, {
     pty = true,
     on_exit = function(_, code)
       vim.schedule(function()
         if code == 0 then
-          vim.notify("ms-teams: davmail authenticated successfully, re-run command", vim.log.levels.INFO)
+          vim.notify("ms-teams: davmail authenticated successfully, refreshing...", vim.log.levels.INFO)
+          -- give davmail a moment to flush oauth_tokens.env, then retry pending UI
+          vim.defer_fn(function()
+            local ok_ui, ui = pcall(require, "ms-teams.ui")
+            if ok_ui and ui.refresh_chats_background then
+              ui.refresh_chats_background(function() end)
+            end
+            local ok_w, watch = pcall(require, "ms-teams.watch")
+            if ok_w and watch.is_running and watch.is_running() and watch.poll_once then
+              watch.poll_once()
+            end
+          end, 2000)
         else
           vim.notify("ms-teams: davmail auth_cmd failed (exit " .. code .. ")", vim.log.levels.ERROR)
         end
@@ -336,6 +349,36 @@ local function access_cache_stale()
   return false
 end
 
+-- errors meaning the refresh token/session is dead and only an interactive
+-- re-login fixes it (e.g. AADSTS50078 MFA expired, expired/revoked grant)
+local function is_reauth_needed(err_text)
+  if not err_text then return false end
+  local s = tostring(err_text):lower()
+  return s:find("invalid_grant", 1, true) ~= nil
+    or s:find("interaction_required", 1, true) ~= nil
+end
+
+local reauth_cooldown_until = 0
+local REAUTH_COOLDOWN_S = 600 -- relaunch auth_cmd at most every 10 min for dead sessions
+
+local function clear_access_cache()
+  access_cache = nil
+  pcall(vim.fn.delete, get_cache_path())
+end
+
+-- returns true when err_text indicated a dead session (caller should surface
+-- a short re-login message instead of the raw error)
+local function handle_dead_session(err_text)
+  if not is_reauth_needed(err_text) then return false end
+  clear_access_cache()
+  local now = os.time()
+  if now < reauth_cooldown_until then return true end
+  reauth_cooldown_until = now + REAUTH_COOLDOWN_S
+  vim.notify("ms-teams: davmail session expired, re-login required - running auth_cmd...", vim.log.levels.WARN)
+  run_auth_cmd(true) -- quiet: already notified above
+  return true
+end
+
 local function refresh_access_token(refresh_token, opts, cb)
   local cfg_ok, cfg = pcall(require, "ms-teams.config")
   local dav = (cfg_ok and cfg.options and cfg.options.davmail) or {}
@@ -358,11 +401,20 @@ local function refresh_access_token(refresh_token, opts, cb)
     vim.schedule(function()
       if obj.code ~= 0 then cb(nil, "curl exit "..obj.code.." "..(obj.stderr or "")); return end
       local ok, j = pcall(vim.json.decode, obj.stdout)
-      if not ok or not j or not j.access_token then cb(nil, "no access_token "..obj.stdout:sub(1,300)); return end
+      if not ok or not j or not j.access_token then
+        local raw = obj.stdout or ""
+        if handle_dead_session(raw) then
+          cb(nil, "davmail session expired, re-login required - auth_cmd launched, re-run after login")
+        else
+          cb(nil, "no access_token "..raw:sub(1,300))
+        end
+        return
+      end
       local expires_on = os.time() + (tonumber(j.expires_in) or 3600)
       if j.expires_on then expires_on = tonumber(j.expires_on) end
       local tok = {access_token=j.access_token, expires_on=expires_on, refresh_token=j.refresh_token or refresh_token}
       save_access_cache(tok)
+      reauth_cooldown_until = 0 -- session healthy again
       cb(tok.access_token, nil)
     end)
   end)
@@ -402,10 +454,16 @@ function M.get_access_token_sync(opts)
   local out = vim.fn.system(curl)
   if vim.v.shell_error ~= 0 then return nil, out end
   local ok, j = pcall(vim.json.decode, out)
-  if not ok or not j or not j.access_token then return nil, out:sub(1,300) end
+  if not ok or not j or not j.access_token then
+    if handle_dead_session(out) then
+      return nil, "davmail session expired, re-login required - auth_cmd launched, re-run after login"
+    end
+    return nil, out:sub(1,300)
+  end
   local expires_on = os.time() + (tonumber(j.expires_in) or 3600)
   if j.expires_on then expires_on = tonumber(j.expires_on) end
   save_access_cache({access_token=j.access_token, expires_on=expires_on, refresh_token=j.refresh_token or refresh})
+  reauth_cooldown_until = 0 -- session healthy again
   return j.access_token
 end
 
