@@ -65,6 +65,13 @@ M.defaults = {
     mentions_only = true, -- only notify when you / @Everyone / @Todos are mentioned
     debug = false,
   },
+  -- channels carry no server-side read state; unread is inferred from the
+  -- latest message vs local reference (mr override or messages cache). When
+  -- there is no local reference at all, only messages newer than this are
+  -- treated as unread (avoids flagging years-old messages as unread)
+  channels = {
+    unread_max_age_days = 30,
+  },
 }
 
 M.options = {}
