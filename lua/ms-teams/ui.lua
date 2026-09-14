@@ -162,6 +162,37 @@ local function is_message_unread(msg, chat)
   return true
 end
 
+-- newest message date previously seen for a channel, across id variants
+-- (@thread.v2 vs @thread.tacv2 historically produced different cache keys)
+local function channel_seen_newest(cid)
+  if not cid or cid == "" then return nil end
+  local ids = { cid }
+  if cid:sub(-13) == "@thread.tacv2" then
+    table.insert(ids, cid:sub(1, -14) .. "@thread.v2")
+  elseif cid:sub(-10) == "@thread.v2" then
+    table.insert(ids, cid:sub(1, -11) .. "@thread.tacv2")
+  end
+  local cache = require("ms-teams.cache")
+  local newest = nil
+  local seen_keys = {}
+  for _, id in ipairs(ids) do
+    local key = "messages_" .. id:gsub("[^%w%-_:.]", "_"):sub(1, 60)
+    if not seen_keys[key] then
+      seen_keys[key] = true
+      local okc, cc = pcall(cache.load, key)
+      if okc and cc and cc.messages then
+        for _, m in ipairs(cc.messages) do
+          if m ~= vim.NIL then
+            local dt = nv(m.createdDateTime) or ""
+            if dt ~= "" and (not newest or dt > newest) then newest = dt end
+          end
+        end
+      end
+    end
+  end
+  return newest
+end
+
 local function has_unread(chat)
   local cache = require("ms-teams.cache")
   local override = cache.get_last_read(nv(chat.id))
@@ -984,6 +1015,8 @@ function M.pick_chats()
     end
     -- Teams section at bottom
     local sorted_teams = nil
+    -- per-channel unread snapshot for live mr/mu updates (see update fn)
+    local channel_unread = {}
     if teams_data and #teams_data > 0 then
       table.insert(lines, "")
       table.insert(lines, "# Teams (" .. #teams_data .. ")")
@@ -1029,11 +1062,13 @@ function M.pick_chats()
             table.insert(lines, ch_line)
             local c_lnum = #lines
             line_to_entry[c_lnum] = {type="channel", channel=ch, team=team}
+            if cid then channel_unread[cid] = is_unread end
             if is_unread then unread_lines[c_lnum] = true end
           end
         end
       end
     end
+    pcall(vim.api.nvim_buf_set_var, buf, "ms_teams_channel_unread", channel_unread)
     -- enrich team channels missing from list_chats (e.g. Random): fetch the
     -- latest message per channel; get_chat does NOT work for channel ids
     -- and list_channels carries no preview data. Retries are time-gated
@@ -1111,17 +1146,7 @@ function M.pick_chats()
                   local cache = require("ms-teams.cache")
                   local ref = cache.get_last_read(item.cid)
                   if not ref then
-                    local okc, cc = pcall(cache.load, "messages_" .. item.cid:gsub("[^%w%-_:.]", "_"):sub(1, 60))
-                    if okc and cc and cc.messages then
-                      local newest = ""
-                      for _, m in ipairs(cc.messages) do
-                        if m ~= vim.NIL then
-                          local dt = nv(m.createdDateTime) or ""
-                          if dt > newest then newest = dt end
-                        end
-                      end
-                      if newest ~= "" then ref = newest end
-                    end
+                    ref = channel_seen_newest(item.cid)
                   end
                   local f0 = latest.from and nv(latest.from)
                   local pfrom = f0 and nv(f0.user)
@@ -1463,6 +1488,10 @@ function M.pick_chats()
       end)
     end })
   end
+  -- expose render fn immediately (before any list_chats call) so background
+  -- refreshes (e.g. after davmail re-auth) can update even never-rendered
+  -- buffers stuck on "Loading chats..."
+  pcall(vim.api.nvim_buf_set_var, buf, "ms_teams_render_and_bind", render_and_bind)
   if cached and cached.chats and #cached.chats>0 then
     vim.api.nvim_buf_set_lines(buf,0,-1,false,{"# Teams chats (cached)","", "Loading chats...",""})
     vim.api.nvim_win_set_buf(0, buf)
@@ -1550,6 +1579,47 @@ function M.update_chat_list_unread_state(chat_id, is_unread)
             vim.api.nvim_buf_clear_namespace(b, ns, lnum - 1, lnum)
             if is_unread then
               vim.api.nvim_buf_add_highlight(b, ns, hl_group, lnum - 1, 0, -1)
+            end
+          end
+        end
+      end
+      -- Also update Teams section channel/team lines (channels are not in
+      -- line_to_chat; their unread state lives in ms_teams_channel_unread)
+      local ok_entry, line_to_entry = pcall(vim.api.nvim_buf_get_var, b, "ms_teams_line_to_entry")
+      if ok_entry and type(line_to_entry) == "table" then
+        local ok_chan, chan_map = pcall(vim.api.nvim_buf_get_var, b, "ms_teams_channel_unread")
+        if not (ok_chan and type(chan_map) == "table") then chan_map = {} end
+        chan_map[chat_id] = is_unread
+        pcall(vim.api.nvim_buf_set_var, b, "ms_teams_channel_unread", chan_map)
+        local teams_seen = {}
+        for lnum, e in pairs(line_to_entry) do
+          if type(e) == "table" and e.type == "channel" and e.channel and nv(e.channel.id) == chat_id then
+            vim.api.nvim_buf_clear_namespace(b, ns, lnum - 1, lnum)
+            if is_unread then
+              vim.api.nvim_buf_add_highlight(b, ns, hl_group, lnum - 1, 0, -1)
+            end
+            if e.team and nv(e.team.id) then teams_seen[nv(e.team.id)] = true end
+          end
+        end
+        -- recompute parent team headers: lit if any of their channels is unread
+        for tid, _ in pairs(teams_seen) do
+          for lnum, e in pairs(line_to_entry) do
+            if type(e) == "table" and e.type == "team" and e.team and nv(e.team.id) == tid then
+              local team_unread = false
+              for _, e2 in pairs(line_to_entry) do
+                if type(e2) == "table" and e2.team and nv(e2.team.id) == tid then
+                  if e2.type == "channel" and e2.channel then
+                    local cid2 = nv(e2.channel.id)
+                    if cid2 and chan_map[cid2] then team_unread = true; break end
+                  elseif e2.type == "chat" and e2.chat and nv(e2.chat.chatType) == "channel" then
+                    if has_unread(e2.chat) then team_unread = true; break end
+                  end
+                end
+              end
+              vim.api.nvim_buf_clear_namespace(b, ns, lnum - 1, lnum)
+              if team_unread then
+                vim.api.nvim_buf_add_highlight(b, ns, hl_group, lnum - 1, 0, -1)
+              end
             end
           end
         end
@@ -2244,6 +2314,14 @@ function M.show_messages(chat, open)
   local cache = require("ms-teams.cache")
   local safe_id_cache = chat_id:gsub("[^%w%-_:.]", "_"):sub(1, 60)
   local cache_key = "messages_" .. safe_id_cache
+  -- channels carry no server viewpoint: infer read position from previously
+  -- cached messages (transient, per open) so detail highlights match chats
+  if is_channel and not cache.get_last_read(chat_id) then
+    local seen_newest = channel_seen_newest(chat_id)
+    if seen_newest then
+      chat.viewpoint = { lastMessageReadDateTime = seen_newest }
+    end
+  end
   local CACHE_TTL = 45
   local function do_list_messages(id, cb, nextLink)
     if is_channel then
