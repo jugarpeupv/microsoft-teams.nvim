@@ -63,6 +63,7 @@ function M.setup(opts)
   vim.api.nvim_create_user_command("MSTeamsWatchStatus", function() require("ms-teams.watch").status() end, { desc = "Teams watch status" })
   vim.api.nvim_create_user_command("MSTeamsWatchPoll", function() require("ms-teams.watch").poll_once() end, { desc = "Teams watch poll once" })
   vim.api.nvim_create_user_command("MSTeamsWatchRestart", function() require("ms-teams.watch").restart() end, { desc = "Teams watch restart" })
+  vim.api.nvim_create_user_command("MSTeamsDebugUnread", function(opts) ui.debug_unread_state(opts.args) end, { nargs = "?", desc = "Teams diagnose unread state across bufvars, disk cache and fresh fetch" })
 
   -- autostart if configured: watch.enabled=true
   -- timer runs via vim.uv (vim.loop) -> sigue disparando aunque el foco esté en Chrome,

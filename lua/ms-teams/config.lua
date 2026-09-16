@@ -42,8 +42,8 @@ M.defaults = {
     chatType = {
       meeting = "󰊻",
       oneOnOne = "",
-      groupChat = "󰭘",
-      channel = "",
+      groupChat = "",
+      channel = "",
       default = "󰭘",
     },
   },

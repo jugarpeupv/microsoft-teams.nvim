@@ -276,6 +276,8 @@ local function do_poll()
     -- update cache every poll so :MSTeamsChats is instant + reflects new messages
     -- uses same key as ui.lua: cache.save("chats",{chats=...}) in cache.lua:23
     cache.save("chats", { chats = chats })
+    -- reconcile open list highlights both ways (new unreads + stale ones)
+    vim.schedule(function() pcall(ui.sync_list_highlights, chats) end)
 
     if not initialized then
       -- first poll: seed seen without notifying to avoid spam on startup
