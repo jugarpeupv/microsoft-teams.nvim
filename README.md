@@ -4,8 +4,7 @@
 > without notice, error handling is thin, and parts of the UI are still
 > rough. Use at your own risk.
 
-Minimal Microsoft Teams chats inside Neovim, via Microsoft Graph.
-File/tab attachments can be opened in the browser with `gx`.
+Microsoft Teams chats inside Neovim, read and answer microsoft teams chats right inside your editor
 
 ## Demo
 
