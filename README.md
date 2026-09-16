@@ -7,6 +7,10 @@
 Minimal Microsoft Teams chats inside Neovim, via Microsoft Graph.
 File/tab attachments can be opened in the browser with `gx`.
 
+## Demo
+
+[![Watch the demo](https://img.youtube.com/vi/p24sI_XM27E/0.jpg)](https://www.youtube.com/watch?v=p24sI_XM27E)
+
 ## Authentication: built on top of DavMail
 
 This plugin does **not** implement its own OAuth login. It reuses the
