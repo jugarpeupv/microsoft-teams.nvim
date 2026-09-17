@@ -2768,6 +2768,13 @@ function M.show_messages(chat, open)
     -- keep ns var even when skipping render
     pcall(vim.api.nvim_buf_set_var, buf, "ms_teams_ns", ns)
 
+    -- did this buffer already render before? re-renders must preserve the
+    -- cursor instead of jumping to first_unread/#lines (scroll-to-bottom)
+    local had_map = false
+    do
+      local okm, mm = pcall(vim.api.nvim_buf_get_var, buf, "ms_teams_id_to_lnum")
+      had_map = okm and type(mm) == "table"
+    end
     vim.api.nvim_buf_set_var(buf, "ms_teams_chat_id", chat_id)
     vim.api.nvim_buf_set_var(buf, "ms_teams_chat", chat)
     vim.api.nvim_buf_set_var(buf, "ms_teams_raw_msgs", msgs)
@@ -2927,11 +2934,24 @@ function M.show_messages(chat, open)
     for lnum, _ in pairs(unread_msg_lines) do
       if not first_unread or lnum < first_unread then first_unread = lnum end
     end
-    local target = opts.target_cursor or (opts.keep_cursor and nil) or first_unread or #lines
+    local target = opts.target_cursor
+    if not target and not opts.no_cursor then
+      if had_map then
+        -- re-render of an already-painted buffer: keep the user's cursor
+        -- (clamped below); never auto-jump to first_unread/#lines
+        local win0 = vim.fn.bufwinid(buf)
+        if win0 ~= -1 then
+          local okc, cc = pcall(vim.api.nvim_win_get_cursor, win0)
+          if okc and cc then target = cc[1] end
+        end
+      else
+        target = first_unread or #lines
+      end
+    end
     -- no_cursor: background re-render for jump flows must not move any cursor
     if target and not opts.no_cursor then
       -- TEMPDEBUG cursor trace
-      local dbg_from = opts.target_cursor and "explicit" or (first_unread and "first_unread" or "END(#lines)")
+      local dbg_from = opts.target_cursor and "explicit" or (had_map and "preserve" or (first_unread and "first_unread" or "END(#lines)"))
       vim.defer_fn(function()
         if vim.api.nvim_buf_is_valid(buf) then
           local win = vim.fn.bufwinid(buf)
