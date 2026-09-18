@@ -1720,6 +1720,16 @@ function M.pick_chats()
   -- BEFORE the first paint to avoid the unresolved flicker / stuck names;
   -- 2.5s safety timeout paints anyway with whatever resolved.
   local function resolve_list_names(chats, cb)
+    -- attach disk cache first (fetch-once across opens)
+    do
+      local cache_mod = require("ms-teams.cache")
+      for _, c in ipairs(chats or {}) do
+        if c ~= vim.NIL and nv(c.chatType) == "oneOnOne" and format_chat(c):match("^oneOnOne") then
+          local mem = cache_mod.get_cached_members(nv(c.id))
+          if mem then c.members = mem end
+        end
+      end
+    end
     local to_fetch = {}
     for _, c in ipairs(chats or {}) do
       if c ~= vim.NIL and nv(c.chatType) == "oneOnOne" and nv(c.id) and not enriched[nv(c.id)] then
@@ -1741,6 +1751,7 @@ function M.pick_chats()
         if members and type(members) == "table" and #members > 0 then
           c.members = members
           enriched[nv(c.id)] = true
+          pcall(require("ms-teams.cache").save_cached_members, nv(c.id), members)
         end
         pending = pending - 1
         if pending <= 0 then finish_once() end
@@ -3726,12 +3737,16 @@ function M.show_messages(chat, open)
       return
     end
     vim.schedule(function()
-      -- render BEFORE touching loading_buf: wiping a displayed buffer
-      -- closes its window (proven), dropping focus into quickfix and
-      -- painting the detail over it
-      render_buffer(msgs, nextLink, {is_cached=false, open=open})
-      -- delete only if hidden: the reuse scan may have adopted loading_buf
-      -- itself as the detail buffer, and it must survive then
+      -- render into the loading window WITHOUT reopening: the open block
+      -- (split/vsplit) already ran for loading, and running it again
+      -- opens a second window on the same chat. If loading is gone,
+      -- fall back to a fresh open.
+      local already_open = vim.api.nvim_buf_is_valid(loading_buf) and vim.fn.bufwinid(loading_buf) ~= -1
+      render_buffer(msgs, nextLink, already_open
+        and { is_cached = false, buf = loading_buf, no_open = true }
+        or { is_cached = false, open = open })
+      -- delete loading only if hidden: wiping a displayed buffer closes
+      -- its window (proven). When reused above it IS the detail now.
       if vim.api.nvim_buf_is_valid(loading_buf) and vim.fn.bufwinid(loading_buf) == -1 then
         pcall(vim.api.nvim_buf_delete, loading_buf, {force=true})
       end
@@ -4090,6 +4105,18 @@ function M.find_chats(opts)
       end
     end
 
+    -- oneOnOne display names: attach disk cache first (fetch-once), so
+    -- repeat opens usually need zero network before paint
+    do
+      local cache_mod = require("ms-teams.cache")
+      for _, c in ipairs(valid_chats) do
+        if c ~= vim.NIL and nv(c.chatType) == "oneOnOne" and format_chat(c):match("^oneOnOne") then
+          local mem = cache_mod.get_cached_members(nv(c.id))
+          if mem then c.members = mem end
+        end
+      end
+    end
+
     table.sort(valid_chats, function(a, b)
       local au, bu = has_unread(a), has_unread(b)
       if au ~= bu then return au and not bu end
@@ -4107,6 +4134,14 @@ function M.find_chats(opts)
     for i = 1, math.min(top_n, #valid_chats) do
       table.insert(top50, valid_chats[i])
     end
+
+    -- names still missing after disk cache: fetched once in background
+    -- after paint; picker stays locked until rows show real names
+    local need_names = {}
+    for _, c in ipairs(top50) do
+      if nv(c.chatType) == "oneOnOne" and format_chat(c):match("^oneOnOne") then table.insert(need_names, c) end
+    end
+    local names_ready = #need_names == 0
 
     local show_all = true -- default: show all chats, <C-g> toggles to unread only
 
@@ -4194,18 +4229,22 @@ function M.find_chats(opts)
     end
 
     pickers.new({}, {
-      prompt_title = "Teams Chats" .. title_suffix(),
+      prompt_title = names_ready and ("Teams Chats" .. title_suffix()) or "Teams Chats (resolving names…)",
       finder = create_finder(show_all),
       sorter = conf.values.generic_sorter({}),
       attach_mappings = function(prompt_bufnr, map)
-        -- names resolve in background (see below): block opening until
-        -- rows show real names so you can't open a misidentified row
-        local names_ready = true
+        -- picker locked until rows show real names: no acting on
+        -- misidentified rows and no filtering on placeholder ordinals
+        if not names_ready then
+          pcall(function() vim.bo[prompt_bufnr].modifiable = false end)
+        end
+        local function guard_names()
+          if names_ready then return true end
+          vim.notify("resolving chat names…", vim.log.levels.INFO)
+          return false
+        end
         local function open_selection(open_mode)
-          if not names_ready then
-            vim.notify("resolving chat names…", vim.log.levels.INFO)
-            return
-          end
+          if not guard_names() then return end
           actions.close(prompt_bufnr)
           local selection = action_state.get_selected_entry()
           if selection and selection.value then
@@ -4222,6 +4261,7 @@ function M.find_chats(opts)
 
         -- <C-g> toggle between unread only and all
         map({ "i", "n" }, "<C-g>", function()
+          if not guard_names() then return end
           show_all = not show_all
           local current_picker = action_state.get_current_picker(prompt_bufnr)
           current_picker:refresh(create_finder(show_all), { reset_prompt = false })
@@ -4247,6 +4287,7 @@ function M.find_chats(opts)
         end
         -- <C-e> mark chat under cursor as read + refresh row (drop ●/highlight)
         map({ "i", "n" }, "<C-e>", function()
+          if not guard_names() then return end
           local selection = action_state.get_selected_entry()
           local chat = selection and selection.value or nil
           if not chat or chat == vim.NIL or not nv(chat.id) then
@@ -4272,6 +4313,7 @@ function M.find_chats(opts)
         end)
         -- <C-b> mark chat under cursor as unread + refresh row (●/highlight back)
         map({ "i", "n" }, "<C-b>", function()
+          if not guard_names() then return end
           local selection = action_state.get_selected_entry()
           local chat = selection and selection.value or nil
           if not chat or chat == vim.NIL or not nv(chat.id) then
@@ -4297,6 +4339,7 @@ function M.find_chats(opts)
         -- <C-q>/<M-q> send chats to quickfix (module-level bridge handles
         -- opening from any qf window, including reopened ones)
         local function send_chats_to_qf()
+          if not guard_names() then return end
           local picker = action_state.get_current_picker(prompt_bufnr)
           if not picker then return end
           local multi = picker:get_multi_selection()
@@ -4385,39 +4428,36 @@ function M.find_chats(opts)
         end
         map({ "i", "n" }, "<C-q>", send_chats_to_qf)
         map({ "i", "n" }, "<M-q>", send_chats_to_qf)
-        -- enrich oneOnOne without members so Rubén etc show real name and are searchable via rub;
-        -- picker already painted: refresh only the rows when data arrives
-        vim.defer_fn(function()
-          local need = {}
-          for _, c in ipairs(valid_chats) do
-            if nv(c.chatType) == "oneOnOne" and format_chat(c):match("^oneOnOne") then table.insert(need, c) end
-          end
-          if #need == 0 then return end
-          names_ready = false
-          vim.schedule(function()
-            local picker = action_state.get_current_picker(prompt_bufnr)
-            if picker then picker.prompt_border:change_title("Teams Chats (resolving names…)") end
-          end)
-          local pending = #need
-          for _, c in ipairs(need) do
-            require("ms-teams.graph").get_chat(nv(c.id), function(full)
-              if full and full.members then c.members = full.members end
-              pending = pending - 1
-              if pending == 0 then
-                vim.schedule(function()
-                  names_ready = true
-                  if vim.api.nvim_buf_is_valid(prompt_bufnr) then
-                    local picker = action_state.get_current_picker(prompt_bufnr)
-                    if picker then
-                      picker:refresh(create_finder(show_all), {reset_prompt=false})
-                      picker.prompt_border:change_title("Teams Chats" .. title_suffix())
+        -- fetch missing oneOnOne names once (disk cache missed): unlock,
+        -- refresh rows and persist for next opens when data arrives
+        if not names_ready then
+          vim.defer_fn(function()
+            local pending = #need_names
+            if pending == 0 then return end
+            for _, c in ipairs(need_names) do
+              require("ms-teams.graph").get_chat(nv(c.id), function(full)
+                if full and full.members then
+                  c.members = full.members
+                  pcall(cache.save_cached_members, nv(c.id), full.members)
+                end
+                pending = pending - 1
+                if pending == 0 then
+                  vim.schedule(function()
+                    names_ready = true
+                    if vim.api.nvim_buf_is_valid(prompt_bufnr) then
+                      pcall(function() vim.bo[prompt_bufnr].modifiable = true end)
+                      local picker = action_state.get_current_picker(prompt_bufnr)
+                      if picker then
+                        picker:refresh(create_finder(show_all), {reset_prompt=false})
+                        picker.prompt_border:change_title("Teams Chats" .. title_suffix())
+                      end
                     end
-                  end
-                end)
-              end
-            end)
-          end
-        end, 100)
+                  end)
+                end
+              end)
+            end
+          end, 100)
+        end
 
         return true
       end,
