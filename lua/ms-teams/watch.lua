@@ -201,6 +201,15 @@ local function notify(chat, preview)
   local notifier = get_notifier()
 
   local function do_notify(url)
+    -- notifier=false: never touch the OS (no terminal-notifier/notify-send).
+    -- vim_notify=false on top means fully silent: only cache + highlights.
+    if w.notifier == false and w.vim_notify == false then return end
+    if w.notifier == false then
+      vim.schedule(function()
+        vim.notify(string.format("Teams: %s — %s", title, body), vim.log.levels.INFO)
+      end)
+      return
+    end
     if notifier == "terminal-notifier" then
       local args = { "terminal-notifier", "-title", title, "-message", body, "-group", nv(chat.id) or title }
       if url and url ~= "" then
@@ -216,6 +225,8 @@ local function notify(chat, preview)
     elseif notifier == "notify-send" then
       vim.system({ "notify-send", title, body }, { text = true }, function() end)
     else
+      -- no OS tool found: fallback is in-nvim, so respect vim_notify
+      if w.vim_notify == false then return end
       local msg = string.format("%s: %s", title, body)
       vim.schedule(function()
         vim.notify(msg, vim.log.levels.INFO)

@@ -3424,20 +3424,17 @@ function M.show_messages(chat, open)
                 -- auto re-render detail to remove Last read divider and highlights
                 vim.defer_fn(function()
                   if vim.api.nvim_buf_is_valid(buf) then
-                    -- re-render current chat detail with new lastRead
-                    -- we have msgs and nextLink in closure, just re-render via cache
-                    local ok, cur_msgs = pcall(vim.api.nvim_buf_get_var, buf, "ms_teams_msgs_cache")
-                    -- fallback: re-fetch via Graph and re-render
-                    do_list_messages(chat_id, function(fresh, err2, freshNext)
-                      if err2 or not fresh then return end
-                      vim.schedule(function()
-                        if vim.api.nvim_buf_is_valid(buf) then
-                          local cache_key2 = "messages_" .. safe_id_cache
-                          require("ms-teams.cache").save(cache_key2, {messages=fresh, nextLink=freshNext or ""})
-                          rerender_at_anchor(fresh, freshNext, anchor_id, anchor_off, cur_pos[1], cur_pos[2])
-                        end
-                      end)
-                    end)
+                    -- re-render from current buffer msgs with new lastRead.
+                    -- Do NOT refetch here: list_channel_messages fetches top-5
+                    -- while the buffer may hold until_read depth (50+), so a
+                    -- refetch drops the anchor and clamps cursor to bottom.
+                    local ok_raw, cur_msgs = pcall(vim.api.nvim_buf_get_var, buf, "ms_teams_raw_msgs")
+                    if not (ok_raw and type(cur_msgs) == "table" and #cur_msgs > 0) then
+                      cur_msgs = msgs
+                    end
+                    local ok_nl, cur_nl = pcall(vim.api.nvim_buf_get_var, buf, "ms_teams_nextLink")
+                    if not (ok_nl and type(cur_nl) == "string") then cur_nl = nextLink end
+                    rerender_at_anchor(cur_msgs, cur_nl, anchor_id, anchor_off, cur_pos[1], cur_pos[2])
                   end
                 end, 100)
               end
@@ -3491,7 +3488,9 @@ function M.show_messages(chat, open)
           if ans and (ans:lower() == "n" or ans:lower() == "no") then vim.notify("cancelled", vim.log.levels.INFO); return end
           if not ans then vim.notify("cancelled", vim.log.levels.INFO); return end
           local target_created = nil
-          for _, m in ipairs(msgs) do
+          local ok_raw_lookup, raw_lookup = pcall(vim.api.nvim_buf_get_var, buf, "ms_teams_raw_msgs")
+          local lookup_msgs = (ok_raw_lookup and type(raw_lookup) == "table" and #raw_lookup > 0) and raw_lookup or msgs
+          for _, m in ipairs(lookup_msgs) do
             if m ~= vim.NIL and nv(m.id) == target_msg_id then
               target_created = nv(m.createdDateTime)
               break
@@ -3512,16 +3511,14 @@ function M.show_messages(chat, open)
             end
             vim.defer_fn(function()
               if vim.api.nvim_buf_is_valid(buf) then
-                do_list_messages(chat_id, function(fresh, err2, freshNext)
-                  if err2 then return end
-                  vim.schedule(function()
-                    if vim.api.nvim_buf_is_valid(buf) then
-                      local cache_key2 = "messages_" .. safe_id_cache
-                      require("ms-teams.cache").save(cache_key2, {messages=fresh, nextLink=freshNext or ""})
-                      rerender_at_anchor(fresh, freshNext, anchor_id, anchor_off, cur_pos[1], cur_pos[2])
-                    end
-                  end)
-                end)
+                -- same as mr: re-render local msgs, never a truncated refetch
+                local ok_raw, cur_msgs = pcall(vim.api.nvim_buf_get_var, buf, "ms_teams_raw_msgs")
+                if not (ok_raw and type(cur_msgs) == "table" and #cur_msgs > 0) then
+                  cur_msgs = msgs
+                end
+                local ok_nl, cur_nl = pcall(vim.api.nvim_buf_get_var, buf, "ms_teams_nextLink")
+                if not (ok_nl and type(cur_nl) == "string") then cur_nl = nextLink end
+                rerender_at_anchor(cur_msgs, cur_nl, anchor_id, anchor_off, cur_pos[1], cur_pos[2])
               end
             end, 100)
           end)
