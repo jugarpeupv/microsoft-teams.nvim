@@ -480,6 +480,36 @@ local function parse_html_table_to_markdown(tbl_html)
   return "\n" .. table.concat(md_lines, "\n") .. "\n"
 end
 
+-- helper: ISO 8601 duration (PT29M10S, PT1H2M3S, P1DT2H...) -> hh:mm:ss.
+-- returns nil when unparseable so callers can fall back to the raw string
+local function format_iso_duration(s)
+  if not s or type(s) ~= "string" then return nil end
+  local date_part, time_part = s:match("^P([^T]*)(.*)$")
+  if not date_part then return nil end
+  local total = 0
+  if date_part ~= "" then
+    local weeks = tonumber(date_part:match("(%d+)W")) or 0
+    local days = tonumber(date_part:match("(%d+)D")) or 0
+    if weeks == 0 and days == 0 and date_part:find("%d") then return nil end
+    total = total + weeks * 7 * 86400 + days * 86400
+  end
+  if time_part and time_part ~= "" then
+    local t = time_part:gsub("^T", "")
+    if t == "" then return nil end
+    local h = tonumber(t:match("(%d+)H")) or 0
+    local m = tonumber(t:match("(%d+)M")) or 0
+    local sec = tonumber(t:match("(%d+)%.*%d*S")) or 0
+    if h == 0 and m == 0 and sec == 0 and t:find("%d") then return nil end
+    total = total + h * 3600 + m * 60 + sec
+  elseif date_part == "" then
+    return nil
+  end
+  local hh = math.floor(total / 3600)
+  local mm = math.floor((total % 3600) / 60)
+  local ss = math.floor(total % 60)
+  return string.format("%02d:%02d:%02d", hh, mm, ss)
+end
+
 -- helper: build lines for a single message, returns { lines, is_unread, id, reply_target }
 local function build_message_lines(m, chat)
   if m == vim.NIL or m == nil then return nil end
@@ -487,6 +517,12 @@ local function build_message_lines(m, chat)
   local from = "unknown"
   local fu = nv(m.from) and nv(m.from.user) and nv(m.from.user.displayName)
   if fu then from = fu end
+  if from == "unknown" then
+    local mt = nv(m.messageType)
+    if nv(m.eventDetail) or (mt and mt ~= "message") then
+      from = "System"
+    end
+  end
   local body = ""
   local b = nv(m.body) and nv(m.body.content)
   if b then body = b end
@@ -716,12 +752,16 @@ local function build_message_lines(m, chat)
         table.insert(lines, "  " .. string.format("[System: Call started by %s]", init))
       elseif otype:find("callEnded") then
         local dur = edetail and (nv(edetail.callDuration) or nv(edetail.duration)) or ""
-        if dur ~= "" then
-          table.insert(lines, "  " .. string.format("[System: Call ended - duration %s]", dur))
+        local dur_fmt = format_iso_duration(dur)
+        if dur_fmt then
+          table.insert(lines, string.format("  [System: Call ended - duration %s]", dur_fmt))
+        elseif dur ~= "" then
+          table.insert(lines, string.format("  [System: Call ended - duration %s]", dur))
         else
           table.insert(lines, "  [System: Call ended]")
         end
-      elseif otype:find("membersAdded") then
+      elseif otype:find("membersAdded") or otype:find("membersJoined") then
+        local joined = otype:find("membersJoined") ~= nil
         local initiator = edetail and nv(edetail.initiator) and nv(nv(edetail.initiator).user) and nv(nv(nv(edetail.initiator).user).displayName) or "unknown"
         if initiator == "unknown" or initiator == "" then
           local iid = edetail and nv(edetail.initiator) and nv(nv(edetail.initiator).user) and nv(nv(nv(edetail.initiator).user).id)
@@ -758,8 +798,12 @@ local function build_message_lines(m, chat)
         end
         local nameStr = table.concat(names, ", ")
         local hist = nv(edetail.visibleHistoryStartDateTime) and nv(edetail.visibleHistoryStartDateTime) ~= "0001-01-01T00:00:00Z" and " and shared all chat history" or ""
-        table.insert(lines, string.format("  [System: %s added %s to the chat%s]", initiator, nameStr, hist))
-      elseif otype:find("membersDeleted") then
+        if joined then
+          table.insert(lines, string.format("  [System: %s joined the chat%s]", nameStr ~= "" and nameStr or initiator, hist))
+        else
+          table.insert(lines, string.format("  [System: %s added %s to the chat%s]", initiator, nameStr, hist))
+        end
+      elseif otype:find("membersDeleted") or otype:find("membersLeft") then
         local members = nv(edetail.members)
         local names = {}
         if members and type(members) == "table" then
@@ -801,6 +845,18 @@ local function build_message_lines(m, chat)
         else
           initiator = initiator or "unknown"
           table.insert(lines, string.format("  [System: %s removed %s from the chat]", initiator, nameStr))
+        end
+      elseif otype:find("chatRenamed") then
+        local new_name = nv(edetail.chatDisplayName) or ""
+        local renamer = edetail and nv(edetail.initiator) and nv(nv(edetail.initiator).user) and nv(nv(nv(edetail.initiator).user).displayName) or nil
+        if not renamer or renamer == "" then
+          renamer = edetail and nv(edetail.initiator) and nv(edetail.initiator.displayName) or nil
+        end
+        renamer = (renamer and renamer ~= "") and renamer or "unknown"
+        if new_name ~= "" then
+          table.insert(lines, string.format("  [System: %s renamed the chat to \"%s\"]", renamer, new_name))
+        else
+          table.insert(lines, string.format("  [System: %s renamed the chat]", renamer))
         end
       elseif edetail and type(edetail) == "table" then
         table.insert(lines, "  " .. string.format("[System event: %s]", vim.inspect(edetail):gsub("\n"," "):sub(1,80)))
@@ -3346,7 +3402,7 @@ function M.show_messages(chat, open)
         end
       end
       local anchor_id, anchor_off = anchor_at(cur_pos[1])
-      vim.ui.input({ prompt = string.format("Mark whole chat '%s' as read? (Y/n) [<CR>=y]: ", format_chat(chat)) }, function(ans)
+      vim.ui.input({ prompt = string.format("Mark whole chat '%s' as read? (<CR>or<y>/n): ", format_chat(chat)) }, function(ans)
         if ans and (ans:lower() == "n" or ans:lower() == "no") then vim.notify("cancelled", vim.log.levels.INFO); return end
         if not ans then vim.notify("cancelled", vim.log.levels.INFO); return end
         require("ms-teams.graph").mark_chat_read(chat_id, function(_, err)
@@ -3431,7 +3487,7 @@ function M.show_messages(chat, open)
         end
       end
       if is_on_message and target_msg_id then
-        vim.ui.input({ prompt = string.format("Mark message %s as unread? (Y/n) [<CR>=y]: ", target_msg_id:sub(1,8)) }, function(ans)
+        vim.ui.input({ prompt = string.format("Mark message %s as unread? (<CR>or<y>/n): ", target_msg_id:sub(1,8)) }, function(ans)
           if ans and (ans:lower() == "n" or ans:lower() == "no") then vim.notify("cancelled", vim.log.levels.INFO); return end
           if not ans then vim.notify("cancelled", vim.log.levels.INFO); return end
           local target_created = nil
