@@ -68,6 +68,42 @@ function M.clear_last_read(chat_id)
   M.set_last_read(chat_id, nil)
 end
 
+local function review_from_path()
+  local dir = vim.fn.stdpath("data") .. "/ms-teams"
+  return dir .. "/review_from.json"
+end
+
+-- mu review point: messages newer than this render highlighted in the
+-- detail (including own) until mr clears it. List-level has_unread()
+-- intentionally keeps excluding self.
+function M.get_review_from(chat_id)
+  local path = review_from_path()
+  if vim.fn.filereadable(path) ~= 1 then return nil end
+  local ok, j = pcall(vim.json.decode, table.concat(vim.fn.readfile(path), "\n"))
+  if not ok or not j then return nil end
+  return j[chat_id]
+end
+
+function M.set_review_from(chat_id, iso)
+  local path = review_from_path()
+  local j = {}
+  if vim.fn.filereadable(path) == 1 then
+    local ok, cur = pcall(vim.json.decode, table.concat(vim.fn.readfile(path), "\n"))
+    if ok and cur then j = cur end
+  end
+  if iso then
+    j[chat_id] = iso
+  else
+    j[chat_id] = nil
+  end
+  vim.fn.writefile({ vim.json.encode(j) }, path)
+  pcall(vim.fn.system, { "chmod", "600", path })
+end
+
+function M.clear_review_from(chat_id)
+  M.set_review_from(chat_id, nil)
+end
+
 function M.save_me(me)
   local path = vim.fn.stdpath("data") .. "/ms-teams/me.json"
   vim.fn.mkdir(vim.fn.fnamemodify(path, ":h"), "p")

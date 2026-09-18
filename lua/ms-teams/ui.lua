@@ -171,6 +171,18 @@ local function is_message_unread(msg, chat)
   return true
 end
 
+-- detail-only pending predicate: after an explicit mu, own messages past
+-- the mu point also render highlighted (review mode). List-level
+-- has_unread() intentionally keeps excluding self.
+local function is_message_unread_or_review(msg, chat)
+  if is_message_unread(msg, chat) then return true end
+  local rf = require("ms-teams.cache").get_review_from(nv(chat.id))
+  if not rf or rf == "" then return false end
+  local ct = nv(msg.createdDateTime)
+  if not ct then return false end
+  return ct > rf
+end
+
 -- newest message date previously seen for a channel, across id variants
 -- (@thread.v2 vs @thread.tacv2 historically produced different cache keys)
 local function channel_seen_newest(cid)
@@ -200,6 +212,27 @@ local function channel_seen_newest(cid)
     end
   end
   return newest
+end
+
+-- unread evidence in already-open detail buffers (fresher than the disk
+-- cache, which may not exist yet if the chat was never opened to the end)
+local function has_unread_in_open_buffers(chat)
+  local cid = nv(chat.id)
+  if not cid then return false end
+  for _, b in ipairs(vim.api.nvim_list_bufs()) do
+    if vim.api.nvim_buf_is_valid(b) then
+      local ok_id, bid = pcall(vim.api.nvim_buf_get_var, b, "ms_teams_chat_id")
+      if ok_id and bid == cid then
+        local ok_raw, raw = pcall(vim.api.nvim_buf_get_var, b, "ms_teams_raw_msgs")
+        if ok_raw and type(raw) == "table" then
+          for _, m in ipairs(raw) do
+            if m ~= vim.NIL and is_message_unread(m, chat) then return true end
+          end
+        end
+      end
+    end
+  end
+  return false
 end
 
 local function has_unread(chat)
@@ -235,7 +268,7 @@ local function has_unread(chat)
   end
   if preview then
     local pFrom = nv(preview.from) and nv(nv(preview.from).user)
-    if pFrom and is_from_me(pFrom) then
+    if (pFrom and is_from_me(pFrom)) or nv(preview.isOwned) == true then
       -- last is from self, check if any earlier message is unread via cache
       local ok, cached = pcall(require("ms-teams.cache").load, "messages_" .. (nv(chat.id) or ""):gsub("[^%w%-_:.]", "_"):sub(1,60))
       if ok and cached and cached.messages then
@@ -243,9 +276,11 @@ local function has_unread(chat)
           if m ~= vim.NIL and is_message_unread(m, chat) then return true end
         end
       end
+      -- disk cache may not exist yet: check open detail buffers too,
+      -- otherwise the chat looks read in list/picker while detail shows ●
+      if has_unread_in_open_buffers(chat) then return true end
       return false
     end
-    if nv(preview.isOwned) == true then return false end
   end
   return true
 end
@@ -655,7 +690,7 @@ local function build_message_lines(m, chat)
 
   body = body:gsub("^%s+", ""):gsub("%s+$", "")
   local dt = format_date(nv(m.createdDateTime) or "")
-  local is_unread = is_message_unread(m, chat)
+  local is_unread = is_message_unread_or_review(m, chat)
   local header = string.format("**%s** (%s):", from, dt)
   if is_unread then header = "● " .. header end
   table.insert(lines, header)
@@ -1391,10 +1426,14 @@ function M.pick_chats()
         enriching = true
         local pending = #to_fetch
         for _, c in ipairs(to_fetch) do
-          enriched[nv(c.id)] = true
           require("ms-teams.graph").get_chat(nv(c.id), function(full, err)
-            if full and nv(full.members) and type(nv(full.members)) == "table" then c.members = nv(full.members)
-            elseif full and full.members then c.members = full.members end
+            -- mark enriched only on success: a failed fetch must retry on
+            -- the next render instead of leaving "oneOnOne [19:xxxx]" stuck
+            local members = full and (nv(full.members) or full.members) or nil
+            if members and type(members) == "table" and #members > 0 then
+              c.members = members
+              enriched[nv(c.id)] = true
+            end
             pending = pending - 1
             if pending == 0 then
               enriching = false
@@ -1676,13 +1715,51 @@ function M.pick_chats()
   vim.api.nvim_create_autocmd("BufWinEnter", { group = fold_grp, buffer = buf, callback = function()
     for _, w in ipairs(vim.fn.win_findbuf(buf)) do apply_list_folds(w) end
   end })
+  -- oneOnOne names: list_chats ships $expand=lastMessagePreview without
+  -- members, so format_chat falls back to "oneOnOne [19:xxxx]". Resolve
+  -- BEFORE the first paint to avoid the unresolved flicker / stuck names;
+  -- 2.5s safety timeout paints anyway with whatever resolved.
+  local function resolve_list_names(chats, cb)
+    local to_fetch = {}
+    for _, c in ipairs(chats or {}) do
+      if c ~= vim.NIL and nv(c.chatType) == "oneOnOne" and nv(c.id) and not enriched[nv(c.id)] then
+        if format_chat(c):match("^oneOnOne") then table.insert(to_fetch, c) end
+      end
+    end
+    if #to_fetch == 0 then cb(); return end
+    local done = false
+    local pending = #to_fetch
+    local function finish_once()
+      if done then return end
+      done = true
+      cb()
+    end
+    vim.defer_fn(finish_once, 2500)
+    for _, c in ipairs(to_fetch) do
+      graph.get_chat(nv(c.id), function(full)
+        local members = full and (nv(full.members) or full.members) or nil
+        if members and type(members) == "table" and #members > 0 then
+          c.members = members
+          enriched[nv(c.id)] = true
+        end
+        pending = pending - 1
+        if pending <= 0 then finish_once() end
+      end)
+    end
+  end
   if cached and cached.chats and #cached.chats>0 then
     set_list_lines({"# Teams chats (cached)","", "Loading chats...",""})
     vim.api.nvim_win_set_buf(0, buf)
     apply_list_folds(vim.api.nvim_get_current_win())
     vim.schedule(function()
       if vim.api.nvim_buf_is_valid(buf) then
-        render_and_bind(cached.chats, cached.chats, true)
+        resolve_list_names(cached.chats, function()
+          vim.schedule(function()
+            if vim.api.nvim_buf_is_valid(buf) then
+              render_and_bind(cached.chats, cached.chats, true)
+            end
+          end)
+        end)
       end
     end)
     vim.defer_fn(function()
@@ -1731,9 +1808,11 @@ function M.pick_chats()
     local has_notes = false
     for _,c in ipairs(chats or {}) do if nv(c.id)=="48:notes" then has_notes=true; break end end
     local function finish(all)
-      vim.schedule(function()
-        render_and_bind(all,all,false)
-        cache.save("chats",{chats=all})
+      resolve_list_names(all, function()
+        vim.schedule(function()
+          render_and_bind(all,all,false)
+          cache.save("chats",{chats=all})
+        end)
       end)
     end
     if has_notes then finish(chats); return end
@@ -2736,10 +2815,10 @@ function M.show_messages(chat, open)
       end
     end
 
-    -- find first unread message
+    -- find first unread message (review mode: includes own past mu point)
     local first_unread_idx = nil
     for i = 1, #sorted_msgs do
-      if is_message_unread(sorted_msgs[i], chat) then first_unread_idx = i; break end
+      if is_message_unread_or_review(sorted_msgs[i], chat) then first_unread_idx = i; break end
     end
 
     local inserted_last_read = false
@@ -2975,6 +3054,21 @@ function M.show_messages(chat, open)
       end
     end
     if not opts.no_open then
+      -- the async fetch may resolve after focus moved back to quickfix
+      -- (e.g. <CR> on a qf entry, then browse qf while loading): never
+      -- paint the detail into a quickfix (or floating) window, it would
+      -- convert/close it
+      if vim.bo[vim.api.nvim_win_get_buf(0)].buftype == "quickfix" then
+        for _, w in ipairs(vim.api.nvim_list_wins()) do
+          local ok_cfg, cfg = pcall(vim.api.nvim_win_get_config, w)
+          if ok_cfg and cfg and cfg.relative ~= "" then goto next_render_win end
+          if vim.bo[vim.api.nvim_win_get_buf(w)].buftype ~= "quickfix" then
+            vim.api.nvim_set_current_win(w)
+            break
+          end
+          ::next_render_win::
+        end
+      end
       if open == "current" then
         vim.api.nvim_win_set_buf(0, buf)
       elseif open == "vsplit" then
@@ -3412,6 +3506,7 @@ function M.show_messages(chat, open)
           local function do_local()
             local now_iso = os.date("!%Y-%m-%dT%H:%M:%SZ")
             require("ms-teams.cache").set_last_read(chat_id, now_iso)
+            require("ms-teams.cache").clear_review_from(chat_id)
             chat.viewpoint = chat.viewpoint or {}
             if chat.viewpoint == vim.NIL then chat.viewpoint = {} end
             chat.viewpoint.lastMessageReadDateTime = now_iso
@@ -3500,6 +3595,7 @@ function M.show_messages(chat, open)
           local sub = vim.fn.system({"python3","-c","import datetime,sys; iso=sys.argv[1]; dt=datetime.datetime.fromisoformat(iso.replace('Z','+00:00')); print((dt - datetime.timedelta(seconds=1)).isoformat().replace('+00:00','Z'))", target_created}):gsub("%s+","")
           local new_last_read = sub ~= "" and sub or target_created
           require("ms-teams.cache").set_last_read(chat_id, new_last_read)
+          require("ms-teams.cache").set_review_from(chat_id, new_last_read)
           chat.viewpoint = chat.viewpoint or {}
           if chat.viewpoint == vim.NIL then chat.viewpoint = {} end
           chat.viewpoint.lastMessageReadDateTime = new_last_read
@@ -3630,8 +3726,15 @@ function M.show_messages(chat, open)
       return
     end
     vim.schedule(function()
-      if vim.api.nvim_buf_is_valid(loading_buf) then pcall(vim.api.nvim_buf_delete, loading_buf, {force=true}) end
+      -- render BEFORE touching loading_buf: wiping a displayed buffer
+      -- closes its window (proven), dropping focus into quickfix and
+      -- painting the detail over it
       render_buffer(msgs, nextLink, {is_cached=false, open=open})
+      -- delete only if hidden: the reuse scan may have adopted loading_buf
+      -- itself as the detail buffer, and it must survive then
+      if vim.api.nvim_buf_is_valid(loading_buf) and vim.fn.bufwinid(loading_buf) == -1 then
+        pcall(vim.api.nvim_buf_delete, loading_buf, {force=true})
+      end
       cache.save(cache_key, {messages=msgs, nextLink=nextLink or ""})
     end)
   end)
@@ -3832,6 +3935,121 @@ function M.new_chat()
     }):find()
 end
 
+-- quickfix <-> chats bridge (module level so it works from any qf window,
+-- including reopened ones, not just the buffer set up at send time)
+local function qf_chat_from_id(id)
+  if not id or id == "" then return nil end
+  if M._qf_chats_by_id then
+    local c = M._qf_chats_by_id[id]
+    if c and c ~= vim.NIL then return c end
+  end
+  if M._qf_chats then
+    for _, c in ipairs(M._qf_chats) do
+      if c ~= vim.NIL and nv(c.id) == id then return c end
+    end
+  end
+  return nil
+end
+
+local function setup_teams_qf(qf_bufnr)
+  vim.keymap.set("n", "<CR>", function()
+    -- resolve by entry id, never by line number: foreign entries,
+    -- filters or re-sends shift lines and M._qf_chats[idx] opens
+    -- the wrong chat (or nothing)
+    local idx = vim.fn.line(".")
+    local chat = nil
+    local ok_list, list = pcall(vim.fn.getqflist)
+    local entry = (ok_list and list) and list[idx] or nil
+    local ud = entry and entry.user_data or nil
+    -- user_data travels as plain string: "ms-teams-chat:<id>"
+    -- (legacy lists used bare "ms-teams-chat" without id)
+    local eid = (type(ud) == "string" and ud:match("^ms%-teams%-chat:(.+)$")) or nil
+    if eid then chat = qf_chat_from_id(eid) end
+    if (not chat or chat == vim.NIL) and M._qf_chats then
+      chat = M._qf_chats[idx] -- legacy fallback, pre-id-tag lists
+    end
+    if not chat or chat == vim.NIL or not nv(chat.id) then
+      vim.notify("no Teams chat on this line", vim.log.levels.WARN)
+      return
+    end
+    local cur = vim.api.nvim_get_current_win()
+    local target = nil
+    for _, w in ipairs(vim.api.nvim_list_wins()) do
+      -- skip floating windows (e.g. notification popups): opening
+      -- the chat inside one "works" until the float dismisses and
+      -- the chat vanishes with it
+      local ok_cfg, cfg = pcall(vim.api.nvim_win_get_config, w)
+      if ok_cfg and cfg and cfg.relative ~= "" then goto next_win end
+      local b = vim.api.nvim_win_get_buf(w)
+      if vim.bo[b].buftype ~= "quickfix" then target = w; break end
+      ::next_win::
+    end
+    if target and target ~= cur then
+      vim.api.nvim_set_current_win(target)
+    elseif not target then
+      -- only quickfix visible: split first so the qf window survives
+      vim.cmd("split")
+    end
+    M.show_messages(chat, "current")
+  end, { buffer = qf_bufnr, desc = "Open Teams chat" })
+  -- no auto-open on CursorMoved: chats open explicitly with <CR>;
+  -- the quickfix window stays open while triaging
+end
+
+-- route ms-teams-chat:// placeholders to the real detail EVERY time one
+-- is displayed (BufReadCmd only fires on first load; revisits would show
+-- the stale empty placeholder)
+local function route_qf_placeholder(buf)
+  if not vim.api.nvim_buf_is_valid(buf) then return false end
+  local id = vim.api.nvim_buf_get_name(buf):match("^ms%-teams%-chat://(.+)$")
+  if not id or id == "" then return false end
+  local chat = qf_chat_from_id(id)
+  if not chat then
+    vim.schedule(function()
+      vim.notify("ms-teams: unknown chat " .. id, vim.log.levels.ERROR)
+    end)
+    return true
+  end
+  vim.schedule(function()
+    if not vim.api.nvim_buf_is_valid(buf) then return end
+    local win = vim.fn.bufwinid(buf)
+    if win ~= -1 then vim.api.nvim_set_current_win(win) end
+    M.show_messages(chat, "current")
+    if vim.api.nvim_buf_is_valid(buf) then
+      vim.bo[buf].buflisted = false
+      vim.bo[buf].bufhidden = "hide"
+    end
+  end)
+  return true
+end
+
+local qf_bridge_done = false
+local function ensure_qf_bridge()
+  if qf_bridge_done then return end
+  qf_bridge_done = true
+  local grp = vim.api.nvim_create_augroup("MsTeamsQfBridge", { clear = true })
+  vim.api.nvim_create_autocmd("BufEnter", {
+    group = grp,
+    pattern = "ms-teams-chat://*",
+    callback = function(ev) route_qf_placeholder(ev.buf) end,
+  })
+  -- backstop: any quickfix window holding our entries gets the opener
+  -- mapping, even if shown long after the send (reopen, :colder, ...)
+  vim.api.nvim_create_autocmd("FileType", {
+    group = grp,
+    pattern = "qf",
+    callback = function(ev)
+      for _, e in ipairs(vim.fn.getqflist()) do
+        local ud = e.user_data
+        if type(ud) == "string" and ud:sub(1, 14) == "ms-teams-chat" then
+          setup_teams_qf(ev.buf)
+          break
+        end
+      end
+    end,
+  })
+end
+
 function M.find_chats(opts)
   opts = opts or {}
   local ok_pickers, pickers = pcall(require, "telescope.pickers")
@@ -3873,6 +4091,8 @@ function M.find_chats(opts)
     end
 
     table.sort(valid_chats, function(a, b)
+      local au, bu = has_unread(a), has_unread(b)
+      if au ~= bu then return au and not bu end
       if nv(a.id) == "48:notes" then return true end
       if nv(b.id) == "48:notes" then return false end
       local ap = nv(a.lastMessagePreview) and nv(nv(a.lastMessagePreview).createdDateTime)
@@ -3888,7 +4108,7 @@ function M.find_chats(opts)
       table.insert(top50, valid_chats[i])
     end
 
-    local show_all = true -- default: show all chats, <C-b> toggles to unread only
+    local show_all = true -- default: show all chats, <C-g> toggles to unread only
 
     local function make_items(include_read)
       local items = {}
@@ -3912,22 +4132,65 @@ function M.find_chats(opts)
       return items
     end
 
+    local ok_edisplay, entry_display = pcall(require, "telescope.pickers.entry_display")
+    local displayer = ok_edisplay and entry_display.create({
+      separator = " ",
+      items = { { width = 2 }, { remaining = true } },
+    }) or nil
+    local unread_hl = get_unread_hl_group()
+
     local function create_finder(include_read)
       local items = make_items(include_read)
       return finders.new_table({
         results = items,
-        entry_maker = function(entry)
+        entry_maker = function(item)
+          local ordinal = to_ascii(item.name) .. " " .. item.name
+          if displayer then
+            if item.unread then
+              return {
+                value = item.chat,
+                ordinal = ordinal,
+                display = function()
+                  return displayer({
+                    { item.unread and "●" or " ", unread_hl },
+                    { item.display_name, unread_hl },
+                  })
+                end,
+              }
+            end
+            return {
+              value = item.chat,
+              ordinal = ordinal,
+              display = function()
+                return displayer({ { " ", nil }, item.display_name })
+              end,
+            }
+          end
+          if item.unread then
+            local text = item.display
+            return {
+              value = item.chat,
+              ordinal = ordinal,
+              display = function()
+                return text, { { { 1, #text }, unread_hl } }
+              end,
+            }
+          end
           return {
-            value = entry.chat,
-            display = entry.display,
-            ordinal = to_ascii(entry.name) .. " " .. entry.name,
+            value = item.chat,
+            display = item.display,
+            ordinal = ordinal,
           }
         end,
       })
     end
 
     local title_suffix = function()
-      return show_all and (" (All "..#top50.." - <C-b> unread only)") or (" (Unread "..#top50.." - <C-b> show all)")
+      local hints = "<C-q> qf - <C-e> read - <C-b> unread"
+      if show_all then
+        return string.format(" (All %d - <C-g> unread only - %s)", #top50, hints)
+      end
+      return string.format(" (Unread %d - <C-g> show all - %s)", #top50, hints)
     end
 
     pickers.new({}, {
@@ -3935,7 +4198,14 @@ function M.find_chats(opts)
       finder = create_finder(show_all),
       sorter = conf.values.generic_sorter({}),
       attach_mappings = function(prompt_bufnr, map)
+        -- names resolve in background (see below): block opening until
+        -- rows show real names so you can't open a misidentified row
+        local names_ready = true
         local function open_selection(open_mode)
+          if not names_ready then
+            vim.notify("resolving chat names…", vim.log.levels.INFO)
+            return
+          end
           actions.close(prompt_bufnr)
           local selection = action_state.get_selected_entry()
           if selection and selection.value then
@@ -3950,23 +4220,184 @@ function M.find_chats(opts)
         map({ "i", "n" }, "<C-s>", function() open_selection("split") end)
         map({ "i", "n" }, "<C-v>", function() open_selection("vsplit") end)
 
-        -- <C-b> toggle between unread only and all
-        map({ "i", "n" }, "<C-b>", function()
+        -- <C-g> toggle between unread only and all
+        map({ "i", "n" }, "<C-g>", function()
           show_all = not show_all
           local current_picker = action_state.get_current_picker(prompt_bufnr)
           current_picker:refresh(create_finder(show_all), { reset_prompt = false })
           current_picker.prompt_border:change_title("Teams Chats" .. title_suffix())
         end)
-        -- disable quickfix for chat entries (not file-based)
-        map({ "i", "n" }, "<C-q>", function() vim.notify("quickfix not supported for chats", vim.log.levels.INFO) end)
-        map({ "i", "n" }, "<M-q>", function() vim.notify("quickfix not supported for chats", vim.log.levels.INFO) end)
-        -- enrich oneOnOne without members so Rubén etc show real name and are searchable via rub
+        local function refresh_picker_keep_selection(msg)
+          vim.schedule(function()
+            if not vim.api.nvim_buf_is_valid(prompt_bufnr) then return end
+            local picker = action_state.get_current_picker(prompt_bufnr)
+            if not picker then return end
+            local row = nil
+            pcall(function() row = picker:get_selection_row() end)
+            picker:refresh(create_finder(show_all), { reset_prompt = false })
+            if row then
+              vim.schedule(function()
+                local p2 = nil
+                pcall(function() p2 = action_state.get_current_picker(prompt_bufnr) end)
+                if p2 then pcall(function() p2:set_selection(row) end) end
+              end)
+            end
+            if msg then vim.notify(msg, vim.log.levels.INFO) end
+          end)
+        end
+        -- <C-e> mark chat under cursor as read + refresh row (drop ●/highlight)
+        map({ "i", "n" }, "<C-e>", function()
+          local selection = action_state.get_selected_entry()
+          local chat = selection and selection.value or nil
+          if not chat or chat == vim.NIL or not nv(chat.id) then
+            vim.notify("no chat under cursor", vim.log.levels.WARN)
+            return
+          end
+          local chat_id = nv(chat.id)
+          graph.mark_chat_read(chat_id, function(_, err)
+            if err then
+              vim.schedule(function()
+                vim.notify("mark_chat_read remote failed: " .. tostring(err), vim.log.levels.WARN)
+              end)
+            end
+            local now_iso = os.date("!%Y-%m-%dT%H:%M:%SZ")
+            cache.set_last_read(chat_id, now_iso)
+            cache.clear_review_from(chat_id)
+            chat.viewpoint = chat.viewpoint or {}
+            if chat.viewpoint == vim.NIL then chat.viewpoint = {} end
+            chat.viewpoint.lastMessageReadDateTime = now_iso
+            M.update_chat_list_unread_state(chat_id, false)
+            refresh_picker_keep_selection("marked as read: " .. format_chat(chat))
+          end)
+        end)
+        -- <C-b> mark chat under cursor as unread + refresh row (●/highlight back)
+        map({ "i", "n" }, "<C-b>", function()
+          local selection = action_state.get_selected_entry()
+          local chat = selection and selection.value or nil
+          if not chat or chat == vim.NIL or not nv(chat.id) then
+            vim.notify("no chat under cursor", vim.log.levels.WARN)
+            return
+          end
+          local chat_id = nv(chat.id)
+          graph.mark_chat_unread(chat_id, function(_, err)
+            if err then
+              vim.schedule(function()
+                vim.notify("mark_chat_unread remote failed: " .. tostring(err), vim.log.levels.WARN)
+              end)
+            end
+            cache.clear_last_read(chat_id)
+            cache.set_review_from(chat_id, "1970-01-01T00:00:00Z")
+            chat.viewpoint = chat.viewpoint or {}
+            if chat.viewpoint == vim.NIL then chat.viewpoint = {} end
+            chat.viewpoint.lastMessageReadDateTime = "1970-01-01T00:00:00Z"
+            M.update_chat_list_unread_state(chat_id, true)
+            refresh_picker_keep_selection("marked as unread: " .. format_chat(chat))
+          end)
+        end)
+        -- <C-q>/<M-q> send chats to quickfix (module-level bridge handles
+        -- opening from any qf window, including reopened ones)
+        local function send_chats_to_qf()
+          local picker = action_state.get_current_picker(prompt_bufnr)
+          if not picker then return end
+          local multi = picker:get_multi_selection()
+          local chats = {}
+          if multi and #multi > 0 then
+            for _, e in ipairs(multi) do
+              if e and e.value and e.value ~= vim.NIL then table.insert(chats, e.value) end
+            end
+          else
+            local prompt = ""
+            pcall(function() prompt = action_state.get_current_line() or "" end)
+            prompt = vim.trim(prompt or ""):lower()
+            for _, it in ipairs(make_items(show_all)) do
+              if prompt == "" then
+                table.insert(chats, it.chat)
+              else
+                local n = (it.name or ""):lower()
+                local a = to_ascii(it.name or ""):lower()
+                if n:find(prompt, 1, true) or a:find(prompt, 1, true) then
+                  table.insert(chats, it.chat)
+                end
+              end
+            end
+          end
+          if #chats == 0 then vim.notify("no chats to send", vim.log.levels.WARN); return end
+          actions.close(prompt_bufnr)
+          -- accumulate: repeated C-q appends (dedupe by id) instead of
+          -- replacing, so earlier records are never lost; foreign qf
+          -- entries (e.g. grep results) are preserved via user_data tag
+          M._qf_chats = M._qf_chats or {}
+          M._qf_chats_by_id = M._qf_chats_by_id or {}
+          for _, c in ipairs(chats) do
+            local id = nv(c.id)
+            if id and not M._qf_chats_by_id[id] then
+              M._qf_chats_by_id[id] = c
+              table.insert(M._qf_chats, c)
+            elseif id then
+              M._qf_chats_by_id[id] = c
+              for i, old in ipairs(M._qf_chats) do
+                if nv(old.id) == id then M._qf_chats[i] = c; break end
+              end
+            else
+              table.insert(M._qf_chats, c)
+            end
+          end
+          local function is_ours(e)
+            local ud = e.user_data
+            return type(ud) == "string" and ud:sub(1, 14) == "ms-teams-chat"
+          end
+          local qf = {}
+          for _, e in ipairs(vim.fn.getqflist()) do
+            if not is_ours(e) then table.insert(qf, e) end
+          end
+          for _, c in ipairs(M._qf_chats) do
+            local unread = has_unread(c)
+            table.insert(qf, {
+              filename = "ms-teams-chat://" .. (nv(c.id) or "noid"),
+              lnum = 1,
+              col = 1,
+              text = (unread and "● " or "") .. format_chat(c),
+              user_data = "ms-teams-chat:" .. (nv(c.id) or "noid"),
+            })
+          end
+          -- module-level bridge (BufEnter router + FileType mapper) routes
+          -- placeholders from any qf window, including reopened ones
+          ensure_qf_bridge()
+          vim.fn.setqflist(qf, "r")
+          vim.cmd("copen")
+          -- synchronous setup (no schedule race): resolve qf window directly
+          local qf_winid = 0
+          pcall(function() qf_winid = vim.fn.getqflist({ winid = 0 }).winid or 0 end)
+          local qf_b = nil
+          if qf_winid ~= 0 then
+            qf_b = vim.api.nvim_win_get_buf(qf_winid)
+          else
+            for _, w in ipairs(vim.api.nvim_list_wins()) do
+              local b = vim.api.nvim_win_get_buf(w)
+              if vim.bo[b].buftype == "quickfix" then qf_b = b; break end
+            end
+          end
+          if qf_b then
+            setup_teams_qf(qf_b)
+          else
+            vim.notify("ms-teams: quickfix window not found", vim.log.levels.WARN)
+          end
+        end
+        map({ "i", "n" }, "<C-q>", send_chats_to_qf)
+        map({ "i", "n" }, "<M-q>", send_chats_to_qf)
+        -- enrich oneOnOne without members so Rubén etc show real name and are searchable via rub;
+        -- picker already painted: refresh only the rows when data arrives
         vim.defer_fn(function()
           local need = {}
           for _, c in ipairs(valid_chats) do
             if nv(c.chatType) == "oneOnOne" and format_chat(c):match("^oneOnOne") then table.insert(need, c) end
           end
           if #need == 0 then return end
+          names_ready = false
+          vim.schedule(function()
+            local picker = action_state.get_current_picker(prompt_bufnr)
+            if picker then picker.prompt_border:change_title("Teams Chats (resolving names…)") end
+          end)
           local pending = #need
           for _, c in ipairs(need) do
             require("ms-teams.graph").get_chat(nv(c.id), function(full)
@@ -3974,9 +4405,13 @@ function M.find_chats(opts)
               pending = pending - 1
               if pending == 0 then
                 vim.schedule(function()
+                  names_ready = true
                   if vim.api.nvim_buf_is_valid(prompt_bufnr) then
                     local picker = action_state.get_current_picker(prompt_bufnr)
-                    if picker then picker:refresh(create_finder(show_all), {reset_prompt=false}) end
+                    if picker then
+                      picker:refresh(create_finder(show_all), {reset_prompt=false})
+                      picker.prompt_border:change_title("Teams Chats" .. title_suffix())
+                    end
                   end
                 end)
               end
