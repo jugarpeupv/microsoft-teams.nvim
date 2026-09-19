@@ -122,6 +122,28 @@ public class GetDavmailToken {
 end
 
 local auth_cmd_pending = nil
+-- processes WE spawned via run_auth_cmd (jobid -> true); killed on VimLeave
+local auth_jobs = {}
+-- circuit breaker: consecutive auth_cmd launches without any token success.
+-- Stops the respawn loop (missing file + watch poll); re-armed by success
+-- or M.reset_auth_breaker() (watch restart).
+local auth_launch_count = 0
+local auth_breaker_tripped = false
+
+-- max fruitless launches before the breaker silences auto-heal.
+-- davmail.auth_max_attempts (default 1): e.g. 1 = single attempt, then quiet.
+local function max_attempts()
+  local ok, cfg = pcall(require, "ms-teams.config")
+  local dav = (ok and cfg.options and cfg.options.davmail) or {}
+  local n = tonumber(dav.auth_max_attempts) or 1
+  if n < 1 then n = 1 end
+  return n
+end
+
+local function note_auth_success()
+  auth_launch_count = 0
+  auth_breaker_tripped = false
+end
 -- notify-once for missing token state: first failure notifies, repeats are
 -- suppressed until success or a different message / 5 min pass
 local last_missing_notify_at = 0
@@ -141,8 +163,13 @@ end
 local function run_auth_cmd(quiet)
   local ok, cfg = pcall(require, "ms-teams.config")
   local dav = ok and cfg.options and cfg.options.davmail or {}
+  -- explicit opt-out: auth_cmd = false NEVER auto-launches (nil = default).
+  -- NOTE: must check before `or "davmail-token"`, which would swallow false.
+  if dav.auth_cmd == false then return false end
   local cmd = dav.auth_cmd or "davmail-token"
-  if not cmd or cmd == "" then return false end
+  if cmd == nil or cmd == "" then return false end
+  -- tripped breaker: stay silent until reset (success / restart)
+  if auth_breaker_tripped then return false end
   -- debounce: only launch once per 60s
   if auth_cmd_pending and os.time() - auth_cmd_pending < 60 then return true end
   auth_cmd_pending = os.time()
@@ -155,9 +182,10 @@ local function run_auth_cmd(quiet)
   if not quiet then
     vim.notify("ms-teams davmail: token missing or expired, running auth_cmd...", vim.log.levels.WARN)
   end
-  pcall(vim.fn.jobstart, job_cmd, {
+  local okj, jid = pcall(vim.fn.jobstart, job_cmd, {
     pty = true,
-    on_exit = function(_, code)
+    on_exit = function(id, code)
+      auth_jobs[id] = nil
       vim.schedule(function()
         if code == 0 then
           vim.notify("ms-teams: davmail authenticated successfully, refreshing...", vim.log.levels.INFO)
@@ -178,7 +206,38 @@ local function run_auth_cmd(quiet)
       end)
     end
   })
+  if not (okj and jid and jid > 0) then return false end
+  auth_jobs[jid] = true
+  auth_launch_count = auth_launch_count + 1
+  if auth_launch_count >= max_attempts() and not auth_breaker_tripped then
+    auth_breaker_tripped = true
+    vim.notify(string.format(
+      "ms-teams: auth_cmd launched %dx with no token - auto-heal silenced until login succeeds or :MSTeamsWatchRestart",
+      auth_launch_count), vim.log.levels.WARN)
+  end
   return true
+end
+
+function M.reset_auth_breaker()
+  auth_launch_count = 0
+  auth_breaker_tripped = false
+  auth_cmd_pending = nil
+end
+
+function M.auth_breaker_status()
+  return { tripped = auth_breaker_tripped, launches = auth_launch_count, max = max_attempts() }
+end
+
+-- kill auth_cmd processes WE spawned (called on VimLeave so a closed
+-- editor never leaves orphan davmail-token/java behind)
+function M.stop_pending_auth()
+  local n = 0
+  for jid, _ in pairs(auth_jobs) do
+    pcall(vim.fn.jobstop, jid)
+    auth_jobs[jid] = nil
+    n = n + 1
+  end
+  return n
 end
 
 local function resolve_token_file(opts)
@@ -279,6 +338,7 @@ function M.load_davmail_token(opts)
   end
 
   reset_missing_notify()
+  note_auth_success()
   if raw_val:match("^{AES}") then
     return decrypt_aes_token(token_file, user, password)
   else
@@ -415,6 +475,7 @@ local function refresh_access_token(refresh_token, opts, cb)
       local tok = {access_token=j.access_token, expires_on=expires_on, refresh_token=j.refresh_token or refresh_token}
       save_access_cache(tok)
       reauth_cooldown_until = 0 -- session healthy again
+      note_auth_success()
       cb(tok.access_token, nil)
     end)
   end)
@@ -464,6 +525,7 @@ function M.get_access_token_sync(opts)
   if j.expires_on then expires_on = tonumber(j.expires_on) end
   save_access_cache({access_token=j.access_token, expires_on=expires_on, refresh_token=j.refresh_token or refresh})
   reauth_cooldown_until = 0 -- session healthy again
+  note_auth_success()
   return j.access_token
 end
 

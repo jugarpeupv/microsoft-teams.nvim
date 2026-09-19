@@ -74,8 +74,11 @@ function M.setup(opts)
   vim.api.nvim_create_autocmd("VimLeavePre", {
     callback = function()
       pcall(function()
+        -- kill auth_cmd children WE spawned so a closed editor never
+        -- leaves orphan davmail-token/java behind
+        pcall(function() require("ms-teams.davmail_token").stop_pending_auth() end)
         local w = require("ms-teams.watch")
-        if w.is_running and w.is_running() then w.stop() else
+        if w.is_running and w.is_running() then w.stop(true) else
           -- ensure stale lock owned by this pid is removed even if watch not running
           local p = (config.options.data_dir or vim.fn.stdpath("data") .. "/ms-teams") .. "/watch.lock"
           if vim.fn.filereadable(p) == 1 then

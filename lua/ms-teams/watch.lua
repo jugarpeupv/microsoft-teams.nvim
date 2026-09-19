@@ -38,6 +38,16 @@ local function read_lock()
   return nil
 end
 
+-- best-effort check that a lock pid is really an nvim (guards against
+-- pid recycling: a dead editor + reused pid must not block a new watch)
+local function lock_pid_is_nvim(pid)
+  local out = vim.fn.system({ "ps", "-p", tostring(pid), "-o", "comm=" })
+  if vim.v.shell_error ~= 0 then return nil end -- ps unavailable/failed: unknown
+  out = ((out or ""):gsub("%s+", "")):lower()
+  if out == "" then return nil end
+  return out:find("nvim", 1, true) ~= nil
+end
+
 local function is_locked()
   local j = read_lock()
   if not j or not j.pid then return false, nil end
@@ -45,6 +55,7 @@ local function is_locked()
   if not pid then return false, nil end
   if pid == vim.fn.getpid() then return false, nil end
   if is_pid_alive(pid) then
+    if lock_pid_is_nvim(pid) == false then return false, j end -- stale: pid recycled
     local age = os.time() - (tonumber(j.started_at) or 0)
     local interval = (config.options.watch and config.options.watch.interval_ms or 60000) / 1000
     if age < interval * 5 then
@@ -361,9 +372,9 @@ function M.start(opts)
   return timer
 end
 
-function M.stop()
+function M.stop(quiet)
   if not timer then
-    vim.notify("MSTeams watch no activo", vim.log.levels.WARN)
+    if not quiet then vim.notify("MSTeams watch no activo", vim.log.levels.WARN) end
     return
   end
   timer:stop()
@@ -371,7 +382,7 @@ function M.stop()
   timer = nil
   polling = false
   release_lock_if_owner()
-  vim.notify("MSTeams watch detenido", vim.log.levels.INFO)
+  if not quiet then vim.notify("MSTeams watch detenido", vim.log.levels.INFO) end
 end
 
 function M.restart()
@@ -379,6 +390,8 @@ function M.restart()
   -- reset seen so next start no spam, but keep initialized false to reseed
   seen = {}
   initialized = false
+  -- re-arm auth auto-heal silenced by the breaker: restart = user intent
+  pcall(function() require("ms-teams.davmail_token").reset_auth_breaker() end)
   M.start()
 end
 

@@ -14,7 +14,8 @@ M.defaults = {
     redirect_uri = "urn:ietf:wg:oauth:2.0:oob",
     fingerprint = "davmailgateway!&",
     password = "", -- for {AES} decrypt; "" when davmail stores plain (password empty at creation)
-    auth_cmd = nil, -- nil | string | string[] to run when token file missing, e.g. "davmail-token" alias or {"bash","-c","davmail-token"}
+    auth_cmd = nil, -- nil = default "davmail-token" alias | string | string[] to run when token file missing, e.g. {"bash","-c","davmail-token"} | false = NEVER auto-launch (silent, no respawn loop)
+    auth_max_attempts = 1, -- fruitless auth_cmd launches before auto-heal silences itself (1 = single attempt, then quiet until login succeeds or :MSTeamsWatchRestart)
   },
   -- fallback legacy first-party client (used when davmail.enabled=false or file missing)
   client = {
