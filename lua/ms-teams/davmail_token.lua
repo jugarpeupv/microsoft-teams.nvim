@@ -338,7 +338,9 @@ function M.load_davmail_token(opts)
   end
 
   reset_missing_notify()
-  note_auth_success()
+  -- NOTE: finding a file entry is NOT success (it may be a stale/dead
+  -- session). Only an actually obtained access token re-arms the breaker
+  -- (see refresh paths below); otherwise reset-then-launch loops forever.
   if raw_val:match("^{AES}") then
     return decrypt_aes_token(token_file, user, password)
   else
@@ -434,8 +436,10 @@ local function handle_dead_session(err_text)
   local now = os.time()
   if now < reauth_cooldown_until then return true end
   reauth_cooldown_until = now + REAUTH_COOLDOWN_S
-  vim.notify("ms-teams: davmail session expired, re-login required - running auth_cmd...", vim.log.levels.WARN)
-  run_auth_cmd(true) -- quiet: already notified above
+  if run_auth_cmd(true) then -- quiet: notified below only on actual launch
+    vim.notify("ms-teams: davmail session expired, re-login required - running auth_cmd...", vim.log.levels.WARN)
+  end
+  -- blocked (tripped breaker / opt-out): stay silent, trip warning already shown
   return true
 end
 
