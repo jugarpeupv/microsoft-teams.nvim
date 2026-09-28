@@ -144,6 +144,11 @@ local function note_auth_success()
   auth_launch_count = 0
   auth_breaker_tripped = false
 end
+-- forward declaration (defined below run_auth_cmd)
+local resolve_token_file
+-- token-file mtime captured at launch; an exit-0 only counts as success
+-- if the file actually changed (davmail-token may exit 0 spuriously)
+local auth_pending_baseline = nil
 -- notify-once for missing token state: first failure notifies, repeats are
 -- suppressed until success or a different message / 5 min pass
 local last_missing_notify_at = 0
@@ -173,6 +178,11 @@ local function run_auth_cmd(quiet)
   -- debounce: only launch once per 60s
   if auth_cmd_pending and os.time() - auth_cmd_pending < 60 then return true end
   auth_cmd_pending = os.time()
+  -- baseline for exit-0 verification (see on_exit below)
+  if resolve_token_file then
+    local tok_path = resolve_token_file({})
+    auth_pending_baseline = tok_path and { path = tok_path, mtime = vim.fn.getftime(tok_path) } or nil
+  end
   local job_cmd
   if type(cmd) == "table" then job_cmd = cmd
   else
@@ -188,18 +198,27 @@ local function run_auth_cmd(quiet)
       auth_jobs[id] = nil
       vim.schedule(function()
         if code == 0 then
-          vim.notify("ms-teams: davmail authenticated successfully, refreshing...", vim.log.levels.INFO)
-          -- give davmail a moment to flush oauth_tokens.env, then retry pending UI
-          vim.defer_fn(function()
-            local ok_ui, ui = pcall(require, "ms-teams.ui")
-            if ok_ui and ui.refresh_chats_background then
-              ui.refresh_chats_background(function() end)
-            end
-            local ok_w, watch = pcall(require, "ms-teams.watch")
-            if ok_w and watch.is_running and watch.is_running() and watch.poll_once then
-              watch.poll_once()
-            end
-          end, 2000)
+          local changed = true
+          if auth_pending_baseline and auth_pending_baseline.path then
+            changed = vim.fn.getftime(auth_pending_baseline.path) ~= auth_pending_baseline.mtime
+          end
+          auth_pending_baseline = nil
+          if not changed then
+            vim.notify("ms-teams: davmail auth_cmd finished but token file unchanged - complete the login or run :MSTeamsLogin", vim.log.levels.WARN)
+          else
+            vim.notify("ms-teams: davmail authenticated successfully, refreshing...", vim.log.levels.INFO)
+            -- give davmail a moment to flush oauth_tokens.env, then retry pending UI
+            vim.defer_fn(function()
+              local ok_ui, ui = pcall(require, "ms-teams.ui")
+              if ok_ui and ui.refresh_chats_background then
+                ui.refresh_chats_background(function() end)
+              end
+              local ok_w, watch = pcall(require, "ms-teams.watch")
+              if ok_w and watch.is_running and watch.is_running() and watch.poll_once then
+                watch.poll_once(true)
+              end
+            end, 2000)
+          end
         else
           vim.notify("ms-teams: davmail auth_cmd failed (exit " .. code .. ")", vim.log.levels.ERROR)
         end
@@ -240,7 +259,7 @@ function M.stop_pending_auth()
   return n
 end
 
-local function resolve_token_file(opts)
+resolve_token_file = function(opts)
   opts = opts or {}
   local ok, cfg = pcall(require, "ms-teams.config")
   local dav = (ok and cfg.options and cfg.options.davmail) or {}
@@ -404,7 +423,10 @@ local function access_cache_stale()
   if not cached then return true end
   local current_rt = read_current_refresh_token()
   if not current_rt then return false end
-  if cached.refresh_token ~= current_rt then
+  -- compare against the RT we used for this cache entry: after OUR refresh
+  -- the file still holds the pre-rotation RT, which must not mark stale
+  -- (that caused a refresh+retry storm on every request)
+  if current_rt ~= (cached.rt_used or cached.refresh_token) then
     access_cache = nil
     return true
   end
@@ -476,7 +498,10 @@ local function refresh_access_token(refresh_token, opts, cb)
       end
       local expires_on = os.time() + (tonumber(j.expires_in) or 3600)
       if j.expires_on then expires_on = tonumber(j.expires_on) end
-      local tok = {access_token=j.access_token, expires_on=expires_on, refresh_token=j.refresh_token or refresh_token}
+      -- rt_used: the RT we refreshed with; the davmail file keeps the OLD RT
+      -- after our own rotation, so staleness must compare against rt_used
+      -- (file only changes when davmail itself re-logs-in)
+      local tok = {access_token=j.access_token, expires_on=expires_on, refresh_token=j.refresh_token or refresh_token, rt_used=refresh_token}
       save_access_cache(tok)
       reauth_cooldown_until = 0 -- session healthy again
       note_auth_success()
@@ -527,7 +552,7 @@ function M.get_access_token_sync(opts)
   end
   local expires_on = os.time() + (tonumber(j.expires_in) or 3600)
   if j.expires_on then expires_on = tonumber(j.expires_on) end
-  save_access_cache({access_token=j.access_token, expires_on=expires_on, refresh_token=j.refresh_token or refresh})
+  save_access_cache({access_token=j.access_token, expires_on=expires_on, refresh_token=j.refresh_token or refresh, rt_used=refresh})
   reauth_cooldown_until = 0 -- session healthy again
   note_auth_success()
   return j.access_token

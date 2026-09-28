@@ -33,7 +33,7 @@ local function graph_request(kind, method, path, body)
   return j, nil
 end
 
-local function graph_request_async(kind, method, path, body, cb, extra_headers)
+local function graph_request_async(kind, method, path, body, cb, extra_headers, attempt)
   auth.ensure_token_async(kind, function(token, err)
     if not token then
       vim.schedule(function() cb(nil, err) end)
@@ -76,14 +76,19 @@ local function graph_request_async(kind, method, path, body, cb, extra_headers)
           local emsg = code .. detail
           -- If token was revoked/invalidated on Graph side, clear access_token expiry and trigger auth
           if emsg:find("InvalidAuthenticationToken") or emsg:find("CompactToken") or emsg:find("Lifetime validation failed") then
-            auth.ensure_token_async(kind, function(new_tok, err_login)
-              if new_tok then
-                -- retry request once
-                graph_request_async(kind, method, path, body, cb)
-              else
-                cb(nil, emsg)
-              end
-            end)
+            -- retry ONCE after re-acquiring the token; without the cap this
+            -- recursed forever (refresh storm at ~1Hz when /me 401'd)
+            if (attempt or 0) < 1 then
+              auth.ensure_token_async(kind, function(new_tok, err_login)
+                if new_tok then
+                  graph_request_async(kind, method, path, body, cb, extra_headers, (attempt or 0) + 1)
+                else
+                  cb(nil, emsg)
+                end
+              end)
+              return
+            end
+            cb(nil, emsg)
             return
           end
           cb(nil, emsg)
@@ -119,7 +124,7 @@ function M.list_chats(cb, opts)
       if #all >= limit then
         local has_notes=false; for _,c in ipairs(all) do if c.id=="48:notes" then has_notes=true; break end end
         if has_notes then cb(all, nil); return end
-        graph_request_async("read","GET","/chats/48:notes?$expand=members",nil,function(n,e)
+        graph_request_async("read","GET","/chats/48:notes?$expand=members,lastMessagePreview",nil,function(n,e)
           if n and n.id then table.insert(all,1,n)
           else
             local me_name = vim.g.ms_teams_me_name or (function() local ok,c=pcall(require("ms-teams.cache").load,"me"); if ok and c and c.displayName then return c.displayName end; return "You" end)()
@@ -136,7 +141,7 @@ function M.list_chats(cb, opts)
       end
       local has_notes=false; for _,c in ipairs(all) do if c.id=="48:notes" then has_notes=true; break end end
       if has_notes then cb(all, nil); return end
-      graph_request_async("read","GET","/chats/48:notes?$expand=members",nil,function(n,e)
+      graph_request_async("read","GET","/chats/48:notes?$expand=members,lastMessagePreview",nil,function(n,e)
         if n and n.id then table.insert(all,1,n)
         else
             local me_name2 = vim.g.ms_teams_me_name or (function() local ok,c=pcall(require("ms-teams.cache").load,"me"); if ok and c and c.displayName then return c.displayName end; return "You" end)()
@@ -242,7 +247,7 @@ end
 
 function M.get_chat(chat_id, cb)
   -- 48:notes y oneOnOne con members truncado (limit=500 quita $expand) necesitan fetch directo
-  graph_request_async("read", "GET", "/chats/" .. chat_id .. "?$expand=members", nil, function(j, err)
+  graph_request_async("read", "GET", "/chats/" .. chat_id .. "?$expand=members,lastMessagePreview", nil, function(j, err)
     if not j then
       -- fallback: /chats/{id}/members
       graph_request_async("read", "GET", "/chats/" .. chat_id .. "/members", nil, function(j2, err2)
@@ -257,10 +262,19 @@ function M.get_chat(chat_id, cb)
   end)
 end
 
+local me_pending = nil -- single-flight: init setup + watch first poll can miss together
 function M.get_me(cb)
+  if me_pending then
+    table.insert(me_pending, cb)
+    return
+  end
+  me_pending = { cb }
   graph_request_async("read", "GET", "/me?$select=id,displayName,mail", nil, function(j, err)
-    if err or not j then cb(nil, err or "no me"); return end
-    cb(j, nil)
+    local pend = me_pending or {}
+    me_pending = nil
+    for _, c in ipairs(pend) do
+      c(j, err or (not j and "no me" or nil))
+    end
   end)
 end
 

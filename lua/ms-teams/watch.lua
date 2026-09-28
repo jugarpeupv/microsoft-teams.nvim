@@ -8,6 +8,8 @@ local seen = {} -- chat_id -> last preview id or createdDateTime
 local initialized = false
 local me_cache = nil
 local me_fetching = false
+local me_attempts = 0
+local me_last_attempt = 0
 local lock_owner = false
 
 local function lock_path()
@@ -266,11 +268,26 @@ local function do_poll()
   if polling then return end
   local w0 = config.options.watch or {}
   if w0.mentions_only and not me_cache and not me_fetching then
+    local now = os.time()
+    -- bounded retries: up to 5 attempts per 60s window with backoff, then
+    -- wait for the next scheduled poll (was an unbounded 1Hz get_me loop
+    -- when /me kept failing)
+    if now - me_last_attempt >= 60 then me_attempts = 0 end
+    if me_attempts >= 5 then return end
+    me_attempts = me_attempts + 1
+    me_last_attempt = now
     me_fetching = true
     require("ms-teams.graph").get_me(function(j, _)
-      if j then me_cache = j end
+      if j then
+        me_cache = j
+        me_attempts = 0
+      end
       me_fetching = false
-      do_poll()
+      if not j then
+        vim.defer_fn(function() do_poll() end, 1000 * me_attempts)
+      else
+        do_poll()
+      end
     end)
     return
   end
@@ -408,9 +425,9 @@ function M.is_running()
 end
 
 -- for manual trigger without waiting interval
-function M.poll_once()
+function M.poll_once(quiet)
   do_poll()
-  vim.notify("MSTeams watch: poll manual disparado", vim.log.levels.INFO)
+  if not quiet then vim.notify("MSTeams watch: poll manual disparado", vim.log.levels.INFO) end
 end
 
 -- reset internal seen (útil tras :MSTeamsChats)
