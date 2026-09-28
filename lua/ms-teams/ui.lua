@@ -423,13 +423,16 @@ local function format_date(iso)
     date_cache[iso] = iso
     return iso
   end
-
-  local now = os.time()
-  local local_t = os.date("*t", now)
-  local utc_t = os.date("!*t", now)
-  local tz_offset = os.difftime(os.time(local_t), os.time(utc_t))
-
-  local t_as_local = os.time({
+  -- explicit offset when present (Graph usually sends Z = UTC)
+  local off_s = 0
+  local zsign, zh, zm = iso:match("T%d%d:%d%d:%d%d%.?%d*([%+%-])(%d%d):?(%d%d)")
+  if zsign then
+    off_s = (tonumber(zh) * 3600 + tonumber(zm) * 60) * (zsign == "-" and -1 or 1)
+  end
+  -- interpret the wall components with isdst determined by the date itself;
+  -- never feed os.date("!*t")'s isdst=false back into os.time (it forces
+  -- standard time and shifted display by the DST hour)
+  local wall = os.time({
     year = tonumber(y),
     month = tonumber(m),
     day = tonumber(d),
@@ -437,9 +440,10 @@ local function format_date(iso)
     min = tonumber(min),
     sec = tonumber(s),
   })
-
-  local true_local_epoch = t_as_local + tz_offset
-  local formatted = os.date("%H:%M %d/%m/%Y", true_local_epoch)
+  local utc_tbl = os.date("!*t", wall)
+  utc_tbl.isdst = nil
+  local local_ahead = wall - os.time(utc_tbl)
+  local formatted = os.date("%H:%M %d/%m/%Y", wall + local_ahead - off_s)
   date_cache[iso] = formatted
   return formatted
 end
