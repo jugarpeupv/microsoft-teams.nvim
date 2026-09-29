@@ -600,6 +600,17 @@ local function build_message_lines(m, chat)
     return "\002IN" .. #inline_codes .. "\002"
   end)
 
+  -- 3.5 Extract mentions: <at id="0">Name</at> → placeholder (restored as @Name)
+  local mention_names = {}
+  body = body:gsub("<at[^>]*>(.-)</at>", function(name)
+    name = name:gsub("<[^>]+>", "")
+    name = name:gsub("&nbsp;", " "):gsub("&amp;", "&"):gsub("&lt;", "<"):gsub("&gt;", ">"):gsub("&quot;", '"')
+    name = name:gsub("^%s+", ""):gsub("%s+$", "")
+    if name == "" then return "" end
+    table.insert(mention_names, name)
+    return "\005MNT" .. #mention_names .. "\005"
+  end)
+
   -- 4. Handle emojis & structure tags
   body = body:gsub('<emoji[^>]+alt="([^"]+)"[^>]*></emoji>', "%1")
   body = body:gsub("<emoji[^>]+alt='([^']+)'[^>]*></emoji>", "%1")
@@ -691,6 +702,11 @@ local function build_message_lines(m, chat)
   -- 8. Restore Markdown tables
   body = body:gsub("\004TBL(%d+)\004", function(idx)
     return tables[tonumber(idx)] or ""
+  end)
+
+  -- restore mentions as @Name (highlight pass matches "@name" per line)
+  body = body:gsub("\005MNT(%d+)\005", function(idx)
+    return "@" .. (mention_names[tonumber(idx)] or "")
   end)
 
   body = body:gsub("^%s+", ""):gsub("%s+$", "")
@@ -916,6 +932,7 @@ local function build_message_lines(m, chat)
     reply_preview = reply_preview,
     reply_target = reply_target,
     img_srcs = img_srcs,
+    mention_names = mention_names,
   }
 end
 
@@ -1201,7 +1218,6 @@ function M.pick_chats()
         local base = format_chat(chat)
         local type_icon = get_chat_type_icon(chat)
         local line = type_icon ~= "" and (type_icon .. "  " .. base) or base
-        if nv(chat.chatType) == "meeting" then line = line .. " (meeting)" end
         table.insert(lines, line)
       local lnum = #lines
       line_to_chat[lnum] = chat
@@ -3006,6 +3022,7 @@ function M.show_messages(chat, open)
       end)
     end
     local unread_msg_lines = {}
+    local mention_names_seen = {}
     local id_to_lnum = {}
     local reply_to_target = {}
     local image_map = {}
@@ -3060,6 +3077,11 @@ function M.show_messages(chat, open)
       local header_lnum = #lines + 1
       if res.id then id_to_lnum[res.id] = header_lnum end
       if res.is_unread then unread_msg_lines[header_lnum] = true end
+      if res.mention_names then
+        for _, n in ipairs(res.mention_names) do
+          if n ~= "" then mention_names_seen[n] = true end
+        end
+      end
       for idx, l in ipairs(res.lines) do
         table.insert(lines, l)
         if res.reply_target and #lines == header_lnum + 1 and res.reply_preview then
@@ -3115,6 +3137,23 @@ function M.show_messages(chat, open)
       vim.api.nvim_buf_clear_namespace(buf, ns, 0, -1)
       for lnum, _ in pairs(unread_msg_lines) do
         vim.api.nvim_buf_add_highlight(buf, ns, hl_group, lnum - 1, 0, eol_col(buf, lnum))
+      end
+      -- style @mentions (real Teams <at> tags) like Teams does
+      if next(mention_names_seen) then
+        pcall(vim.api.nvim_set_hl, 0, "MsTeamsMention", { default = true, bold = true, fg = "#5b9bd5" })
+        for lnum = 1, #lines do
+          local l = lines[lnum]
+          for name in pairs(mention_names_seen) do
+            local pat = "@" .. name
+            local init = 1
+            while true do
+              local s = l:find(pat, init, true)
+              if not s then break end
+              vim.api.nvim_buf_add_highlight(buf, ns, "MsTeamsMention", lnum - 1, s - 1, s - 1 + #pat)
+              init = s + #pat
+            end
+          end
+        end
       end
     end
     -- keep ns var even when skipping render

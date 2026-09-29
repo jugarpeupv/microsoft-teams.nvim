@@ -57,7 +57,11 @@ local function graph_request_async(kind, method, path, body, cb, extra_headers, 
           local errmsg = "curl exit " .. tostring(obj.code) .. " url: " .. url:sub(1, 300)
           if obj.stderr ~= "" then errmsg = errmsg .. " stderr: " .. obj.stderr end
           if obj.stdout ~= "" then errmsg = errmsg .. " stdout: " .. obj.stdout:sub(1, 200) end
-          vim.notify("ms-teams graph_request_async: " .. errmsg, vim.log.levels.ERROR)
+          -- exit 28 = curl --max-time timeout: transient, callers already get
+          -- the error via cb and the next poll retries; don't spam ERROR
+          if obj.code ~= 28 then
+            vim.notify("ms-teams graph_request_async: " .. errmsg, vim.log.levels.ERROR)
+          end
           cb(nil, errmsg)
           return
         end
