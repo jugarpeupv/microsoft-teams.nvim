@@ -108,11 +108,18 @@ end
 -- reused from disk (names barely change). Only successful fetches are
 -- stored, so failures retry on the next open.
 local MEMBERS_TTL = 7 * 24 * 3600
+-- Graph gives two id forms for the same chat (19:xxx_thread.v2 used in
+-- URLs, 19:xxx@thread.v2 raw). Members were saved with either form, so
+-- canonicalize on read/write or lookups silently miss.
+local function member_key(chat_id)
+  return (chat_id:gsub("_thread%.tacv2$", "@thread.tacv2"):gsub("_thread%.v2$", "@thread.v2"))
+end
+
 function M.get_cached_members(chat_id)
   if not chat_id then return nil end
   local ok, j = pcall(M.load, "oneonone_members", MEMBERS_TTL)
   if not ok or type(j) ~= "table" or type(j.members) ~= "table" then return nil end
-  local m = j.members[chat_id]
+  local m = j.members[member_key(chat_id)] or j.members[chat_id]
   if type(m) == "table" and #m > 0 then return m end
   return nil
 end
@@ -123,7 +130,7 @@ function M.save_cached_members(chat_id, members)
   pcall(function() j = M.load("oneonone_members", nil) end)
   if type(j) ~= "table" then j = {} end
   if type(j.members) ~= "table" then j.members = {} end
-  j.members[chat_id] = members
+  j.members[member_key(chat_id)] = members
   M.save("oneonone_members", j)
 end
 
