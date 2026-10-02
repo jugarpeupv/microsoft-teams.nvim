@@ -326,10 +326,74 @@ local function resolve_identity_name(id)
   return identity_names[id]
 end
 
+-- last resort for names the member caches can't give (channels whose
+-- members endpoint 404s, e.g. the new shared/incoming types): look each id
+-- up in the directory via /users. One global FIFO with a gap between
+-- requests (Graph 429s on burst lookups); each caller waits on its own uids,
+-- so a second open while a lookup is in flight still gets the fill-in.
+local users_unknown = {}
+local users_queue = {}
+local users_queued = {}
+local users_waiters = {}
+local users_running = false
+
+local function users_pump()
+  if users_running then return end
+  local uid = table.remove(users_queue, 1)
+  if not uid then return end
+  users_running = true
+  require("ms-teams.graph").get_user_name(uid, function(name, err)
+    vim.schedule(function()
+      if name then
+        identity_names[uid] = name
+      elseif not err then
+        users_unknown[uid] = true
+      end
+      users_queued[uid] = nil
+      local ws = users_waiters[uid]
+      users_waiters[uid] = nil
+      if ws then
+        for _, w in ipairs(ws) do w() end
+      end
+      users_running = false
+      vim.defer_fn(users_pump, 350)
+    end)
+  end)
+end
+
+local function resolve_names_async(uids, cb)
+  local wait_on, seen = {}, {}
+  for _, uid in ipairs(uids) do
+    if uid and uid ~= "" and not identity_names[uid] and not users_unknown[uid] and not seen[uid] then
+      seen[uid] = true
+      table.insert(wait_on, uid)
+      if not users_queued[uid] then
+        users_queued[uid] = true
+        table.insert(users_queue, uid)
+      end
+    end
+  end
+  if #wait_on == 0 then cb(); return end
+  local remaining = #wait_on
+  local function one_done()
+    remaining = remaining - 1
+    if remaining == 0 then cb() end
+  end
+  for _, uid in ipairs(wait_on) do
+    users_waiters[uid] = users_waiters[uid] or {}
+    table.insert(users_waiters[uid], one_done)
+  end
+  users_pump()
+end
+
 -- chat members fetched via get_chat, shared across renders: chat objects
 -- are rebuilt by watch refreshes, so keep a session-level cache by chat id
 local chat_members_cache = {}
 local members_fetching = {}
+local members_failed = {} -- chat_id -> failed attempts (cap retries per session)
+-- queue fallback for reactant ids members can't resolve (shared channels)
+local names_fetching = {}
+local names_tried = {}
 
 -- members from every available source (chat expand, session, disk cache),
 -- seeding the identity map each time so reaction names resolve in gr even
@@ -383,7 +447,10 @@ local function messages_need_members(msgs)
           local ru = nv(r.user)
           if type(ru) == "table" then ru = nv(ru.user) or ru end
           local uid = type(ru) == "table" and (nv(ru.userId) or nv(ru.id)) or nil
-          if uid and not resolve_identity_name(uid) then need_fetch = true end
+          if uid and not resolve_identity_name(uid) then
+            -- single-reactor names render inline: repaint changes a visible line
+            need_repaint, need_fetch = true, true
+          end
         end
       end
     end
@@ -411,6 +478,29 @@ local function messages_need_members(msgs)
     end
   end
   return need_repaint, need_fetch
+end
+
+-- reactant ids with no resolved name yet: the compact line shows them
+-- inline for single-reactor groups, so they must be looked up
+local function missing_reaction_uids(msgs)
+  local out, seen = {}, {}
+  for _, sm in ipairs(msgs) do
+    local rs = nv(sm.reactions)
+    if type(rs) == "table" then
+      for _, r in ipairs(rs) do
+        if type(r) == "table" then
+          local ru = nv(r.user)
+          if type(ru) == "table" then ru = nv(ru.user) or ru end
+          local uid = type(ru) == "table" and (nv(ru.userId) or nv(ru.id)) or nil
+          if uid and not seen[uid] and not resolve_identity_name(uid) then
+            seen[uid] = true
+            table.insert(out, uid)
+          end
+        end
+      end
+    end
+  end
+  return out
 end
 
 -- group a message's reactions by emoji, deduped per user, in order of
@@ -1109,7 +1199,11 @@ local function build_message_lines(m, chat)
   if #r_order > 0 then
     local parts = {}
     for _, rt in ipairs(r_order) do
-      table.insert(parts, rt .. #r_groups[rt])
+      local g = r_groups[rt]
+      local p = rt .. #g
+      -- single reactor: name inline, no need to open the detail buffer
+      if #g == 1 and g[1].name then p = p .. " " .. g[1].name end
+      table.insert(parts, p)
     end
     table.insert(lines, "  [reactions: " .. table.concat(parts, " ") .. "]")
   end
@@ -3189,7 +3283,7 @@ function M.show_messages(chat, open)
     set_listed_scratch(buf, "ms-teams://chat/" .. safe_name .. "__" .. safe_id)
     local HEADER_LINES = 6
     local header_suffix = is_cached and " (cached)" or ""
-    local lines = { "# " .. chat_name, "", string.format("Chat: %s | %d messages%s", chat_id, #msgs, header_suffix), "", "Press g? participants | <CR> jump reply / reactions | S reply | R refresh | gR load 50 older | g/ search | gF telescope search | mr mark read | mu mark unread | q close", "" }
+    local lines = { "# " .. chat_name, "", string.format("Chat: %s | %d messages%s", chat_id, #msgs, header_suffix), "", "Press g? participants | <CR> jump reply / reactions | <C-s>/<C-v> reactions split/vsplit | S reply | R refresh | gR load 50 older | g/ search | gF telescope search | mr mark read | mu mark unread | q close", "" }
     -- enrich header for oneOnOne with missing members (was oneOnOne)
     if nv(chat.chatType) == "oneOnOne" and chat_name:match("^oneOnOne") then
       require("ms-teams.graph").get_chat(chat_id, function(full)
@@ -3251,12 +3345,17 @@ function M.show_messages(chat, open)
 
     -- fetch members once per session when they would resolve a name we can
     -- see (system-event ids, reaction ids); repaint only when a visible
-    -- line changes. chat_members_cache + members_fetching prevent storms.
-    if chat_id and not get_chat_members(chat) and not members_fetching[chat_id] then
+    -- line changes. chat_members_cache + members_failed prevent storms.
+    local launched_members = false
+    if chat_id and not get_chat_members(chat) and not members_fetching[chat_id]
+        and (not members_failed[chat_id] or members_failed[chat_id] < 2) then
       local need_repaint, need_fetch = messages_need_members(sorted_msgs)
       if need_fetch then
         members_fetching[chat_id] = true
-        require("ms-teams.graph").get_chat(chat_id, function(full)
+        launched_members = true
+        local g = require("ms-teams.graph")
+        local function on_members(full)
+          members_fetching[chat_id] = nil
           local ms = full and nv(full.members)
           if type(ms) == "table" and #ms > 0 then
             chat_members_cache[chat_id] = ms
@@ -3273,7 +3372,42 @@ function M.show_messages(chat, open)
                 end
               end)
             end
+          else
+            -- failed: cap retries, repaint so the /users fallback below takes over
+            members_failed[chat_id] = (members_failed[chat_id] or 0) + 1
+            vim.schedule(function()
+              if vim.api.nvim_buf_is_valid(buf) then
+                render_buffer(msgs, nextLink, { buf = buf, no_cursor = true, keep_cursor = true, no_open = true, is_cached = is_cached })
+              end
+            end)
           end
+        end
+        if nv(chat.chatType) == "channel" and nv(chat.teamId) then
+          g.get_channel_members(nv(chat.teamId), chat_id, on_members)
+        else
+          g.get_chat(chat_id, on_members)
+        end
+      end
+    end
+
+    -- leftover reactant ids members can't give (shared channels, departed
+    -- users): one /users queue pass per progress step, repaint when they land
+    if chat_id and not launched_members and not members_fetching[chat_id]
+        and not names_fetching[chat_id] then
+      local missing = missing_reaction_uids(sorted_msgs)
+      local n = #missing
+      if n > 0 and names_tried[chat_id] ~= n then
+        names_fetching[chat_id] = true
+        names_tried[chat_id] = n
+        resolve_names_async(missing, function()
+          names_fetching[chat_id] = nil
+          vim.schedule(function()
+            -- another round only while the queue is still making progress
+            if #missing_reaction_uids(sorted_msgs) < n then names_tried[chat_id] = nil end
+            if vim.api.nvim_buf_is_valid(buf) then
+              render_buffer(msgs, nextLink, { buf = buf, no_cursor = true, keep_cursor = true, no_open = true, is_cached = is_cached })
+            end
+          end)
         end)
       end
     end
@@ -3347,7 +3481,7 @@ function M.show_messages(chat, open)
     end
     table.insert(lines, "---")
     table.insert(lines, "Chat: " .. format_chat(chat) .. " | " .. #msgs .. " messages")
-    table.insert(lines, "Hints: q close | S reply (<C-p> paste img) | R refresh | g/ search | gF telescope search | g? participants | <CR> jump to original / reactions | mr mark read | mu mark unread | gR load 50 older")
+    table.insert(lines, "Hints: q close | S reply (<C-p> paste img) | R refresh | g/ search | gF telescope search | g? participants | <CR> jump to original / reactions (<C-s>/<C-v> split/vsplit) | mr mark read | mu mark unread | gR load 50 older")
 
     -- dirty check: skip full set_lines/highlights if content identical (major flicker source)
     local do_render = true
@@ -4134,7 +4268,7 @@ function M.show_messages(chat, open)
     vim.keymap.set("n", "<CR>", function()
       -- reactions line opens the reaction detail instead of jumping
       if vim.api.nvim_get_current_line():find("[reactions:", 1, true) then
-        M.show_reactions(buf, chat)
+        M.show_reactions(buf, chat, "replace")
         return
       end
       local lnum = vim.api.nvim_win_get_cursor(0)[1]
@@ -4149,6 +4283,25 @@ function M.show_messages(chat, open)
         vim.notify("original message not in buffer (beyond 50 loaded - press R to load more)", vim.log.levels.WARN)
       end
     end, { buffer = buf, desc = "Jump to replied message / reactions" })
+    -- <C-s>/<C-v> open the reactions line in a split/vsplit; elsewhere fall
+    -- through to the default key behaviour (<C-v> blockwise, <C-s> no-op)
+    local function reactions_line()
+      return vim.api.nvim_get_current_line():find("[reactions:", 1, true) ~= nil
+    end
+    vim.keymap.set("n", "<C-s>", function()
+      if reactions_line() then
+        M.show_reactions(buf, chat, "split")
+      else
+        vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<C-s>", true, false, true), "n", false)
+      end
+    end, { buffer = buf, desc = "Reactions in horizontal split" })
+    vim.keymap.set("n", "<C-v>", function()
+      if reactions_line() then
+        M.show_reactions(buf, chat, "vsplit")
+      else
+        vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<C-v>", true, false, true), "n", false)
+      end
+    end, { buffer = buf, desc = "Reactions in vertical split" })
     -- :e refreshes in place instead of wiping the nofile buffer
     local e_grp = vim.api.nvim_create_augroup("MsTeamsChatDetail" .. buf, { clear = true })
     vim.api.nvim_create_autocmd("BufReadCmd", { group = e_grp, buffer = buf, callback = function()
@@ -4243,8 +4396,9 @@ function M.show_messages(chat, open)
 end
 
 
--- <CR> on a [reactions:] line: original message + per-emoji who reacted
-function M.show_reactions(detail_buf, chat)
+-- <CR>/<C-s>/<C-v> on a [reactions:] line: original message + per-emoji who
+-- reacted. open_mode: "replace" (default) | "split" | "vsplit"
+function M.show_reactions(detail_buf, chat, open_mode)
   local m = message_at_cursor(detail_buf)
   if not m then
     vim.notify("no message under cursor", vim.log.levels.INFO)
@@ -4252,7 +4406,6 @@ function M.show_reactions(detail_buf, chat)
   end
   -- seed identity from members: reactants we never saw must resolve by name
   if chat then get_chat_members(chat) end
-  local order, groups = group_reactions(m)
   local rbuf = vim.api.nvim_create_buf(true, false)
   vim.api.nvim_buf_set_option(rbuf, "filetype", "markdown")
   set_listed_scratch(rbuf, "ms-teams://reactions/" .. ((nv(m.id) or "x"):sub(1, 12)))
@@ -4260,44 +4413,92 @@ function M.show_reactions(detail_buf, chat)
   fu = type(fu) == "table" and (nv(fu.user) or fu) or nil
   local from = (fu and nv(fu.displayName)) or "System"
   local dt = format_date(nv(m.createdDateTime) or "")
-  local out = { "# Reactions — **" .. from .. "** (" .. dt .. ")", "" }
-  -- full original message as rendered in the chat detail: skip its header
-  -- line (title already has author+date) and the compact reactions block
-  local body = {}
-  local ok_b, res = pcall(build_message_lines, m, chat or {})
-  if ok_b and type(res) == "table" and type(res.lines) == "table" then
-    for i = 2, #res.lines do
-      local l = res.lines[i]
-      if not l:find("[reactions:", 1, true) then table.insert(body, l) end
-    end
-    while #body > 0 and body[1] == "" do table.remove(body, 1) end
-    while #body > 0 and body[#body] == "" do table.remove(body) end
-  end
-  if #body > 0 then
-    for _, l in ipairs(body) do table.insert(out, l) end
-    table.insert(out, "")
-  end
-  if #order == 0 then
-    table.insert(out, "_no reactions_")
-    table.insert(out, "")
-  end
-  for _, rt in ipairs(order) do
-    local g = groups[rt]
-    table.insert(out, "## " .. rt .. " ×" .. #g)
-    for _, u in ipairs(g) do
-      if u.name then
-        table.insert(out, "- " .. u.name)
-      else
-        table.insert(out, "- ? (" .. ((u.uid or "?"):sub(1, 8)) .. ")")
+  local title = "# Reactions — **" .. from .. "** (" .. dt .. ")"
+  local function build()
+    local order, groups = group_reactions(m)
+    local out = { title, "" }
+    -- full original message as rendered in the chat detail: skip its header
+    -- line (title already has author+date) and the compact reactions block
+    local body = {}
+    local ok_b, res = pcall(build_message_lines, m, chat or {})
+    if ok_b and type(res) == "table" and type(res.lines) == "table" then
+      for i = 2, #res.lines do
+        local l = res.lines[i]
+        if not l:find("[reactions:", 1, true) then table.insert(body, l) end
       end
+      while #body > 0 and body[1] == "" do table.remove(body, 1) end
+      while #body > 0 and body[#body] == "" do table.remove(body) end
     end
-    table.insert(out, "")
+    if #body > 0 then
+      for _, l in ipairs(body) do table.insert(out, l) end
+      table.insert(out, "")
+    end
+    local missing = {}
+    if #order == 0 then
+      table.insert(out, "_no reactions_")
+      table.insert(out, "")
+    end
+    for _, rt in ipairs(order) do
+      local g = groups[rt]
+      table.insert(out, "## " .. rt .. " ×" .. #g)
+      for _, u in ipairs(g) do
+        if u.name then
+          table.insert(out, "- " .. u.name)
+        else
+          table.insert(out, "- ? (" .. ((u.uid or "?"):sub(1, 8)) .. ")")
+          if u.uid then table.insert(missing, u.uid) end
+        end
+      end
+      table.insert(out, "")
+    end
+    return out, missing
   end
-  vim.cmd("vsplit")
+  local function fill_missing(missing)
+    if #missing == 0 then return end
+    resolve_names_async(missing, function()
+      vim.schedule(function()
+        if not vim.api.nvim_buf_is_valid(rbuf) then return end
+        vim.api.nvim_buf_set_lines(rbuf, 0, -1, false, (build()))
+      end)
+    end)
+  end
+  local out, missing = build()
+  local prev_buf = vim.api.nvim_get_current_buf()
+  if open_mode == "split" then
+    vim.cmd("split")
+  elseif open_mode == "vsplit" then
+    vim.cmd("vsplit")
+  end
+  -- default: replace the current buffer in the current window
   vim.api.nvim_win_set_buf(0, rbuf)
   vim.api.nvim_buf_set_lines(rbuf, 0, -1, false, out)
-  vim.keymap.set("n", "q", function() vim.api.nvim_buf_delete(rbuf, { force = true }) end, { buffer = rbuf })
-  vim.keymap.set("n", "gr", function() vim.api.nvim_buf_delete(rbuf, { force = true }) end, { buffer = rbuf, desc = "Close reactions" })
+  local function close_reactions()
+    if not vim.api.nvim_buf_is_valid(rbuf) then return end
+    local win = vim.fn.bufwinid(rbuf)
+    local cur = vim.api.nvim_get_current_win()
+    vim.api.nvim_buf_delete(rbuf, { force = true })
+    if win == -1 or not vim.api.nvim_win_is_valid(win) then return end
+    if open_mode == "replace" or open_mode == nil then
+      if vim.api.nvim_buf_is_valid(prev_buf) then
+        pcall(vim.api.nvim_win_set_buf, win, prev_buf)
+      end
+    else
+      pcall(vim.api.nvim_set_current_win, win)
+      pcall(vim.cmd, "close")
+      if vim.api.nvim_win_is_valid(cur) then pcall(vim.api.nvim_set_current_win, cur) end
+    end
+  end
+  vim.keymap.set("n", "q", close_reactions, { buffer = rbuf })
+  vim.keymap.set("n", "gr", close_reactions, { buffer = rbuf, desc = "Close reactions" })
+  -- :e re-renders instead of wiping the nofile buffer
+  local e_grp = vim.api.nvim_create_augroup("MsTeamsReactions" .. rbuf, { clear = true })
+  vim.api.nvim_create_autocmd("BufReadCmd", { group = e_grp, buffer = rbuf, callback = function()
+    if not vim.api.nvim_buf_is_valid(rbuf) then return end
+    local refreshed, miss = build()
+    vim.api.nvim_buf_set_lines(rbuf, 0, -1, false, refreshed)
+    fill_missing(miss)
+  end })
+  fill_missing(missing)
 end
 
 function M.show_participants(chat)
@@ -4330,7 +4531,8 @@ function M.show_participants(chat)
     -- fetch members on demand (group chats don't carry them in list_chats)
     vim.api.nvim_buf_set_lines(buf, 0, -1, false, { title, "", "_Loading members..._" })
     local cid = nv(chat.id)
-    require("ms-teams.graph").get_chat(cid, function(full, err)
+    local g = require("ms-teams.graph")
+    local function on_members(full, err)
       vim.schedule(function()
         if not vim.api.nvim_buf_is_valid(buf) then return end
         if err or not full then
@@ -4352,7 +4554,12 @@ function M.show_participants(chat)
           end
         end
       end)
-    end)
+    end
+    if nv(chat.chatType) == "channel" and nv(chat.teamId) then
+      g.get_channel_members(nv(chat.teamId), cid, on_members)
+    else
+      g.get_chat(cid, on_members)
+    end
   end
   vim.cmd("vsplit")
   vim.api.nvim_win_set_buf(0, buf)
