@@ -503,15 +503,61 @@ local function missing_reaction_uids(msgs)
   return out
 end
 
+-- keycap reactions (1️⃣ = digit + VS16 + U+20E3) break the terminal cell
+-- grid: Neovim counts 1 cell, terminals draw a 2-cell emoji, so the glyph
+-- renders blank/overlapped no matter the font. Normalize to single-codepoint
+-- circled digits for display (raw reactionType data stays untouched).
+local keycap_circled = {
+  ["0"] = "⓪", ["1"] = "①", ["2"] = "②", ["3"] = "③", ["4"] = "④",
+  ["5"] = "⑤", ["6"] = "⑥", ["7"] = "⑦", ["8"] = "⑧", ["9"] = "⑨",
+}
+-- Nerd Font style (md-numeric-N-box): only renders with a Nerd Font,
+-- enabled via setup({ icons = { keycap_style = "nerd" } }).
+local keycap_nerd = {
+  ["0"] = "\243\176\142\161", -- U+F03A1
+  ["1"] = "\243\176\142\164", -- U+F03A4
+  ["2"] = "\243\176\142\167", -- U+F03A7
+  ["3"] = "\243\176\142\170", -- U+F03AA
+  ["4"] = "\243\176\142\173", -- U+F03AD
+  ["5"] = "\243\176\142\177", -- U+F03B1
+  ["6"] = "\243\176\142\179", -- U+F03B3
+  ["7"] = "\243\176\142\182", -- U+F03B6
+  ["8"] = "\243\176\142\185", -- U+F03B9
+  ["9"] = "\243\176\142\188", -- U+F03BC
+}
+local function keycap_map()
+  local ok, conf = pcall(require, "ms-teams.config")
+  local ic = ok and conf and conf.options and conf.options.icons
+  if type(ic) == "table" then
+    if type(ic.keycap_icons) == "table" then return ic.keycap_icons end
+    if ic.keycap_style == "nerd" then return keycap_nerd end
+  end
+  return keycap_circled
+end
+local function normalize_keycaps(s)
+  if type(s) ~= "string" then return s end
+  local map = keycap_map()
+  local function pick(d) return map[d] or d end
+  -- byte escapes: \239\184\143 = U+FE0F (VS16), \226\131\163 = U+20E3.
+  -- (Lua patterns can't quantify a capture group, so with/without VS16
+  -- are two passes.)
+  s = s:gsub("([0-9])\239\184\143\226\131\163", pick)
+  s = s:gsub("([0-9])\226\131\163", pick)
+  return s
+end
+
 -- group a message's reactions by emoji, deduped per user, in order of
 -- first appearance: returns order list + groups[emoji] = {{name, uid}, ...}
+-- plus labels[emoji] = Graph displayName ("Keycap one") for normalized
+-- (keycap) types, so the detail view can name glyphs that may not render.
 local function group_reactions(m)
   local reactions = nv(m and m.reactions)
-  local order, groups, seen = {}, {}, {}
-  if type(reactions) ~= "table" then return order, groups end
+  local order, groups, seen, labels = {}, {}, {}, {}
+  if type(reactions) ~= "table" then return order, groups, labels end
   for _, r in ipairs(reactions) do
     if type(r) == "table" then
-      local rt = nv(r.reactionType) or "?"
+      local raw_rt = nv(r.reactionType) or "?"
+      local rt = normalize_keycaps(raw_rt)
       local ru = nv(r.user)
       if type(ru) == "table" then ru = nv(ru.user) or ru end
       local uid = type(ru) == "table" and (nv(ru.userId) or nv(ru.id)) or nil
@@ -522,6 +568,12 @@ local function group_reactions(m)
           groups[rt] = {}
           table.insert(order, rt)
         end
+        -- remember the Graph displayName for keycap groups only: standard
+        -- emoji render fine, and their headers must stay byte-identical
+        if rt ~= raw_rt and labels[rt] == nil then
+          local dl = nv(r.displayName)
+          if dl and dl ~= "" then labels[rt] = dl end
+        end
         local name = uid and resolve_identity_name(uid) or nil
         if (not name or name == "") and type(ru) == "table" then name = nv(ru.displayName) end
         if name == "" then name = nil end
@@ -529,7 +581,25 @@ local function group_reactions(m)
       end
     end
   end
-  return order, groups
+  return order, groups, labels
+end
+
+-- sender name for message headers: user displayName, else the posting app
+-- (Power Automate "Workflows" bot etc.), else device. Returns nil when
+-- nothing usable is present; callers map that to "unknown"/"System".
+local function sender_display_name(f)
+  f = nv(f)
+  if type(f) ~= "table" then return nil end
+  local u = nv(f.user)
+  local dn = type(u) == "table" and nv(u.displayName) or nil
+  if dn and dn ~= "" then return dn end
+  local app = nv(f.application)
+  dn = type(app) == "table" and nv(app.displayName) or nil
+  if dn and dn ~= "" then return dn end
+  local dev = nv(f.device)
+  dn = type(dev) == "table" and nv(dev.displayName) or nil
+  if dn and dn ~= "" then return dn end
+  return nil
 end
 
 -- message under the cursor: nearest header from ms_teams_id_to_lnum
@@ -570,7 +640,7 @@ end
 local function extract_message_plain(m)
   if not m or m == vim.NIL then return "" end
   local parts = {}
-  local from = nv(m.from) and nv(m.from.user) and nv(m.from.user.displayName)
+  local from = sender_display_name(nv(m.from))
   if from and from ~= "" then table.insert(parts, from) end
   local body = nv(m.body) and nv(m.body.content) or ""
   if body and body ~= "" and body ~= vim.NIL then
@@ -809,9 +879,7 @@ end
 local function build_message_lines(m, chat)
   if m == vim.NIL or m == nil then return nil end
   local lines = {}
-  local from = "unknown"
-  local fu = nv(m.from) and nv(m.from.user) and nv(m.from.user.displayName)
-  if fu then from = fu end
+  local from = sender_display_name(nv(m.from)) or "unknown"
   if from == "unknown" then
     local mt = nv(m.messageType)
     if nv(m.eventDetail) or (mt and mt ~= "message") then
@@ -885,6 +953,10 @@ local function build_message_lines(m, chat)
   body = body:gsub("<[^>]+>", "")
   body = body:gsub("&nbsp;", " "):gsub("&amp;", "&"):gsub("&lt;", "<"):gsub("&gt;", ">"):gsub("&quot;", '"')
   body = body:gsub("\226\128\131", " ") -- U+2003 em space
+  -- keycap emoji (1️⃣…) break the terminal cell grid: normalize to circled
+  -- digits here, while inline code / codeblocks / tables / images are still
+  -- hidden behind placeholders, so code stays byte-exact
+  body = normalize_keycaps(body)
 
   -- 5. Restore inline codes
   body = body:gsub("\002IN(%d+)\002", function(idx)
@@ -1194,13 +1266,13 @@ local function build_message_lines(m, chat)
     end
     -- images handled as placeholder, gx will download on demand
   end
-  -- reactions: compact [reactions: ❌2 ❤️1] block; per-user detail on gr
+  -- reactions: compact [reactions: ❌ 2 ❤️ 1] block; per-user detail on gr
   local r_order, r_groups = group_reactions(m)
   if #r_order > 0 then
     local parts = {}
     for _, rt in ipairs(r_order) do
       local g = r_groups[rt]
-      local p = rt .. #g
+      local p = rt .. " " .. #g
       -- single reactor: name inline, no need to open the detail buffer
       if #g == 1 and g[1].name then p = p .. " " .. g[1].name end
       table.insert(parts, p)
@@ -2929,7 +3001,7 @@ local function send_msgs_to_qflist(chat, detail_buf, msgs, query)
       local id = nv(m.id)
       local lnum = id and id_map[id] or nil
       if lnum then
-        local f = nv(m.from) and nv(m.from.user) and nv(m.from.user.displayName) or "unknown"
+        local f = sender_display_name(nv(m.from)) or "unknown"
         if f == vim.NIL then f = "unknown" end
         local dt = format_date(nv(m.createdDateTime) or "")
         local plain = extract_message_plain(m)
@@ -3029,7 +3101,7 @@ local function fill_search_buffer(buf, chat, query, matches, detail_buf)
   local line_to_match = {}
   for i, r in ipairs(matches) do
     local m = r.msg
-    local from = nv(m.from) and nv(m.from.user) and nv(m.from.user.displayName) or "unknown"
+    local from = sender_display_name(nv(m.from)) or "unknown"
     local dt = format_date(nv(m.createdDateTime) or "")
     local snippet = r.snippet or extract_message_plain(m):sub(1, 120)
     local header = string.format("● **%s** (%s):", from, dt)
@@ -3112,7 +3184,7 @@ function M.search_in_chat_telescope(chat, detail_buf)
           if m ~= vim.NIL then
             local plain = extract_message_plain(m)
             local snippet, _, _ = make_snippet(plain, q)
-            local from = nv(m.from) and nv(m.from.user) and nv(m.from.user.displayName) or "unknown"
+            local from = sender_display_name(nv(m.from)) or "unknown"
             local dt = format_date(nv(m.createdDateTime) or "")
             table.insert(items, { msg = m, display = from .. " (" .. dt .. "): " .. snippet, plain = plain })
           end
@@ -4409,13 +4481,11 @@ function M.show_reactions(detail_buf, chat, open_mode)
   local rbuf = vim.api.nvim_create_buf(true, false)
   vim.api.nvim_buf_set_option(rbuf, "filetype", "markdown")
   set_listed_scratch(rbuf, "ms-teams://reactions/" .. ((nv(m.id) or "x"):sub(1, 12)))
-  local fu = nv(m.from)
-  fu = type(fu) == "table" and (nv(fu.user) or fu) or nil
-  local from = (fu and nv(fu.displayName)) or "System"
+  local from = sender_display_name(nv(m.from)) or "System"
   local dt = format_date(nv(m.createdDateTime) or "")
   local title = "# Reactions — **" .. from .. "** (" .. dt .. ")"
   local function build()
-    local order, groups = group_reactions(m)
+    local order, groups, labels = group_reactions(m)
     local out = { title, "" }
     -- full original message as rendered in the chat detail: skip its header
     -- line (title already has author+date) and the compact reactions block
@@ -4440,7 +4510,10 @@ function M.show_reactions(detail_buf, chat, open_mode)
     end
     for _, rt in ipairs(order) do
       local g = groups[rt]
-      table.insert(out, "## " .. rt .. " ×" .. #g)
+      -- keycap groups carry the Graph displayName ("Keycap one") so the
+      -- vote stays readable even where the glyph itself cannot render
+      local lbl = labels and labels[rt]
+      table.insert(out, "## " .. rt .. " ×" .. #g .. (lbl and " — " .. lbl or ""))
       for _, u in ipairs(g) do
         if u.name then
           table.insert(out, "- " .. u.name)

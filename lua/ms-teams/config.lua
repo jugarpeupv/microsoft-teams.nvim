@@ -47,6 +47,11 @@ M.defaults = {
       channel = "",
       default = "󰭘",
     },
+    -- Keycap reactions: "circled" (universal, any font) or "nerd"
+    -- (md-numeric-N-box, requires a Nerd Font). Alternatively set
+    -- keycap_icons to a custom per-digit map (missing digits stay raw).
+    keycap_style = "circled",
+    keycap_icons = nil,
   },
   debug = false, -- global debug for auth/graph logs (auth_debug.log)
   auth_debug = false,
