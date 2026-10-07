@@ -80,7 +80,7 @@ M.defaults = {
     -- false = serve channel lists from cache only: no allChannels traffic
     -- on opens (useful during sustained throttling). Explicit R still
     -- refreshes from the network.
-    auto_fetch = false,
+    auto_fetch = true,
   },
 }
 
