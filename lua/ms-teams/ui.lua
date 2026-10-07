@@ -482,20 +482,36 @@ end
 
 -- reactant ids with no resolved name yet: the compact line shows them
 -- inline for single-reactor groups, so they must be looked up
-local function missing_reaction_uids(msgs)
+-- every identity id still lacking a name (reactions + system events), newest
+-- message first: renders show oldest at top, so what the user is looking at
+-- (the recent bottom) fills in before stale history.
+local function missing_name_uids(msgs)
   local out, seen = {}, {}
-  for _, sm in ipairs(msgs) do
-    local rs = nv(sm.reactions)
-    if type(rs) == "table" then
-      for _, r in ipairs(rs) do
-        if type(r) == "table" then
-          local ru = nv(r.user)
-          if type(ru) == "table" then ru = nv(ru.user) or ru end
-          local uid = type(ru) == "table" and (nv(ru.userId) or nv(ru.id)) or nil
-          if uid and not seen[uid] and not resolve_identity_name(uid) then
-            seen[uid] = true
-            table.insert(out, uid)
+  local function consider(u)
+    local id = type(u) == "table" and (nv(u.userId) or nv(u.id)) or nil
+    if id and not seen[id] and not resolve_identity_name(id) then
+      seen[id] = true
+      table.insert(out, id)
+    end
+  end
+  for i = #msgs, 1, -1 do
+    local sm = msgs[i]
+    if sm ~= vim.NIL and type(sm) == "table" then
+      local rs = nv(sm.reactions)
+      if type(rs) == "table" then
+        for _, r in ipairs(rs) do
+          if type(r) == "table" then
+            local ru = nv(r.user)
+            if type(ru) == "table" then consider(nv(ru.user) or ru) end
           end
+        end
+      end
+      local ed = nv(sm.eventDetail)
+      if type(ed) == "table" then
+        local ini = nv(ed.initiator)
+        if type(ini) == "table" then consider(nv(ini.user) or ini) end
+        for _, mm in ipairs(nv(ed.members) or {}) do
+          if type(mm) == "table" then consider(nv(mm.user) or mm) end
         end
       end
     end
@@ -1185,6 +1201,10 @@ local function build_message_lines(m, chat)
                     break
                   end
                 end
+                -- session identity (seen in other chats) before raw id
+                if mid and (n == nil or n == "" or n == mid) then
+                  n = resolve_identity_name(mid) or n
+                end
                 n = n or mid or "unknown"
               end
               table.insert(names, n)
@@ -1213,7 +1233,11 @@ local function build_message_lines(m, chat)
                     break
                   end
                 end
-                -- fallback to Graph lookup will be async, for now use id
+                -- session identity (seen in other chats) before raw id;
+                -- truly unknown ids resolve via the /users queue + repaint
+                if mid and (n == nil or n == "" or n == mid) then
+                  n = resolve_identity_name(mid) or n
+                end
                 n = n or mid or "unknown"
               end
               table.insert(names, n)
@@ -1331,20 +1355,36 @@ function M.pick_chats()
   local channel_probe_allowed = false
   local teams_data = nil
   local channels_map = {}
+  -- last channels load cycle hit errors (e.g. throttling): teams render a
+  -- retry hint instead of a bare, ambiguous (0)
+  local channels_error = false
   -- per-channel unread state from latest-message enrichment (list_channels
   -- has no preview data): cid -> {dt, ref, from_self, known_other}
   local channel_state = {}
   local function clean(s) local t = (nv(s) or ""):gsub("\n"," "):gsub("\r"," "); return t end
-  local function load_all_channels(teams, cb)
-    local pending = #teams
-    if pending == 0 then if cb then cb() end; return end
-    for _, team in ipairs(teams) do
-      require("ms-teams.graph").list_channels(team.id, function(channels, err)
+  -- one team at a time with a gap between requests: the old concurrent
+  -- fan-out burst-tripped Graph throttling (429). cb(fetched_any); callers
+  -- re-save the channels cache only when something was actually fetched,
+  -- otherwise the save would keep the TTL fresh forever and plain opens
+  -- would never pick up new channels.
+  local function load_all_channels(teams, cb, opts)
+    opts = opts or {}
+    local fetched_any = false
+    local had_error = false
+    local i = 0
+    local function next_team()
+      i = i + 1
+      if i > #teams then if cb then cb(fetched_any, had_error) end; return end
+      local team = teams[i]
+      require("ms-teams.graph").list_channels(team.id, function(channels, err, fetched, stale)
         channels_map[team.id] = channels or {}
-        pending = pending - 1
-        if pending == 0 and cb then cb() end
-      end)
+        if fetched then fetched_any = true end
+        if err or stale then had_error = true end
+        vim.defer_fn(next_team, 400)
+      end, opts.force and { force = true } or nil)
     end
+    if #teams == 0 then if cb then cb(false, false) end; return end
+    next_team()
   end
   local render_and_bind
   -- coalesce rapid background re-renders into one trailing paint: on open,
@@ -1436,8 +1476,9 @@ function M.pick_chats()
       if nt and #nt > 0 and not err then
         teams_data = nt
         cache.save("teams", { teams = nt })
-        load_all_channels(nt, function()
-          cache.save("teams_channels", channels_map)
+        load_all_channels(nt, function(fetched, had_error)
+          if fetched then cache.save("teams_channels", channels_map) end
+          channels_error = had_error or false
           vim.schedule(function()
             if not vim.api.nvim_buf_is_valid(buf) then return end
             local was_fired = gate_fired
@@ -1611,6 +1652,9 @@ function M.pick_chats()
           end
         end
         table.insert(lines, "## " .. clean(team.displayName) .. " (" .. #channels .. ")")
+        if #channels == 0 and channels_error then
+          table.insert(lines, "  _channels unavailable (throttled?) — press R to retry_")
+        end
         local t_lnum = #lines
         line_to_entry[t_lnum] = {type="team", team=team}
         if team_has_unread then unread_lines[t_lnum] = true end
@@ -1989,11 +2033,12 @@ function M.pick_chats()
           if nt and #nt>0 and not err2 then
             teams_data = nt
             cache.save("teams",{teams=nt})
-            load_all_channels(nt, function()
-              cache.save("teams_channels", channels_map)
+            load_all_channels(nt, function(fetched, had_error)
+              if fetched then cache.save("teams_channels", channels_map) end
+              channels_error = had_error or false
               render_and_bind(nc,nc,false,"")
               vim.notify(string.format("refreshed %d chats + %d teams", #nc, #nt), vim.log.levels.INFO)
-            end)
+            end, { force = true })
           else
             render_and_bind(nc,nc,false,"")
             vim.notify(string.format("refreshed %d chats", #nc), vim.log.levels.INFO)
@@ -3462,11 +3507,12 @@ function M.show_messages(chat, open)
       end
     end
 
-    -- leftover reactant ids members can't give (shared channels, departed
-    -- users): one /users queue pass per progress step, repaint when they land
+    -- leftover reactant/event ids members can't give (shared channels,
+    -- departed users, meeting chats): one /users queue pass per progress
+    -- step, repaint when they land
     if chat_id and not launched_members and not members_fetching[chat_id]
         and not names_fetching[chat_id] then
-      local missing = missing_reaction_uids(sorted_msgs)
+      local missing = missing_name_uids(sorted_msgs)
       local n = #missing
       if n > 0 and names_tried[chat_id] ~= n then
         names_fetching[chat_id] = true
@@ -3475,7 +3521,7 @@ function M.show_messages(chat, open)
           names_fetching[chat_id] = nil
           vim.schedule(function()
             -- another round only while the queue is still making progress
-            if #missing_reaction_uids(sorted_msgs) < n then names_tried[chat_id] = nil end
+            if #missing_name_uids(sorted_msgs) < n then names_tried[chat_id] = nil end
             if vim.api.nvim_buf_is_valid(buf) then
               render_buffer(msgs, nextLink, { buf = buf, no_cursor = true, keep_cursor = true, no_open = true, is_cached = is_cached })
             end
@@ -5337,24 +5383,30 @@ function M.pick_teams()
     local t = (nv(s) or ""):gsub("\n", " "):gsub("\r", " ")
     return t
   end
-  local function load_all_channels(teams, cb)
-    local pending = #teams
-    if pending == 0 then
-      if cb then cb() end
-      return
-    end
-    for _, team in ipairs(teams) do
-      require("ms-teams.graph").list_channels(team.id, function(channels, err)
+  -- one team at a time with a gap between requests: the old concurrent
+  -- fan-out burst-tripped Graph throttling (429). cb(fetched_any).
+  local function load_all_channels(teams, cb, opts)
+    opts = opts or {}
+    local fetched_any = false
+    local i = 0
+    local function next_team()
+      i = i + 1
+      if i > #teams then if cb then cb(fetched_any) end; return end
+      local team = teams[i]
+      require("ms-teams.graph").list_channels(team.id, function(channels, err, fetched)
         if err then
           vim.schedule(function() vim.notify("ms-teams list_channels for " .. tostring(team.id) .. ": " .. tostring(err), vim.log.levels.ERROR) end)
         end
         channels_map[team.id] = channels or {}
-        pending = pending - 1
-        if pending == 0 then
-          if cb then cb() end
-        end
-      end)
+        if fetched then fetched_any = true end
+        vim.defer_fn(next_team, 400)
+      end, opts.force and { force = true } or nil)
     end
+    if #teams == 0 then
+      if cb then cb(false) end
+      return
+    end
+    next_team()
   end
   local line_map = {}
   local function render_and_bind(teams, is_cached)
@@ -5458,8 +5510,8 @@ function M.pick_teams()
       require("ms-teams.graph").list_teams(function(new_teams, err)
         if err or not new_teams then return end
         cache.save("teams", { teams = new_teams })
-        load_all_channels(new_teams, function()
-          cache.save("teams_channels", channels_map)
+        load_all_channels(new_teams, function(fetched)
+          if fetched then cache.save("teams_channels", channels_map) end
           if vim.api.nvim_buf_is_valid(buf) and vim.api.nvim_buf_get_name(buf):find("ms%-teams://teams") then
             render_and_bind(new_teams, false)
             vim.notify("teams updated (press R)", vim.log.levels.INFO)
@@ -5474,11 +5526,11 @@ function M.pick_teams()
       require("ms-teams.graph").list_teams(function(new_teams, err)
         if err then vim.notify("refresh failed: " .. err, vim.log.levels.ERROR); return end
         cache.save("teams", { teams = new_teams })
-        load_all_channels(new_teams, function()
-          cache.save("teams_channels", channels_map)
-          render_and_bind(new_teams, false)
-          vim.notify(string.format("refreshed %d teams", #new_teams), vim.log.levels.INFO)
-        end)
+    load_all_channels(new_teams, function(fetched)
+      if fetched then cache.save("teams_channels", channels_map) end
+      render_and_bind(new_teams, false)
+      vim.notify(string.format("refreshed %d teams", #new_teams), vim.log.levels.INFO)
+    end, { force = true })
       end)
     end, { buffer = buf })
     vim.keymap.set("n", "q", function() vim.api.nvim_buf_delete(buf, { force = true }) end, { buffer = buf })
@@ -5517,19 +5569,19 @@ function M.pick_teams()
     require("ms-teams.graph").list_teams(function(new_teams, err)
       if err then vim.notify("refresh failed: " .. err, vim.log.levels.ERROR); return end
       cache.save("teams", { teams = new_teams })
-      load_all_channels(new_teams, function()
-        cache.save("teams_channels", channels_map)
+      load_all_channels(new_teams, function(fetched)
+        if fetched then cache.save("teams_channels", channels_map) end
         render_and_bind(new_teams, false)
         vim.notify(string.format("refreshed %d teams", #new_teams), vim.log.levels.INFO)
-      end)
+      end, { force = true })
     end)
   end, { buffer = buf })
   vim.keymap.set("n", "q", function() vim.api.nvim_buf_delete(buf, { force = true }) end, { buffer = buf })
   require("ms-teams.graph").list_teams(function(teams, err)
     if err then vim.notify("ms-teams list_teams: " .. tostring(err), vim.log.levels.ERROR); return end
     cache.save("teams", { teams = teams })
-    load_all_channels(teams, function()
-      cache.save("teams_channels", channels_map)
+    load_all_channels(teams, function(fetched)
+      if fetched then cache.save("teams_channels", channels_map) end
       render_and_bind(teams, false)
     end)
   end)

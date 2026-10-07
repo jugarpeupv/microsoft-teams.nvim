@@ -77,6 +77,10 @@ M.defaults = {
   -- treated as unread (avoids flagging years-old messages as unread)
   channels = {
     unread_max_age_days = 30,
+    -- false = serve channel lists from cache only: no allChannels traffic
+    -- on opens (useful during sustained throttling). Explicit R still
+    -- refreshes from the network.
+    auto_fetch = false,
   },
 }
 

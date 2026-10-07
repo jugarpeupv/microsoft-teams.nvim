@@ -387,36 +387,80 @@ function M.list_groups(cb)
   return M.list_teams(cb)
 end
 
-function M.list_channels(team_id, cb)
+-- channels change rarely: serve them from cache without any network
+-- while the map is fresh (plain opens stay paint-cheap and throttle-safe).
+-- opts: { force = true } (explicit R refresh skips cache), { ttl = secs }.
+local CHANNELS_TTL = 900
+local channels_throttle_until = 0
+local channels_inflight = {} -- team_id -> {cb, ...} (single-flight)
+
+function M.list_channels(team_id, cb, opts)
+  opts = opts or {}
   local cache = require("ms-teams.cache")
   local cached_map = cache.load("teams_channels") or {}
   local cached = cached_map[team_id]
-  auth.ensure_token_async("read", function(token, err)
-    if not token then cb(nil, err); return end
+  -- kill-switch for sustained throttling episodes: serve cache, zero network
+  -- (explicit R with force still refreshes). Reported stale so empty teams
+  -- render the retry hint instead of a bare (0).
+  local ch_conf = config.options.channels
+  if not opts.force and ch_conf and ch_conf.auto_fetch == false then
+    cb(cached or {}, nil, false, true); return
+  end
+  local fresh = cached_map._ts and (os.time() - cached_map._ts < (opts.ttl or CHANNELS_TTL))
+  -- fresh cache for a known team: no network at all. An empty list never
+  -- counts as fresh: every team has at least one channel, so [] means a
+  -- past failure poisoned the cache and must be refetched, not served.
+  local have_cached = cached ~= nil and #cached > 0
+  if not opts.force and fresh and have_cached then cb(cached, nil, false); return end
+  -- recently throttled: fail fast on stale cache instead of hammering
+  if not opts.force and os.time() < channels_throttle_until then cb(cached or {}, nil, false, true); return end
+  -- single-flight: coalesce concurrent callers for the same team
+  if channels_inflight[team_id] then
+    table.insert(channels_inflight[team_id], cb)
+    return
+  end
+  channels_inflight[team_id] = { cb }
+  local function resolve(chans, err, fetched, stale)
+    local waiters = channels_inflight[team_id]
+    channels_inflight[team_id] = nil
+    for _, w in ipairs(waiters or {}) do
+      vim.schedule(function() w(chans, err, fetched, stale) end)
+    end
+  end
+  auth.ensure_token_async("read", function(token, terr)
+    if not token then resolve(nil, terr, false); return end
     local url = config.options.graph_base .. "/teams/" .. team_id .. "/allChannels?$select=id,displayName,description,webUrl,membershipType"
     local cmd = {"curl","-s","--max-time","60","-X","GET", url, "-H","Authorization: Bearer "..token, "-H","Content-Type: application/json", "-w","\n%{http_code}", "-D","-"}
     vim.system(cmd, {text=true}, function(obj)
       vim.schedule(function()
-        if obj.code ~= 0 then cb(nil, "curl exit "..obj.code); return end
+        if obj.code ~= 0 then resolve(nil, "curl exit "..obj.code, false); return end
         local raw = (obj.stdout or ""):gsub("\r\n", "\n")
         local code = raw:match("\n(%d%d%d)%s*$")
         if not code then code = "200" end
         local sep = raw:find("\n\n", 1, true)
         local body = sep and raw:sub(sep + 2) or raw
         body = body:gsub("\n" .. code .. "%s*$", "")
+        local throttled = code == "429" or body:find("TooManyRequests") ~= nil
+        if throttled then
+          -- no retries, ever: Graph keeps logging usage while a client is
+          -- throttled, so retrying extends the penalty. Serve stale cache
+          -- silently; TTL + pacing + single-flight prevent the next storm.
+          channels_throttle_until = os.time() + 120
+          if cached then resolve(cached, nil, false, true); return end
+        end
         if code ~= "200" then
           local ok, j = pcall(vim.json.decode, body)
-          if ok and j and j.error then cb(nil, j.error.message or vim.inspect(j.error)); return end
-          if body == "" then cb(cached or {}, nil); return end
+          if ok and j and j.error then resolve(nil, j.error.message or vim.inspect(j.error), false); return end
+          if body == "" then resolve(cached or {}, nil, false); return end
         end
         local ok, j = pcall(vim.json.decode, body)
-        if not ok or not j then cb(cached or {}, nil); return end
+        if not ok or not j then resolve(cached or {}, nil, false); return end
         local chans = j.value or {}
         -- update channels_map cache
         local map = cache.load("teams_channels") or {}
         map[team_id] = chans
         pcall(cache.save, "teams_channels", map)
-        cb(chans, nil)
+        resolve(chans, nil, true)
       end)
     end)
   end)
