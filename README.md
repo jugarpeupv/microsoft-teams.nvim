@@ -110,18 +110,92 @@ config.lua ──► setup() options (scope, icons, watch, open_cmd, davmail)
 Requires `telescope.nvim`. For watch notifications:
 `brew install terminal-notifier` (fallback to `notify-send` on Linux).
 
+## Keymaps
+
+Keymaps are configurable per buffer under `keymaps`:
+
+* `chat_list` — `:MSTeamsChats` list
+* `msteams_finder` — `:MSTeamsFind` Telescope picker
+* `chat_detail` — chat detail buffer
+* `user_detail` — user detail buffer
+
+Defaults are deep-merged, so you only override what you need. Setting an
+action to `false` (or `""`) removes its mapping and its hint.
+
+```lua
+require("ms-teams").setup({
+  keymaps = {
+    chat_list = {
+      open = "go",            -- default: <CR>
+      mark_read = "mr",       -- also works on a visual selection
+      user_detail = "mp",     -- 1:1 chat under cursor
+    },
+    msteams_finder = {
+      open = "<CR>",
+      user_detail = "<C-i>",  -- 1:1 chats only; groups/channels are rejected
+      quickfix = "<C-q>",
+    },
+    chat_detail = {
+      user_detail = "gu",     -- default: mp (1:1 chats only)
+      close = false,          -- disable q
+    },
+    user_detail = {
+      open_photo = "gx",      -- default: gx
+      refresh = "R",          -- re-fetch profile after throttling
+    },
+  },
+})
+```
+
+The complete list of actions and their default keys is the source of truth in
+[`lua/ms-teams/config.lua`](lua/ms-teams/config.lua) (see
+`M.defaults.keymaps`); refer to that file if a default changes.
+
 ## Commands
 
 * `:MSTeamsLogin` / `:MSTeamsCode <url>` / `:MSTeamsLoginCancel` — legacy OAuth flow (untested)
 * `:MSTeamsRegisterProtocol` — macOS `ms-appx-web://` protocol handler (legacy flow)
 * `:MSTeamsStatus` — token status and expiry
 * `:MSTeamsTokenScopes` — scopes of the current access token
-* `:MSTeamsChats` — recent chats list (`R` refresh, `g?` participants, `mr`/`mu` mark read/unread)
+* `:MSTeamsChats` — recent chats list (`R` refresh, `g?` participants, `mr`/`mu` mark read/unread; chats with the same name get a short id suffix)
 * `:MSTeamsTeams` — teams and channels
 * `:MSTeamsFind` — Telescope fuzzy find over chats (`<C-b>` unread/all)
 * `:MSTeamsNewChat` — new chat picking a user via Telescope
 * `:MSTeamsReply` / `S` — reply in chat buffer
 * `:MSTeamsWatchStart` / `Stop` / `Status` / `Poll` / `Restart` — watch polling
+
+## User detail
+
+`mp` opens the selected user's detail buffer
+(`ms-teams://user-detail/<id>`):
+
+* `<C-i>` in `:MSTeamsFind` (only for 1:1 chats; groups/channels show a notice;
+  override with `keymaps.msteams_finder.user_detail`),
+* `mp` in `:MSTeamsChats` on a 1:1 chat (override with
+  `keymaps.chat_list.user_detail`),
+* `mp` in a 1:1 chat buffer (override with
+  `keymaps.chat_detail.user_detail`; `nil`/`false` disables the mapping),
+* `<CR>` on a participant in `g?`.
+
+The buffer shows the Graph profile fields the token can read (name,
+email, job title, department, company, office, phones, language, city,
+country, account status, creation date) plus the profile photo. Profiles
+are cached in `stdpath("cache")/ms-teams/user_profiles.json`, so data
+fetched once stays visible during 429 windows; `R` forces a refresh
+(override with `keymaps.user_detail.refresh`). If the profile call is
+throttled and nothing is cached, the title still uses the name learned
+from chat members or the persisted identity cache, the member email is
+shown when available, and the id is shown as a field instead of the
+title. When
+`image.nvim` is available the avatar is rendered inline at the top of the
+buffer, cropped into a circle with ImageMagick like Teams; otherwise the
+cached path is shown and `gx` opens it. Photos are cached under
+`stdpath("cache")/ms-teams/avatars` and revalidated with their etag, so
+reopening a user costs no network.
+
+Names resolved through `/users` are persisted in
+`stdpath("cache")/ms-teams/user_names.json`, so the directory lookup
+queue stays idle across sessions instead of re-requesting the same ids.
 
 ## Searching in a chat
 
@@ -144,3 +218,6 @@ Inside a chat detail buffer:
 * `stdpath("data")/ms-teams/davmail_access.json` — cached Graph access token (`chmod 600`)
 * `stdpath("data")/ms-teams/chats.json`, `teams*.json` — list caches
 * `stdpath("cache")/ms-teams/attachments` — downloaded images/files
+* `stdpath("cache")/ms-teams/avatars` — cached profile photos (etag-revalidated)
+* `stdpath("cache")/ms-teams/user_profiles.json` — cached user profiles (429-safe, `R` refreshes)
+* `stdpath("cache")/ms-teams/user_names.json` — persisted id → displayName cache

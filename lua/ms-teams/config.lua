@@ -59,6 +59,60 @@ M.defaults = {
   -- e.g. pin a Chrome profile that holds the M365 session:
   -- open_cmd = {"open", "-a", "Google Chrome", "--args", "--profile-directory=Profile 3"}
   open_cmd = nil,
+  -- Per-buffer keymaps. Override any action; nil/false disables the mapping.
+  -- Defaults are deep-merged, so you only need to set what changes.
+  keymaps = {
+    -- chat list buffer (:MSTeamsChats)
+    chat_list = {
+      open = "<CR>",
+      open_split = "<C-s>",
+      open_vsplit = "<C-v>",
+      search = "g/",
+      help = "g?",
+      toggle_unread = "U",
+      toggle_meeting = "M",
+      toggle_limit = "gS",
+      refresh = "R",
+      hide = "<C-x>",
+      mark_read = "mr",
+      mark_unread = "mu",
+      user_detail = "mp", -- 1:1 chat under cursor
+      close = "q",
+    },
+    -- :MSTeamsFind telescope picker
+    msteams_finder = {
+      open = "<CR>",
+      open_split = "<C-s>",
+      open_vsplit = "<C-v>",
+      toggle_unread = "<C-g>",
+      mark_read = "<C-e>",
+      mark_unread = "<C-b>",
+      quickfix = "<C-q>",
+      quickfix_all = "<M-q>",
+      user_detail = "<C-i>",
+    },
+    chat_detail = {
+      jump = "<CR>",
+      reply = "S",
+      participants = "g?",
+      search = "g/",
+      search_telescope = "gF",
+      open_link = "gx",
+      refresh = "R",
+      load_older = "gR",
+      mark_read = "mr",
+      mark_unread = "mu",
+      reactions_split = "<C-s>",
+      reactions_vsplit = "<C-v>",
+      user_detail = "mp", -- 1:1 chats only
+      close = "q",
+    },
+    user_detail = {
+      open_photo = "gx",
+      refresh = "R",
+      close = "q",
+    },
+  },
   -- watch: polling while nvim is open (works even if focus is on Chrome)
   watch = {
     enabled = false, -- set true to autostart on setup()

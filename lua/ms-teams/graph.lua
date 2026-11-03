@@ -286,18 +286,218 @@ function M.get_channel_members(team_id, channel_id, cb)
   fetch("/teams/" .. team_id .. "/channels/" .. channel_id .. "/members", 0)
 end
 
--- cb(name, err): name found; err non-nil = transient (caller may retry);
--- both nil = user does not exist (memoize as unknown)
-function M.get_user_name(user_id, cb, attempt)
-  attempt = attempt or 0
+-- cb(name, err): name found; err non-nil = failure (caller owns cooldown/
+-- pacing; retrying while throttled only extends the penalty); both nil =
+-- user does not exist (memoize as unknown)
+function M.get_user_name(user_id, cb)
   graph_request_async("read", "GET", "/users/" .. user_id .. "?$select=id,displayName", nil, function(j, err)
     if j and j.displayName and j.displayName ~= "" then cb(j.displayName, nil); return end
     if err and err:find("ResourceNotFound") then cb(nil, nil); return end
-    if err and (err:find("TooManyRequests") or err:find("429")) and attempt < 3 then
-      vim.defer_fn(function() M.get_user_name(user_id, cb, attempt + 1) end, 1500 * (attempt + 1))
+    cb(nil, err or "no displayName")
+  end)
+end
+
+-- full profile for the user detail buffer: names/contact/job data. Cached in
+-- memory and on disk: directory lookups are throttled easily, and a profile
+-- fetched once should stay visible across sessions/429 windows.
+local user_profile_cache = {}
+local user_profile_inflight = {}
+local PROFILE_TTL = 7 * 24 * 3600
+local user_profiles_disk = nil
+
+local function profile_store()
+  if user_profiles_disk == nil then
+    local ok, j = pcall(require("ms-teams.cache").load, "user_profiles")
+    user_profiles_disk = (ok and type(j) == "table") and j or {}
+  end
+  return user_profiles_disk
+end
+
+-- last known profile (bounded by PROFILE_TTL); nil when never fetched
+function M.get_cached_profile(user_id)
+  if not user_id then return nil end
+  if user_profile_cache[user_id] then return user_profile_cache[user_id] end
+  local st = profile_store()[user_id]
+  if type(st) == "table" and type(st.profile) == "table"
+      and (os.time() - (st.ts or 0) < PROFILE_TTL) then
+    user_profile_cache[user_id] = st.profile
+    return st.profile
+  end
+  return nil
+end
+
+local function profile_save(user_id, j)
+  user_profile_cache[user_id] = j
+  local st = profile_store()
+  st[user_id] = { ts = os.time(), profile = j }
+  pcall(require("ms-teams.cache").save, "user_profiles", st)
+end
+
+-- opts: { force = true } bypasses the cache (manual refresh)
+function M.get_user_profile(user_id, cb, opts)
+  opts = opts or {}
+  if not user_id or user_id == "" then cb(nil, "no user id"); return end
+  if not opts.force then
+    local hit = M.get_cached_profile(user_id)
+    if hit then cb(hit, nil); return end
+  end
+  -- coalesce concurrent opens of the same user into a single request
+  if user_profile_inflight[user_id] then
+    table.insert(user_profile_inflight[user_id], cb)
+    return
+  end
+  user_profile_inflight[user_id] = { cb }
+  local function resolve(p, err)
+    local waiters = user_profile_inflight[user_id]
+    user_profile_inflight[user_id] = nil
+    for _, w in ipairs(waiters or {}) do
+      vim.schedule(function() w(p, err) end)
+    end
+  end
+  local attempt = 0
+  local sel = table.concat({
+    "id", "displayName", "mail", "userPrincipalName", "jobTitle", "department",
+    "companyName", "officeLocation", "mobilePhone", "businessPhones",
+    "preferredLanguage", "city", "country", "accountEnabled", "createdDateTime",
+  }, ",")
+  local function fetch()
+    graph_request_async("read", "GET", "/users/" .. user_id .. "?$select=" .. sel, nil, function(j, err)
+      if not j then
+        -- /users has its own throttle budget; one short retry covers bursts
+        if err and (err:find("TooManyRequests") or err:find("429")) and attempt < 1 then
+          attempt = attempt + 1
+          vim.defer_fn(fetch, 1500)
+          return
+        end
+        -- keep the last known profile visible even if the refresh failed
+        local st = profile_store()[user_id]
+        local stale = type(st) == "table" and type(st.profile) == "table" and st.profile or nil
+        resolve(stale, err)
+        return
+      end
+      profile_save(user_id, j)
+      resolve(j, nil)
+    end)
+  end
+  fetch()
+end
+
+-- profile photos: binary download cached under stdpath("cache")/avatars and
+-- revalidated with the photo etag, so reopening a user is a no-op. 404 (no
+-- photo) is a normal answer and memoized for AVATAR_TTL.
+local AVATAR_TTL = 7 * 24 * 3600
+local avatar_meta_cache = nil
+
+local function not_nil(v)
+  if v == nil or v == vim.NIL then return nil end
+  return v
+end
+
+local function avatar_meta()
+  if avatar_meta_cache == nil then
+    local ok, m = pcall(require("ms-teams.cache").load, "avatars")
+    avatar_meta_cache = (ok and type(m) == "table") and m or {}
+  end
+  return avatar_meta_cache
+end
+
+local function avatar_save_meta()
+  pcall(require("ms-teams.cache").save, "avatars", avatar_meta_cache or {})
+end
+
+function M.avatar_dir()
+  local dir = vim.fn.stdpath("cache") .. "/ms-teams/avatars"
+  vim.fn.mkdir(dir, "p")
+  return dir
+end
+
+-- cb(path, meta, err): path = cached jpg; path nil + err nil = user has no photo
+local avatar_inflight = {}
+function M.get_user_photo(user_id, cb)
+  if not user_id or user_id == "" then cb(nil, nil, "no user id"); return end
+  local dir = M.avatar_dir()
+  local path = dir .. "/" .. user_id:gsub("[^%w%-_]", "_") .. ".jpg"
+  local meta = avatar_meta()
+  local ent = meta[user_id]
+  if ent and (os.time() - (ent.ts or 0) < AVATAR_TTL) then
+    if ent.none then cb(nil, ent, nil); return end
+    if vim.fn.filereadable(path) == 1 then cb(path, ent, nil); return end
+  end
+  -- coalesce concurrent opens of the same user into a single download
+  if avatar_inflight[user_id] then
+    table.insert(avatar_inflight[user_id], cb)
+    return
+  end
+  avatar_inflight[user_id] = { cb }
+  local function resolve(p, m, e)
+    local waiters = avatar_inflight[user_id]
+    avatar_inflight[user_id] = nil
+    for _, w in ipairs(waiters or {}) do
+      vim.schedule(function() w(p, m, e) end)
+    end
+  end
+  -- metadata first: the etag lets us skip re-downloading unchanged photos
+  graph_request_async("read", "GET", "/users/" .. user_id .. "/photo", nil, function(j, err)
+    if not j then
+      if err and (err:find("ImageNotFound") or err:find("itemNotFound")
+          or err:lower():find("not found")) then
+        meta[user_id] = { none = true, ts = os.time() }
+        avatar_save_meta()
+        resolve(nil, meta[user_id], nil)
+        return
+      end
+      resolve(nil, nil, err)
       return
     end
-    cb(nil, err or "no displayName")
+    local etag = not_nil(j["@odata.mediaEtag"]) or not_nil(j.etag)
+    -- no-photo accounts may answer 200 with the 1x1 gif placeholder
+    if not_nil(j.id) == "1x1" or (not_nil(j.width) == 1 and not_nil(j.height) == 1) then
+      meta[user_id] = { none = true, ts = os.time() }
+      avatar_save_meta()
+      resolve(nil, meta[user_id], nil)
+      return
+    end
+    if etag and ent and ent.etag == etag and vim.fn.filereadable(path) == 1 then
+      meta[user_id] = { ts = os.time(), etag = etag, ct = ent.ct }
+      avatar_save_meta()
+      resolve(path, meta[user_id], nil)
+      return
+    end
+    auth.ensure_token_async("read", function(token, terr)
+      if not token then resolve(nil, nil, terr); return end
+      local url = config.options.graph_base .. "/users/" .. user_id .. "/photo/$value"
+      local tmp = path .. ".tmp"
+      local cmd = {"curl","-s","--max-time","60","-o",tmp,"-D","-","-w","\n%{http_code}","-X","GET", url, "-H","Authorization: Bearer "..token}
+      vim.system(cmd, {text=true}, function(obj)
+        vim.schedule(function()
+          local raw = (obj.stdout or ""):gsub("\r\n", "\n")
+          local code = raw:match("\n(%d%d%d)%s*$")
+          local ct = raw:match("[Cc]ontent%-[Tt]ype:%s*([^\r\n]+)")
+          if obj.code ~= 0 then
+            pcall(vim.fn.delete, tmp)
+            resolve(nil, nil, "curl exit " .. tostring(obj.code))
+            return
+          end
+          if code == "404" then
+            pcall(vim.fn.delete, tmp)
+            meta[user_id] = { none = true, ts = os.time() }
+            avatar_save_meta()
+            resolve(nil, meta[user_id], nil)
+            return
+          end
+          if code ~= "200" then
+            pcall(vim.fn.delete, tmp)
+            resolve(nil, nil, "http " .. tostring(code))
+            return
+          end
+          if vim.fn.filereadable(path) == 1 then pcall(vim.fn.delete, path) end
+          pcall(vim.fn.rename, tmp, path)
+          meta[user_id] = { ts = os.time(), etag = etag, ct = ct }
+          avatar_save_meta()
+          resolve(path, meta[user_id], nil)
+        end)
+      end)
+    end)
   end)
 end
 

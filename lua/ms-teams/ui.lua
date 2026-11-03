@@ -7,6 +7,28 @@ local function nv(v)
   return v
 end
 
+-- resolved keymap for a buffer/action from config.keymaps (setup deep-merges
+-- defaults). nil/false/"" means "do not map it".
+local function km(section, action)
+  local cfg = require("ms-teams.config")
+  local cur = cfg.options and cfg.options.keymaps and cfg.options.keymaps[section]
+  local key = cur and cur[action]
+  if key == nil and cfg.defaults and cfg.defaults.keymaps then
+    local def = cfg.defaults.keymaps[section]
+    key = def and def[action]
+  end
+  if key == nil or key == false or key == "" then return nil end
+  return key
+end
+
+local function set_key(buf, section, action, rhs, opts, modes)
+  local key = km(section, action)
+  if not key then return nil end
+  local o = vim.tbl_extend("force", opts or {}, { buffer = buf })
+  vim.keymap.set(modes or "n", key, rhs, o)
+  return key
+end
+
 -- end column for whole-line highlights: explicit text length, NOT -1. A -1
 -- end normalizes to the next line start, so clearing an adjacent line kills
 -- the mark by range overlap (e.g. mr on Random cleared Core's highlight).
@@ -302,6 +324,46 @@ end
 local identity_names = {}
 local me_identity_done = false
 
+-- Persisted id -> displayName. Directory lookups are this plugin's biggest
+-- request source; names practically never change, so reusing them across
+-- sessions keeps the users queue idle (fewer 429 bursts). Bounded file.
+local USER_NAMES_CACHE = "user_names"
+local names_persist_timer = nil
+local function persist_identity_names()
+  if names_persist_timer then return end
+  names_persist_timer = vim.defer_fn(function()
+    names_persist_timer = nil
+    local out, n = {}, 0
+    for id, name in pairs(identity_names) do
+      if type(id) == "string" and type(name) == "string" and name ~= "" then
+        out[id] = name
+        n = n + 1
+      end
+    end
+    if n > 5000 then
+      local keep, i = {}, 0
+      for id, name in pairs(out) do
+        i = i + 1
+        if i > 4000 then break end
+        keep[id] = name
+      end
+      out = keep
+    end
+    pcall(require("ms-teams.cache").save, USER_NAMES_CACHE, out)
+  end, 3000)
+end
+
+do
+  local ok, saved = pcall(require("ms-teams.cache").load, USER_NAMES_CACHE)
+  if ok and type(saved) == "table" then
+    for id, name in pairs(saved) do
+      if type(id) == "string" and type(name) == "string" and name ~= "" then
+        identity_names[id] = name
+      end
+    end
+  end
+end
+
 local function remember_identity(u)
   if type(u) ~= "table" then return end
   -- userId first: conversationMember.id is the MCM blob, not the AAD id
@@ -309,6 +371,7 @@ local function remember_identity(u)
   local dn = nv(u.displayName)
   if id and dn and dn ~= "" and not identity_names[id] then
     identity_names[id] = dn
+    persist_identity_names()
   end
 end
 
@@ -336,24 +399,52 @@ local users_queue = {}
 local users_queued = {}
 local users_waiters = {}
 local users_running = false
+-- Graph keeps charging usage while a client is throttled, so retrying during
+-- a 429 extends the penalty. One short retry per uid after a global cooldown,
+-- then give up for the session (names persist on disk for the next one).
+local users_throttle_until = 0
+local users_attempts = {}
+local USERS_COOLDOWN = 60
+local USERS_MAX_TRIES = 2
 
 local function users_pump()
   if users_running then return end
+  local now = os.time()
+  if now < users_throttle_until then
+    vim.defer_fn(users_pump, (users_throttle_until - now) * 1000 + 50)
+    return
+  end
   local uid = table.remove(users_queue, 1)
   if not uid then return end
   users_running = true
   require("ms-teams.graph").get_user_name(uid, function(name, err)
     vim.schedule(function()
+      local settled = false
       if name then
         identity_names[uid] = name
-      elseif not err then
+        persist_identity_names()
+        settled = true
+      elseif err and (err:find("TooManyRequests") or err:find("429")) then
+        users_throttle_until = os.time() + USERS_COOLDOWN
+        users_attempts[uid] = (users_attempts[uid] or 0) + 1
+        if users_attempts[uid] < USERS_MAX_TRIES then
+          -- keep users_queued true and waiters pending: one more try later
+          table.insert(users_queue, 1, uid)
+        else
+          users_unknown[uid] = true
+          settled = true
+        end
+      else
         users_unknown[uid] = true
+        settled = true
       end
-      users_queued[uid] = nil
-      local ws = users_waiters[uid]
-      users_waiters[uid] = nil
-      if ws then
-        for _, w in ipairs(ws) do w() end
+      if settled then
+        users_queued[uid] = nil
+        local ws = users_waiters[uid]
+        users_waiters[uid] = nil
+        if ws then
+          for _, w in ipairs(ws) do w() end
+        end
       end
       users_running = false
       vim.defer_fn(users_pump, 350)
@@ -751,6 +842,29 @@ local function format_chat(chat)
     return "oneOnOne [" .. (nv(chat.id) and nv(chat.id):sub(1,8) or "") .. "]"
   end
   return (nv(chat.chatType) or "chat") .. (nv(chat.topic) and nv(chat.topic)~="" and (": "..nv(chat.topic)) or "")
+end
+
+-- chat names are not unique in Teams (two groups/meetings can share a topic);
+-- when a name repeats in a list, suffix the short conversation id so rows are
+-- distinguishable before opening them.
+local function unique_chat_names(chats)
+  local counts = {}
+  for _, c in ipairs(chats or {}) do
+    if c ~= vim.NIL then
+      local n = format_chat(c)
+      counts[n] = (counts[n] or 0) + 1
+    end
+  end
+  return counts
+end
+
+local function chat_label(chat, counts)
+  local base = format_chat(chat)
+  if counts and (counts[base] or 0) > 1 then
+    local id = nv(chat.id)
+    if id and id ~= "" then return base .. " [" .. id:sub(1, 8) .. "]" end
+  end
+  return base
 end
 
 local date_cache = {}
@@ -1610,8 +1724,9 @@ function M.pick_chats()
     local line_to_chat = {}
     local line_to_entry = {}
     local unread_lines = {}
+    local name_counts = unique_chat_names(display)
       for _, chat in ipairs(display) do
-        local base = format_chat(chat)
+        local base = chat_label(chat, name_counts)
         local type_icon = get_chat_type_icon(chat)
         local line = type_icon ~= "" and (type_icon .. "  " .. base) or base
         table.insert(lines, line)
@@ -1909,10 +2024,10 @@ function M.pick_chats()
       if not chat or nv(chat.id)==nil then vim.notify("no chat on this line",vim.log.levels.WARN); return end
       M.show_messages(chat, open)
     end
-    vim.keymap.set("n", "<CR>", function() open_for(vim.api.nvim_win_get_cursor(0)[1],"current") end, {buffer=buf})
-    vim.keymap.set("n", "<C-s>", function() open_for(vim.api.nvim_win_get_cursor(0)[1],"split") end, {buffer=buf})
-    vim.keymap.set("n", "<C-v>", function() open_for(vim.api.nvim_win_get_cursor(0)[1],"vsplit") end, {buffer=buf})
-    vim.keymap.set("n", "g/", function()
+    set_key(buf, "chat_list", "open", function() open_for(vim.api.nvim_win_get_cursor(0)[1],"current") end)
+    set_key(buf, "chat_list", "open_split", function() open_for(vim.api.nvim_win_get_cursor(0)[1],"split") end)
+    set_key(buf, "chat_list", "open_vsplit", function() open_for(vim.api.nvim_win_get_cursor(0)[1],"vsplit") end)
+    set_key(buf, "chat_list", "search", function()
       vim.ui.input({prompt="Search chats (name): "}, function(q)
         if not q then return end
         local q_raw = q
@@ -1952,31 +2067,33 @@ function M.pick_chats()
           do_filter(all_for_search)
         end
       end)
-    end, {buffer=buf})
-    vim.keymap.set("n", "g?", function()
+    end)
+    set_key(buf, "chat_list", "help", function()
       local hb = vim.api.nvim_create_buf(false, true)
       vim.api.nvim_buf_set_option(hb, "filetype", "markdown")
       vim.api.nvim_buf_set_option(hb, "buftype", "nofile")
-      vim.api.nvim_buf_set_lines(hb, 0, -1, false, {
-        "# Teams Help",
-        "",
-        "<CR> open in place",
-        "<C-s> open in horizontal split",
-        "<C-v> open in vertical split",
-        "g/ search",
-        "U unread",
-        "M meeting",
-        "gS show more/less",
-        "R refresh (incl. channels)",
-        "<C-x> hide",
-        "mr mark read",
-        "v mr mark selected read",
-        "mu mark unread",
-        "v mu mark selected unread",
-        "q close",
-      })
-      local width = 30
-      local height = 17
+      local hl = { "# Teams Help", "" }
+      for _, item in ipairs({
+        { "open", "open in place" },
+        { "open_split", "open in horizontal split" },
+        { "open_vsplit", "open in vertical split" },
+        { "search", "search" },
+        { "toggle_unread", "unread" },
+        { "toggle_meeting", "meeting" },
+        { "toggle_limit", "show more/less" },
+        { "refresh", "refresh (incl. channels)" },
+        { "hide", "hide" },
+        { "mark_read", "mark read (v: selection)" },
+        { "mark_unread", "mark unread (v: selection)" },
+        { "user_detail", "user detail (1:1)" },
+        { "close", "close" },
+      }) do
+        local k = km("chat_list", item[1])
+        if k then table.insert(hl, k .. " " .. item[2]) end
+      end
+      vim.api.nvim_buf_set_lines(hb, 0, -1, false, hl)
+      local width = 40
+      local height = #hl + 2
       local row = math.floor((vim.o.lines - height) / 2)
       local col = math.floor((vim.o.columns - width) / 2)
       local win = vim.api.nvim_open_win(hb, true, {
@@ -1991,23 +2108,23 @@ function M.pick_chats()
       vim.api.nvim_buf_set_keymap(hb, "n", "q", "<cmd>close<cr>", {silent=true})
       vim.api.nvim_buf_set_keymap(hb, "n", "<Esc>", "<cmd>close<cr>", {silent=true})
       vim.api.nvim_win_set_option(win, "cursorline", true)
-    end, {buffer=buf, desc="Teams help"})
-    vim.keymap.set("n", "U", function()
+    end, {desc="Teams help"})
+    set_key(buf, "chat_list", "toggle_unread", function()
       show_unread_only = not show_unread_only
       render_and_bind(all_for_search, all_for_search, false, current_filter or "")
       vim.notify(show_unread_only and "Showing unread chats only" or "Showing all chats", vim.log.levels.INFO)
-    end, {buffer=buf, desc="Toggle unread only"})
-    vim.keymap.set("n", "M", function()
+    end, {desc="Toggle unread only"})
+    set_key(buf, "chat_list", "toggle_meeting", function()
       vim.g.ms_teams_show_meeting=not vim.g.ms_teams_show_meeting
       render_and_bind(all_for_search, all_for_search, false, current_filter or "")
       vim.notify(vim.g.ms_teams_show_meeting and "Showing meetings" or "Hiding meetings", vim.log.levels.INFO)
-    end, {buffer=buf, desc="Toggle show meetings"})
-    vim.keymap.set("n", "gS", function()
+    end, {desc="Toggle show meetings"})
+    set_key(buf, "chat_list", "toggle_limit", function()
       show_all_limit = not show_all_limit
       render_and_bind(all_for_search, all_for_search, false, current_filter or "")
       vim.notify(show_all_limit and "Showing all chats" or "Showing top 30 chats", vim.log.levels.INFO)
-    end, {buffer=buf, desc="Toggle show more/less chats"})
-    vim.keymap.set("n", "R", function()
+    end, {desc="Toggle show more/less chats"})
+    set_key(buf, "chat_list", "refresh", function()
       vim.notify("refreshing...",vim.log.levels.INFO)
       -- allow one round of channel latest-message probes on the render
       -- this refresh produces; plain opens never probe
@@ -2045,8 +2162,8 @@ function M.pick_chats()
           end
         end)
       end,{all=true,limit=100})
-    end, {buffer=buf})
-    vim.keymap.set("n", "<C-x>", function()
+    end)
+    set_key(buf, "chat_list", "hide", function()
       local lnum = vim.api.nvim_win_get_cursor(0)[1]
       local ok, line_to_chat = pcall(vim.api.nvim_buf_get_var, buf, "ms_teams_line_to_chat")
       if not ok or not line_to_chat[lnum] then vim.notify("no chat on this line", vim.log.levels.WARN); return end
@@ -2079,7 +2196,7 @@ function M.pick_chats()
           end)
         end)
       end)
-    end, { buffer=buf, desc="Hide chat (Graph POST /chats/{id}/hide)" })
+    end, { desc="Hide chat (Graph POST /chats/{id}/hide)" })
     local function chat_at_line(lnum)
       -- returns chat, is_channel or nil (team headers / blanks -> nil)
       local ok_entry, line_to_entry = pcall(vim.api.nvim_buf_get_var, buf, "ms_teams_line_to_entry")
@@ -2124,7 +2241,7 @@ function M.pick_chats()
       -- clears highlight on this list + any other list buffer, no re-render
       M.update_chat_list_unread_state(cid, false)
     end
-    vim.keymap.set("n", "mr", function()
+    set_key(buf, "chat_list", "mark_read", function()
       local lnum = vim.api.nvim_win_get_cursor(0)[1]
       local chat, is_channel = chat_at_line(lnum)
       if not chat then vim.notify("no chat on this line", vim.log.levels.WARN); return end
@@ -2142,8 +2259,8 @@ function M.pick_chats()
           end
         end)
       end
-    end, { buffer = buf, desc = "Mark chat on line as read" })
-    vim.keymap.set("x", "mr", function()
+    end, { desc = "Mark chat on line as read" })
+    set_key(buf, "chat_list", "mark_read", function()
       -- x-mode Lua callbacks run while STILL in visual mode, when '< and '>
       -- are stale (unset on first use -> "no chats in selection", then the
       -- retry works). Exit first so marks reflect this selection.
@@ -2186,7 +2303,7 @@ function M.pick_chats()
           end)
         end
       end
-    end, { buffer = buf, desc = "Mark selected chats as read" })
+    end, { desc = "Mark selected chats as read" }, "x")
     local function mark_chat_unread_local(chat, cid, is_channel)
       local cache = require("ms-teams.cache")
       if is_channel then
@@ -2202,7 +2319,7 @@ function M.pick_chats()
       chat.viewpoint.lastMessageReadDateTime = "1970-01-01T00:00:00Z"
       M.update_chat_list_unread_state(cid, true)
     end
-    vim.keymap.set("n", "mu", function()
+    set_key(buf, "chat_list", "mark_unread", function()
       local lnum = vim.api.nvim_win_get_cursor(0)[1]
       local chat, is_channel = chat_at_line(lnum)
       if not chat then vim.notify("no chat on this line", vim.log.levels.WARN); return end
@@ -2220,8 +2337,8 @@ function M.pick_chats()
           end
         end)
       end
-    end, { buffer = buf, desc = "Mark chat on line as unread" })
-    vim.keymap.set("x", "mu", function()
+    end, { desc = "Mark chat on line as unread" })
+    set_key(buf, "chat_list", "mark_unread", function()
       -- same as visual mr: exit visual first so '< / '> are current
       vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<Esc>", true, false, true), "nx", false)
       local s = vim.fn.getpos("'<")[2]
@@ -2262,8 +2379,17 @@ function M.pick_chats()
           end)
         end
       end
-    end, { buffer = buf, desc = "Mark selected chats as unread" })
-    vim.keymap.set("n", "q", function() vim.api.nvim_buf_delete(buf,{force=true}) end,{buffer=buf})
+    end, { desc = "Mark selected chats as unread" }, "x")
+    set_key(buf, "chat_list", "user_detail", function()
+      local lnum = vim.api.nvim_win_get_cursor(0)[1]
+      local chat = chat_at_line(lnum)
+      if not chat then
+        vim.notify("no chat on this line", vim.log.levels.WARN)
+        return
+      end
+      M.show_user_from_chat(chat)
+    end, { desc = "User detail (1:1 chats)" })
+    set_key(buf, "chat_list", "close", function() vim.api.nvim_buf_delete(buf,{force=true}) end)
     -- per-buffer group with clear: render_and_bind re-registers keymaps on every
     -- render; without clear, one :e would fire N accumulated handlers (Nx logs)
     local list_grp = vim.api.nvim_create_augroup("MsTeamsListRefresh" .. buf, { clear = true })
@@ -2391,10 +2517,10 @@ function M.pick_chats()
   local function list_not_ready()
     vim.notify("chat list not ready yet, try again in a moment", vim.log.levels.INFO)
   end
-  vim.keymap.set("n", "mr", list_not_ready, { buffer = buf })
-  vim.keymap.set("x", "mr", list_not_ready, { buffer = buf })
-  vim.keymap.set("n", "mu", list_not_ready, { buffer = buf })
-  vim.keymap.set("x", "mu", list_not_ready, { buffer = buf })
+  set_key(buf, "chat_list", "mark_read", list_not_ready)
+  set_key(buf, "chat_list", "mark_read", list_not_ready, nil, "x")
+  set_key(buf, "chat_list", "mark_unread", list_not_ready)
+  set_key(buf, "chat_list", "mark_unread", list_not_ready, nil, "x")
   if cached and cached.chats and #cached.chats>0 then
     set_list_lines({"# Teams chats (cached)","", "Loading chats...",""})
     vim.api.nvim_win_set_buf(0, buf)
@@ -3300,6 +3426,291 @@ function M.search_in_chat_telescope(chat, detail_buf)
   end)
 end
 
+-- other party's AAD id for a direct (1:1) chat. Groups/channels/self chats
+-- return why="not_one_on_one"; a 1:1 whose members are missing (Graph often
+-- returns one member only) is enriched once via GET /chats/{id}.
+local function one_on_one_user_id(chat, cb)
+  if not chat or chat == vim.NIL or nv(chat.id) == "48:notes"
+      or nv(chat.chatType) ~= "oneOnOne" then
+    cb(nil, "not_one_on_one")
+    return
+  end
+  local me = get_me()
+  local me_id = me and nv(me.id)
+  local function pick(members)
+    for _, m in ipairs(members or {}) do
+      if m ~= vim.NIL then
+        -- userId first: conversationMember.id may be an MCM blob, not AAD
+        local uid = nv(m.userId)
+        if not uid then
+          local raw = nv(m.id)
+          -- only accept id as AAD when it looks like a GUID (MCM ids don't)
+          if raw and raw:match("^%x%x%x%x%x%x%x%x%-") then uid = raw end
+        end
+        local dn = nv(m.displayName)
+        if uid and uid ~= me_id then return uid, dn, m end
+      end
+    end
+    return nil
+  end
+  local members = nv(chat.members)
+  local uid, dn, member = nil, nil, nil
+  if type(members) == "table" then uid, dn, member = pick(members) end
+  if uid then
+    -- remember it (and persist): the detail buffer can reuse this name even
+    -- when /users is throttled
+    if dn and dn ~= "" then remember_identity({ userId = uid, displayName = dn }) end
+    cb(uid, nil, dn, member)
+    return
+  end
+  graph.get_chat(nv(chat.id), function(full)
+    local fm = full and (nv(full.members) or nv(full.value))
+    if type(fm) == "table" then uid, dn, member = pick(fm) end
+    if uid and dn and dn ~= "" then remember_identity({ userId = uid, displayName = dn }) end
+    cb(uid, uid and nil or "no_user", dn, member)
+  end)
+end
+
+local USER_DETAIL_NOT_USER = "user detail is only available for users, not groups"
+
+-- Circular avatar like Teams: mask the cached square jpg into a png with
+-- transparent corners. Falls back to the original when ImageMagick is absent.
+local AVATAR_ROWS = 8
+local AVATAR_COLS = 16
+
+local function circular_avatar(path)
+  if not path or path == "" then return nil end
+  local out = path:gsub("%.[%w]+$", "") .. ".circle.png"
+  if vim.fn.filereadable(out) == 1 and vim.fn.getftime(out) >= vim.fn.getftime(path) then
+    return out
+  end
+  local magick = vim.fn.executable("magick") == 1 and "magick"
+    or (vim.fn.executable("convert") == 1 and "convert" or nil)
+  if not magick then return path end
+  pcall(vim.fn.system, {
+    magick, path,
+    "-resize", "256x256^",
+    "-gravity", "center",
+    "-extent", "256x256",
+    "(", "-size", "256x256", "xc:black",
+    "-fill", "white", "-draw", "circle 128,128 128,0", ")",
+    "-alpha", "off", "-compose", "CopyOpacity", "-composite",
+    out,
+  })
+  if vim.v.shell_error ~= 0 or vim.fn.filereadable(out) ~= 1 then
+    return path
+  end
+  return out
+end
+
+local function image_available()
+  local ok, api = pcall(require, "image")
+  return ok and type(api) == "table" and type(api.from_file) == "function"
+end
+
+-- Inline render through image.nvim. y=0 anchors on the first buffer line and
+-- with_virtual_padding reserves the rows below it, so the profile text flows
+-- under the avatar (the first line is a blank anchor covered by the image).
+local function render_avatar(buf, user_id, path)
+  local ok, api = pcall(require, "image")
+  if not ok or type(api) ~= "table" or type(api.from_file) ~= "function" then return false end
+  local id = "ms-teams-avatar-" .. user_id
+  pcall(api.clear, id)
+  local win = vim.fn.bufwinid(buf)
+  if win == -1 then win = vim.api.nvim_get_current_win() end
+  local img = api.from_file(path, {
+    id = id,
+    buffer = buf,
+    window = win,
+    x = 0,
+    y = 0,
+    width = AVATAR_COLS,
+    height = AVATAR_ROWS,
+    with_virtual_padding = true,
+  })
+  if not img then return false end
+  pcall(function() img:render() end)
+  return true
+end
+
+-- scratch buffer with everything the token lets us read about a user
+-- (profile via /users/{id}, avatar cached on disk; gx opens the image).
+-- `fallback` covers throttled/failed profiles: a name string or a chat member
+-- table ({displayName, email}) so known contact data still renders.
+function M.show_user_detail(user_id, open_mode, fallback)
+  if not user_id or user_id == "" then
+    vim.notify("no user selected", vim.log.levels.WARN)
+    return
+  end
+  local fb_name, fb_mail
+  if type(fallback) == "table" then
+    local f = nv(fallback)
+    fb_name = f and (nv(f.displayName) or nv(f.name))
+    fb_mail = f and (nv(f.email) or nv(f.mail) or nv(f.userPrincipalName))
+  else
+    fb_name = nv(fallback)
+  end
+  local buf = vim.api.nvim_create_buf(true, false)
+  vim.api.nvim_buf_set_option(buf, "filetype", "markdown")
+  set_listed_scratch(buf, "ms-teams://user-detail/" .. user_id)
+  vim.api.nvim_buf_set_var(buf, "ms_teams_user_id", user_id)
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, { "# User", "", "_loading profile..._", "" })
+  if open_mode == "split" then
+    vim.cmd("split")
+  elseif open_mode == "vsplit" then
+    vim.cmd("vsplit")
+  end
+  vim.api.nvim_win_set_buf(0, buf)
+  local avatar_group = vim.api.nvim_create_augroup("MsTeamsUserDetail" .. buf, { clear = true })
+  vim.api.nvim_create_autocmd("BufWipeout", {
+    group = avatar_group,
+    buffer = buf,
+    callback = function()
+      pcall(function() require("image").clear("ms-teams-avatar-" .. user_id) end)
+    end,
+  })
+
+  local profile = graph.get_cached_profile(user_id)
+  local profile_err
+  local photo_path, photo_err
+  local pending = 2
+  local function render()
+    if not vim.api.nvim_buf_is_valid(buf) then return end
+    local avatar = photo_path and circular_avatar(photo_path) or nil
+    local show_avatar = avatar ~= nil and image_available()
+    local lines = {}
+    if show_avatar then
+      table.insert(lines, "") -- anchor line, covered by the image
+    end
+    local fallback_name = fb_name
+    local name = (profile and nv(profile.displayName))
+      or (fallback_name ~= "" and fallback_name)
+      or resolve_identity_name(user_id)
+      or user_id
+    table.insert(lines, "# " .. name)
+    table.insert(lines, "")
+    if profile then
+      local function add(label, val)
+        val = nv(val)
+        if type(val) == "table" then
+          local parts = {}
+          for _, v in ipairs(val) do
+            if v ~= vim.NIL and tostring(v) ~= "" then table.insert(parts, tostring(v)) end
+          end
+          val = #parts > 0 and table.concat(parts, ", ") or nil
+        end
+        if val ~= nil and tostring(val) ~= "" then
+          table.insert(lines, "- **" .. label .. "**: " .. tostring(val))
+        end
+      end
+      add("ID", profile.id)
+      add("Email", profile.mail or profile.userPrincipalName)
+      add("Job title", profile.jobTitle)
+      add("Department", profile.department)
+      add("Company", profile.companyName)
+      add("Office", profile.officeLocation)
+      add("Mobile", profile.mobilePhone)
+      add("Phones", profile.businessPhones)
+      add("Language", profile.preferredLanguage)
+      add("City", profile.city)
+      add("Country", profile.country)
+      add("Account enabled", profile.accountEnabled)
+      add("Created", profile.createdDateTime)
+    else
+      local reason = tostring(profile_err or "?")
+      local note = "profile unavailable"
+      if reason:find("TooManyRequests") or reason:find("429") then
+        note = "profile unavailable (Graph throttled)"
+      end
+      table.insert(lines, "_" .. note .. ": " .. reason .. "_")
+      table.insert(lines, "")
+      if fb_mail and fb_mail ~= "" then
+        table.insert(lines, "- **Email**: " .. fb_mail)
+      end
+      table.insert(lines, "- **ID**: " .. user_id)
+    end
+    table.insert(lines, "")
+    if photo_path then
+      if show_avatar then
+        table.insert(lines, "- **Photo**: _shown above (gx opens the file)_")
+      else
+        table.insert(lines, "- **Photo**: " .. photo_path)
+        table.insert(lines, "  _press gx to open the image_")
+      end
+    elseif photo_err then
+      table.insert(lines, "- **Photo**: unavailable (" .. tostring(photo_err) .. ")")
+    else
+      table.insert(lines, "- **Photo**: none")
+    end
+    table.insert(lines, "")
+    local hint_parts = {}
+    local ck = km("user_detail", "close")
+    if ck then table.insert(hint_parts, ck .. " close") end
+    local rk = km("user_detail", "refresh")
+    if rk then table.insert(hint_parts, rk .. " refresh profile") end
+    if photo_path then
+      local pk = km("user_detail", "open_photo")
+      if pk then table.insert(hint_parts, pk .. " open photo") end
+    end
+    table.insert(lines, "Hints: " .. table.concat(hint_parts, " | "))
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+    pcall(vim.api.nvim_buf_set_var, buf, "ms_teams_user_photo", photo_path or "")
+    if show_avatar then render_avatar(buf, user_id, avatar) end
+  end
+  local function done()
+    pending = pending - 1
+    if pending == 0 then render() end
+  end
+
+  graph.get_user_profile(user_id, function(p, err)
+    if p then
+      profile, profile_err = p, nil
+    elseif not profile then
+      -- keep a cached profile visible when the refresh/network fails
+      profile_err = err
+    end
+    done()
+  end)
+  graph.get_user_photo(user_id, function(path, _meta, err)
+    photo_path, photo_err = path, err
+    done()
+  end)
+
+  set_key(buf, "user_detail", "refresh", function()
+    vim.notify("refreshing profile...", vim.log.levels.INFO)
+    graph.get_user_profile(user_id, function(p, err)
+      if p then
+        profile, profile_err = p, nil
+      else
+        profile_err = err
+      end
+      render()
+    end, { force = true })
+  end, { desc = "Refresh user profile" })
+  set_key(buf, "user_detail", "close", function() vim.api.nvim_buf_delete(buf, { force = true }) end,
+    { desc = "Close user detail" })
+  set_key(buf, "user_detail", "open_photo", function()
+    local ok, path = pcall(vim.api.nvim_buf_get_var, buf, "ms_teams_user_photo")
+    if not ok or not path or path == "" then
+      vim.notify("no photo to open", vim.log.levels.INFO)
+      return
+    end
+    if vim.ui and vim.ui.open then vim.ui.open(path) else vim.fn.jobstart({ "open", path }, { detach = true }) end
+  end, { desc = "Open profile photo" })
+end
+
+-- open the peer's detail from a chat buffer/object (1:1 only)
+function M.show_user_from_chat(chat)
+  one_on_one_user_id(chat, function(uid, why, name, member)
+    if not uid then
+      vim.notify(why == "not_one_on_one" and USER_DETAIL_NOT_USER
+        or "could not identify the user in this 1:1 chat", vim.log.levels.WARN)
+      return
+    end
+    M.show_user_detail(uid, "current", member or name)
+  end)
+end
+
 function M.show_messages(chat, open)
   open = open or "split"
   local chat_id = nv(chat.id)
@@ -3310,6 +3721,29 @@ function M.show_messages(chat, open)
   local is_channel = nv(chat.chatType) == "channel" and nv(chat.teamId) ~= nil
   local team_id = nv(chat.teamId)
   local cache = require("ms-teams.cache")
+  -- chat-detail hints follow the configured keymaps; disabled actions and
+  -- removed keys disappear from the header/footer.
+  local function detail_hints(items)
+    local out = {}
+    for _, it in ipairs(items) do
+      local k = km("chat_detail", it[1])
+      if k then table.insert(out, k .. " " .. it[2]) end
+    end
+    return table.concat(out, " | ")
+  end
+  local main_hints = detail_hints({
+    { "participants", "participants" }, { "user_detail", "user detail (1:1)" },
+    { "jump", "jump reply / reactions" }, { "reactions_split", "reactions split" },
+    { "reactions_vsplit", "reactions vsplit" }, { "reply", "reply" }, { "refresh", "refresh" },
+    { "load_older", "load 50 older" }, { "search", "search" }, { "search_telescope", "telescope search" },
+    { "mark_read", "mark read" }, { "mark_unread", "mark unread" }, { "close", "close" },
+  })
+  local foot_hints = detail_hints({
+    { "close", "close" }, { "reply", "reply (<C-p> paste img)" }, { "refresh", "refresh" },
+    { "search", "search" }, { "search_telescope", "telescope search" }, { "participants", "participants" },
+    { "user_detail", "user detail (1:1)" }, { "jump", "jump to original / reactions" },
+    { "mark_read", "mark read" }, { "mark_unread", "mark unread" }, { "load_older", "load 50 older" },
+  })
   local safe_id_cache = chat_id:gsub("[^%w%-_:.]", "_"):sub(1, 60)
   local cache_key = "messages_" .. safe_id_cache
   -- channels carry no server viewpoint: infer read position from previously
@@ -3400,7 +3834,7 @@ function M.show_messages(chat, open)
     set_listed_scratch(buf, "ms-teams://chat/" .. safe_name .. "__" .. safe_id)
     local HEADER_LINES = 6
     local header_suffix = is_cached and " (cached)" or ""
-    local lines = { "# " .. chat_name, "", string.format("Chat: %s | %d messages%s", chat_id, #msgs, header_suffix), "", "Press g? participants | <CR> jump reply / reactions | <C-s>/<C-v> reactions split/vsplit | S reply | R refresh | gR load 50 older | g/ search | gF telescope search | mr mark read | mu mark unread | q close", "" }
+    local lines = { "# " .. chat_name, "", string.format("Chat: %s | %d messages%s", chat_id, #msgs, header_suffix), "", "Press " .. main_hints, "" }
     -- enrich header for oneOnOne with missing members (was oneOnOne)
     if nv(chat.chatType) == "oneOnOne" and chat_name:match("^oneOnOne") then
       require("ms-teams.graph").get_chat(chat_id, function(full)
@@ -3599,7 +4033,7 @@ function M.show_messages(chat, open)
     end
     table.insert(lines, "---")
     table.insert(lines, "Chat: " .. format_chat(chat) .. " | " .. #msgs .. " messages")
-    table.insert(lines, "Hints: q close | S reply (<C-p> paste img) | R refresh | g/ search | gF telescope search | g? participants | <CR> jump to original / reactions (<C-s>/<C-v> split/vsplit) | mr mark read | mu mark unread | gR load 50 older")
+    table.insert(lines, "Hints: " .. foot_hints)
 
     -- dirty check: skip full set_lines/highlights if content identical (major flicker source)
     local do_render = true
@@ -4126,12 +4560,14 @@ function M.show_messages(chat, open)
       vim.cmd("belowright 7split")
       vim.api.nvim_win_set_buf(0, compose_buf)
     end
-    vim.keymap.set("n", "S", open_compose, { buffer = buf, desc = "Teams compose reply" })
-    vim.keymap.set("n", "q", function() vim.api.nvim_buf_delete(buf, { force = true }) end, { buffer = buf })
-    vim.keymap.set("n", "g?", function() M.show_participants(chat) end, { buffer = buf, desc = "Teams participants" })
-    vim.keymap.set("n", "g/", function() M.search_in_chat(chat, buf) end, { buffer = buf, desc = "Search in chat (buffer)" })
-    vim.keymap.set("n", "gF", function() M.search_in_chat_telescope(chat, buf) end, { buffer = buf, desc = "Search in chat (telescope)" })
-    vim.keymap.set("n", "gx", function()
+    set_key(buf, "chat_detail", "reply", open_compose, { desc = "Teams compose reply" })
+    set_key(buf, "chat_detail", "close", function() vim.api.nvim_buf_delete(buf, { force = true }) end)
+    set_key(buf, "chat_detail", "participants", function() M.show_participants(chat) end, { desc = "Teams participants" })
+    set_key(buf, "chat_detail", "user_detail", function() M.show_user_from_chat(chat) end,
+      { desc = "User detail (1:1 chats)" })
+    set_key(buf, "chat_detail", "search", function() M.search_in_chat(chat, buf) end, { desc = "Search in chat (buffer)" })
+    set_key(buf, "chat_detail", "search_telescope", function() M.search_in_chat_telescope(chat, buf) end, { desc = "Search in chat (telescope)" })
+    set_key(buf, "chat_detail", "open_link", function()
       local lnum = vim.api.nvim_win_get_cursor(0)[1]
       local line = vim.api.nvim_get_current_line()
       if not (line:find("%[Image:") or line:find("%[File:")) then
@@ -4198,7 +4634,7 @@ function M.show_messages(chat, open)
       end
       vim.notify("opening with Preview...", vim.log.levels.INFO)
       vim.fn.jobstart({"open", tmp}, {detach=true})
-    end, { buffer = buf, desc = "Open image or default gx" })
+    end, { desc = "Open image or default gx" })
     -- anchor helpers: position survives Last-read divider insert/remove
     -- across re-renders (raw lnum goes stale when divider appears/vanishes)
     local function anchor_at(lnum)
@@ -4229,7 +4665,7 @@ function M.show_messages(chat, open)
       nl = nl or (fallback_lnum and math.max(1, math.min(fallback_lnum, lc)) or nil)
       if nl then pcall(vim.api.nvim_win_set_cursor, win, { nl, fallback_col or 0 }) end
     end
-    vim.keymap.set("n", "mr", function()
+    set_key(buf, "chat_detail", "mark_read", function()
       local cur_pos = vim.api.nvim_win_get_cursor(0)
       -- guard against stale closures (reused buffers): act only if this
       -- buffer still shows the chat this mapping was created for
@@ -4283,8 +4719,8 @@ function M.show_messages(chat, open)
           do_local()
         end)
       end)
-    end, { buffer = buf, desc = "Mark chat read (whole chat)" })
-    vim.keymap.set("n", "mu", function()
+    end, { desc = "Mark chat read (whole chat)" })
+    set_key(buf, "chat_detail", "mark_unread", function()
       local cur_pos = vim.api.nvim_win_get_cursor(0)
       do
         local ok_cur, cur_cid = pcall(vim.api.nvim_buf_get_var, buf, "ms_teams_chat_id")
@@ -4367,10 +4803,10 @@ function M.show_messages(chat, open)
       else
         vim.notify("marking as unread should be performed above a message (on **from** header, reply or body)", vim.log.levels.WARN)
       end
-    end, { buffer = buf, desc = "Mark unread (on message only)" })
-    vim.keymap.set("n", "gR", do_load_older, { buffer = buf, desc = "Teams load 50 older messages" })
+    end, { desc = "Mark unread (on message only)" })
+    set_key(buf, "chat_detail", "load_older", do_load_older, { desc = "Teams load 50 older messages" })
 
-    vim.keymap.set("n", "R", function()
+    set_key(buf, "chat_detail", "refresh", function()
       vim.notify("refreshing messages...", vim.log.levels.INFO)
       do_list_messages(chat_id, function(fresh, err, freshNext)
         if err then vim.notify("refresh failed: "..err, vim.log.levels.ERROR); return end
@@ -4382,8 +4818,8 @@ function M.show_messages(chat, open)
           vim.notify(string.format("refreshed %d messages", #fresh), vim.log.levels.INFO)
         end)
       end)
-    end, { buffer = buf, desc = "Teams refresh messages" })
-    vim.keymap.set("n", "<CR>", function()
+    end, { desc = "Teams refresh messages" })
+    set_key(buf, "chat_detail", "jump", function()
       -- reactions line opens the reaction detail instead of jumping
       if vim.api.nvim_get_current_line():find("[reactions:", 1, true) then
         M.show_reactions(buf, chat, "replace")
@@ -4400,26 +4836,31 @@ function M.show_messages(chat, open)
       elseif vim.api.nvim_get_current_line():match("^_↳ reply to:") then
         vim.notify("original message not in buffer (beyond 50 loaded - press R to load more)", vim.log.levels.WARN)
       end
-    end, { buffer = buf, desc = "Jump to replied message / reactions" })
-    -- <C-s>/<C-v> open the reactions line in a split/vsplit; elsewhere fall
-    -- through to the default key behaviour (<C-v> blockwise, <C-s> no-op)
+    end, { desc = "Jump to replied message / reactions" })
+    -- reactions split keys; elsewhere fall through to the configured key
     local function reactions_line()
       return vim.api.nvim_get_current_line():find("[reactions:", 1, true) ~= nil
     end
-    vim.keymap.set("n", "<C-s>", function()
-      if reactions_line() then
-        M.show_reactions(buf, chat, "split")
-      else
-        vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<C-s>", true, false, true), "n", false)
-      end
-    end, { buffer = buf, desc = "Reactions in horizontal split" })
-    vim.keymap.set("n", "<C-v>", function()
-      if reactions_line() then
-        M.show_reactions(buf, chat, "vsplit")
-      else
-        vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<C-v>", true, false, true), "n", false)
-      end
-    end, { buffer = buf, desc = "Reactions in vertical split" })
+    local rs_key = km("chat_detail", "reactions_split")
+    if rs_key then
+      set_key(buf, "chat_detail", "reactions_split", function()
+        if reactions_line() then
+          M.show_reactions(buf, chat, "split")
+        else
+          vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes(rs_key, true, false, true), "n", false)
+        end
+      end, { desc = "Reactions in horizontal split" })
+    end
+    local rv_key = km("chat_detail", "reactions_vsplit")
+    if rv_key then
+      set_key(buf, "chat_detail", "reactions_vsplit", function()
+        if reactions_line() then
+          M.show_reactions(buf, chat, "vsplit")
+        else
+          vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes(rv_key, true, false, true), "n", false)
+        end
+      end, { desc = "Reactions in vertical split" })
+    end
     -- :e refreshes in place instead of wiping the nofile buffer
     local e_grp = vim.api.nvim_create_augroup("MsTeamsChatDetail" .. buf, { clear = true })
     vim.api.nvim_create_autocmd("BufReadCmd", { group = e_grp, buffer = buf, callback = function()
@@ -4625,8 +5066,10 @@ function M.show_participants(chat)
   vim.api.nvim_buf_set_option(buf, "filetype", "markdown")
   set_listed_scratch(buf, "ms-teams://chat/" .. (nv(chat.id) or "unknown"):gsub("[^%w%-_:.]", "_"):sub(1, 50) .. "/participants")
   local title = "# Participants: " .. (nv(chat.topic) or nv(chat.chatType) or nv(chat.id) or "chat")
+  local line_user = {}
   local function render_members(members)
     local lines = { title, "" }
+    line_user = {}
     if members and type(members) == "table" and #members > 0 then
       for _, m in ipairs(members) do
         if m == vim.NIL then goto cont end
@@ -4634,6 +5077,7 @@ function M.show_participants(chat)
         local email = nv(m.email) or ""
         local userId = nv(m.userId) or ""
         table.insert(lines, string.format("- %s%s%s", name, email ~= "" and " <" .. email .. ">" or "", userId ~= "" and " (" .. userId:sub(1, 8) .. ")" or ""))
+        if userId ~= "" then line_user[#lines] = { id = userId, name = name, email = email } end
         ::cont::
       end
     else
@@ -4683,6 +5127,15 @@ function M.show_participants(chat)
   vim.cmd("vsplit")
   vim.api.nvim_win_set_buf(0, buf)
   vim.keymap.set("n", "q", function() vim.api.nvim_buf_delete(buf, { force = true }) end, { buffer = buf })
+  vim.keymap.set("n", "<CR>", function()
+    local lnum = vim.api.nvim_win_get_cursor(0)[1]
+    local user = line_user[lnum]
+    if not user then
+      vim.notify("user detail is only available for users, not groups", vim.log.levels.WARN)
+      return
+    end
+    M.show_user_detail(user.id, "current", user)
+  end, { buffer = buf, desc = "User detail" })
 end
 
 function M.reply(chat)
@@ -5015,12 +5468,13 @@ function M.find_chats(opts)
 
     local show_all = true -- default: show all chats, <C-g> toggles to unread only
 
+    local picker_name_counts = unique_chat_names(top50)
     local function make_items(include_read)
       local items = {}
       for _, c in ipairs(top50) do
         local unread = has_unread(c)
          if include_read or unread then
-           local base = format_chat(c)
+           local base = chat_label(c, picker_name_counts)
            local type_icon = get_chat_type_icon(c)
            local icon_prefix = type_icon ~= "" and (type_icon .. "  ") or ""
            local display_name = icon_prefix .. base
@@ -5091,11 +5545,20 @@ function M.find_chats(opts)
     end
 
     local title_suffix = function()
-      local hints = "<C-q> qf - <C-e> read - <C-b> unread"
-      if show_all then
-        return string.format(" (All %d - <C-g> unread only - %s)", #top50, hints)
+      local hints = {}
+      for _, it in ipairs({ { "quickfix", "qf" }, { "mark_read", "read" },
+        { "mark_unread", "unread" }, { "user_detail", "user" } }) do
+        local k = km("msteams_finder", it[1])
+        if k then table.insert(hints, k .. " " .. it[2]) end
       end
-      return string.format(" (Unread %d - <C-g> show all - %s)", #top50, hints)
+      local hint_str = table.concat(hints, " - ")
+      local toggle = km("msteams_finder", "toggle_unread")
+      if show_all then
+        return string.format(" (All %d%s - %s)", #top50,
+          toggle and (" - " .. toggle .. " unread only") or "", hint_str)
+      end
+      return string.format(" (Unread %d%s - %s)", #top50,
+        toggle and (" - " .. toggle .. " show all") or "", hint_str)
     end
 
     pickers.new({}, {
@@ -5126,11 +5589,19 @@ function M.find_chats(opts)
         actions.select_horizontal:replace(function() open_selection("split") end)
         actions.select_vertical:replace(function() open_selection("vsplit") end)
 
-        map({ "i", "n" }, "<C-s>", function() open_selection("split") end)
-        map({ "i", "n" }, "<C-v>", function() open_selection("vsplit") end)
+        local function picker_map(action, fn)
+          local key = km("msteams_finder", action)
+          if key then map({ "i", "n" }, key, fn) end
+        end
 
-        -- <C-g> toggle between unread only and all
-        map({ "i", "n" }, "<C-g>", function()
+        local open_key = km("msteams_finder", "open")
+        if open_key and open_key ~= "<CR>" then
+          map({ "i", "n" }, open_key, function() open_selection("current") end)
+        end
+        picker_map("open_split", function() open_selection("split") end)
+        picker_map("open_vsplit", function() open_selection("vsplit") end)
+
+        picker_map("toggle_unread", function()
           if not guard_names() then return end
           show_all = not show_all
           local current_picker = action_state.get_current_picker(prompt_bufnr)
@@ -5155,8 +5626,31 @@ function M.find_chats(opts)
             if msg then vim.notify(msg, vim.log.levels.INFO) end
           end)
         end
-        -- <C-e> mark chat under cursor as read + refresh row (drop ●/highlight)
-        map({ "i", "n" }, "<C-e>", function()
+        -- picker user detail for the selected chat: only 1:1 chats map to a
+        -- single user; groups/channels get an explicit message
+        picker_map("user_detail", function()
+          if not guard_names() then return end
+          local selection = action_state.get_selected_entry()
+          local chat = selection and selection.value or nil
+          if not chat or chat == vim.NIL then
+            vim.notify("no chat under cursor", vim.log.levels.WARN)
+            return
+          end
+          if nv(chat.chatType) ~= "oneOnOne" then
+            vim.notify("user detail is only available for users, not groups", vim.log.levels.WARN)
+            return
+          end
+          one_on_one_user_id(chat, function(uid, _, name, member)
+            if not uid then
+              vim.notify("could not identify the user in this 1:1 chat", vim.log.levels.WARN)
+              return
+            end
+            actions.close(prompt_bufnr)
+            M.show_user_detail(uid, "current", member or name)
+          end)
+        end)
+        -- mark chat under cursor as read + refresh row (drop ●/highlight)
+        picker_map("mark_read", function()
           if not guard_names() then return end
           local selection = action_state.get_selected_entry()
           local chat = selection and selection.value or nil
@@ -5182,7 +5676,7 @@ function M.find_chats(opts)
           end)
         end)
         -- <C-b> mark chat under cursor as unread + refresh row (●/highlight back)
-        map({ "i", "n" }, "<C-b>", function()
+        picker_map("mark_unread", function()
           if not guard_names() then return end
           local selection = action_state.get_selected_entry()
           local chat = selection and selection.value or nil
@@ -5296,8 +5790,8 @@ function M.find_chats(opts)
             vim.notify("ms-teams: quickfix window not found", vim.log.levels.WARN)
           end
         end
-        map({ "i", "n" }, "<C-q>", send_chats_to_qf)
-        map({ "i", "n" }, "<M-q>", send_chats_to_qf)
+        picker_map("quickfix", send_chats_to_qf)
+        picker_map("quickfix_all", send_chats_to_qf)
         -- fetch missing oneOnOne names once (disk cache missed): unlock,
         -- refresh rows and persist for next opens when data arrives
         if not names_ready then
