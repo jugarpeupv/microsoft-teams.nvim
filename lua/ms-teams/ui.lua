@@ -4083,16 +4083,26 @@ function M.show_messages(chat, open)
       end
     end
     local ns = vim.api.nvim_create_namespace("ms_teams_msg_unread")
+    -- did this buffer already render before? re-renders must preserve the
+    -- cursor/scroll instead of jumping to first_unread/#lines (scroll-to-bottom)
+    local had_map = false
+    do
+      local okm, mm = pcall(vim.api.nvim_buf_get_var, buf, "ms_teams_id_to_lnum")
+      had_map = okm and type(mm) == "table"
+    end
+    local restored_view = false
     if do_render then
-      -- preserve view for background re-renders (no_cursor)
+      -- preserve view for re-renders: background paints, live merges and
+      -- send/reply reloads must not scroll to the end
       local win_for_view = vim.fn.bufwinid(buf)
       local saved_view = nil
-      if win_for_view ~= -1 and (opts.no_cursor or opts.keep_cursor) then
+      if win_for_view ~= -1 and (opts.no_cursor or opts.keep_cursor or had_map) then
         saved_view = vim.api.nvim_win_call(win_for_view, function() return vim.fn.winsaveview() end)
       end
       vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
       if saved_view and win_for_view ~= -1 then
         pcall(vim.api.nvim_win_call, win_for_view, function() vim.fn.winrestview(saved_view) end)
+        restored_view = true
       end
     end
     -- highlights always re-applied: unread state can change without text
@@ -4126,11 +4136,6 @@ function M.show_messages(chat, open)
 
     -- did this buffer already render before? re-renders must preserve the
     -- cursor instead of jumping to first_unread/#lines (scroll-to-bottom)
-    local had_map = false
-    do
-      local okm, mm = pcall(vim.api.nvim_buf_get_var, buf, "ms_teams_id_to_lnum")
-      had_map = okm and type(mm) == "table"
-    end
     vim.api.nvim_buf_set_var(buf, "ms_teams_chat_id", chat_id)
     vim.api.nvim_buf_set_var(buf, "ms_teams_chat", chat)
     vim.api.nvim_buf_set_var(buf, "ms_teams_raw_msgs", msgs)
@@ -4304,7 +4309,7 @@ function M.show_messages(chat, open)
       if not first_unread or lnum < first_unread then first_unread = lnum end
     end
     local target = opts.target_cursor
-    if not target and not opts.no_cursor then
+    if not target and not opts.no_cursor and not restored_view then
       if had_map then
         -- re-render of an already-painted buffer: keep the user's cursor
         -- (clamped below); never auto-jump to first_unread/#lines
@@ -4488,6 +4493,10 @@ function M.show_messages(chat, open)
       local lines = vim.api.nvim_buf_get_lines(compose_buf, 0, -1, false)
       local text = table.concat(lines, "\n"):gsub("^%s+", ""):gsub("%s+$", "")
       if text == "" then vim.notify("compose empty", vim.log.levels.WARN); return end
+      -- remember where the user was before the compose split closes: sending
+      -- must not scroll the chat to the end
+      local chat_win = vim.fn.bufwinid(buf)
+      local chat_view = chat_win ~= -1 and vim.api.nvim_win_call(chat_win, function() return vim.fn.winsaveview() end) or nil
       vim.api.nvim_buf_set_option(compose_buf, "modifiable", false)
       graph.send_message(chat_id, text, function(_, err)
         vim.schedule(function()
@@ -4512,7 +4521,12 @@ function M.show_messages(chat, open)
             vim.schedule(function()
               if not vim.api.nvim_buf_is_valid(buf) then return end
               cache.save(cache_key, { messages = fresh, nextLink = freshNext or "" })
-              render_buffer(fresh, freshNext, { is_cached = false, buf = buf, no_open = true })
+              render_buffer(fresh, freshNext,
+                { is_cached = false, buf = buf, no_open = true, keep_cursor = true, force = true })
+              local w = vim.fn.bufwinid(buf)
+              if chat_view and w ~= -1 then
+                pcall(vim.api.nvim_win_call, w, function() vim.fn.winrestview(chat_view) end)
+              end
             end)
           end)
         end)
@@ -5314,26 +5328,59 @@ function M.reply(chat)
         return
       end
       vim.notify("sent", vim.log.levels.INFO)
+      local cache_mod = require("ms-teams.cache")
+      local safe = chat_id:gsub("[^%w%-_:.]", "_"):sub(1, 60)
       -- invalidate messages cache so next open shows fresh (Teams optimistic update)
-      local ok, cache = pcall(require, "ms-teams.cache")
-      if ok and chat_id then
-        local safe = chat_id:gsub("[^%w%-_:.]", "_"):sub(1, 60)
-        local path = vim.fn.stdpath("cache") .. "/ms-teams/messages_" .. safe .. ".json"
-        pcall(vim.fn.delete, path)
-      end
-      -- refresca en la misma ventana, no split horizontal (antes hacía split y abría el mismo buffer abajo)
-      if chat then
-        -- si estamos ya en el buffer del chat, recarga in-place
-        local cur = vim.api.nvim_get_current_buf()
-        local ok2, cur_id = pcall(vim.api.nvim_buf_get_var, cur, "ms_teams_chat_id")
-        if ok2 and cur_id == chat_id then
-          -- fuerza reload sin cambiar layout
-          M.show_messages(chat, "current")
-        else
-          M.show_messages(chat, "current")
+      pcall(vim.fn.delete, vim.fn.stdpath("cache") .. "/ms-teams/messages_" .. safe .. ".json")
+
+      -- Refresh in place when the detail is open: show_messages would hit a
+      -- cache miss, create a new buffer and jump to the end. Reusing the
+      -- existing render keeps cursor/scroll where the user left them.
+      local target_buf, target_chat
+      for _, b in ipairs(vim.api.nvim_list_bufs()) do
+        if vim.api.nvim_buf_is_valid(b) and vim.fn.bufwinid(b) ~= -1 then
+          local okid, id = pcall(vim.api.nvim_buf_get_var, b, "ms_teams_chat_id")
+          if okid and id == chat_id then
+            target_buf = b
+            local okc, cc = pcall(vim.api.nvim_buf_get_var, b, "ms_teams_chat")
+            if okc then target_chat = cc end
+            break
+          end
         end
+      end
+      if target_buf then
+        local win = vim.fn.bufwinid(target_buf)
+        local view = win ~= -1 and vim.api.nvim_win_call(win, function() return vim.fn.winsaveview() end) or nil
+        local tc = target_chat or chat or {}
+        local function fetch(cb)
+          if nv(tc.chatType) == "channel" and nv(tc.teamId) then
+            graph.list_channel_messages(nv(tc.teamId), chat_id, cb)
+          else
+            graph.list_messages(chat_id, cb)
+          end
+        end
+        fetch(function(fresh, ferr, fnext)
+          if ferr or not fresh then return end
+          vim.schedule(function()
+            if not vim.api.nvim_buf_is_valid(target_buf) then return end
+            cache_mod.save("messages_" .. safe, { messages = fresh, nextLink = fnext or "" })
+            local okr, render = pcall(vim.api.nvim_buf_get_var, target_buf, "ms_teams_detail_render")
+            if okr and type(render) == "function" then
+              render(fresh, fnext, { no_cursor = true, keep_cursor = true, force = true })
+            end
+            local w = vim.fn.bufwinid(target_buf)
+            if view and w ~= -1 then
+              pcall(vim.api.nvim_win_call, w, function() vim.fn.winrestview(view) end)
+            end
+          end)
+        end)
+        return
+      end
+
+      -- no open detail buffer: fall back to the normal open path
+      if chat then
+        M.show_messages(chat, "current")
       else
-        -- reply desde pick sin chat obj: busca el buf del chat y recárgalo si existe
         for _, b in ipairs(vim.api.nvim_list_bufs()) do
           if vim.api.nvim_buf_is_valid(b) then
             local ok2, bid = pcall(vim.api.nvim_buf_get_var, b, "ms_teams_chat_id")
