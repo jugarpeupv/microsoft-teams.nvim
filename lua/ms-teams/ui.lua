@@ -867,6 +867,43 @@ local function chat_label(chat, counts)
   return base
 end
 
+-- Merge a freshly polled newest-N page into the loaded buffer messages by id.
+-- Returns the merged list plus whether a message was added or updated.
+local function merge_live_messages(existing, incoming)
+  local by_id, order = {}, {}
+  for _, m in ipairs(existing or {}) do
+    if m ~= vim.NIL and type(m) == "table" then
+      local id = nv(m.id)
+      if id then
+        if not by_id[id] then table.insert(order, id) end
+        by_id[id] = m
+      end
+    end
+  end
+  local changed = false
+  for _, m in ipairs(incoming or {}) do
+    if m ~= vim.NIL and type(m) == "table" then
+      local id = nv(m.id)
+      if id then
+        local old = by_id[id]
+        if not old then
+          by_id[id] = m
+          table.insert(order, id)
+          changed = true
+        elseif nv(old.etag) ~= nv(m.etag)
+            or nv(old.lastModifiedDateTime) ~= nv(m.lastModifiedDateTime) then
+          by_id[id] = m
+          changed = true
+        end
+      end
+    end
+  end
+  if not changed then return existing, false end
+  local out = {}
+  for _, id in ipairs(order) do table.insert(out, by_id[id]) end
+  return out, true
+end
+
 local date_cache = {}
 
 local function format_date(iso)
@@ -4860,6 +4897,127 @@ function M.show_messages(chat, open)
           vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes(rv_key, true, false, true), "n", false)
         end
       end, { desc = "Reactions in vertical split" })
+    end
+    -- Live refresh for open 1:1 chats. Graph has no push for chat messages
+    -- (change notifications need a public HTTPS endpoint), so poll the visible
+    -- buffer every >=10s and merge new/updated messages. Groups/channels are
+    -- not polled, and 429 pauses for 60s without retrying. A per-chat lock
+    -- follows the editor in use: opening/focusing a chat steals the lock from
+    -- older instances, which are told who took over.
+    local live = require("ms-teams.config").options.refresh_one_to_one_chats_opts or {}
+    if live.enabled ~= false and nv(chat.chatType) == "oneOnOne" and chat_id ~= "48:notes" then
+      local interval = math.max(10000, tonumber(live.interval_ms) or 10000)
+      local top = math.max(1, math.min(tonumber(live.top) or 20, 50))
+      local use_lock = live.lock ~= false
+      local live_lock = use_lock and require("ms-teams.live_lock") or nil
+      local token = chat_id .. "|" .. tostring(buf)
+      local ok_tok, cur_tok = pcall(vim.api.nvim_buf_get_var, buf, "ms_teams_live_token")
+      if not (ok_tok and cur_tok == token) then
+        pcall(vim.api.nvim_buf_set_var, buf, "ms_teams_live_token", token)
+        pcall(vim.api.nvim_buf_set_var, buf, "ms_teams_live_interval", interval)
+        -- opening the chat makes this instance the owner (steals from older ones)
+        local function announce_steal(prev)
+          if not live_lock or not prev then return end
+          if tonumber(prev.pid) == vim.fn.getpid() then return end
+          vim.notify(string.format(
+            "ms-teams: live refresh for %s: took over lock from %s",
+            format_chat(chat), live_lock.describe(prev)), vim.log.levels.INFO)
+        end
+        if live_lock then
+          local ok, _, prev = live_lock.steal(chat_id)
+          if ok then announce_steal(prev) end
+        end
+        local throttle_until = 0
+        local lost_notified = false
+        local function alive()
+          if not vim.api.nvim_buf_is_valid(buf) then return false end
+          local ok, t = pcall(vim.api.nvim_buf_get_var, buf, "ms_teams_live_token")
+          return ok and t == token
+        end
+        local function tick()
+          if not alive() then
+            if live_lock then live_lock.release(chat_id) end
+            return
+          end
+          vim.defer_fn(tick, interval)
+          if live.only_visible ~= false and vim.fn.bufwinid(buf) == -1 then
+            -- hidden: let another instance take over
+            if live_lock then live_lock.release(chat_id) end
+            lost_notified = false
+            return
+          end
+          if os.time() < throttle_until then return end
+          if live_lock then
+            local ok, owner = live_lock.renew(chat_id, interval)
+            if not ok then
+              if not lost_notified then
+                lost_notified = true
+                vim.notify(string.format(
+                  "ms-teams: live refresh lock for %s was taken over by %s; polling paused here",
+                  format_chat(chat), live_lock.describe(owner)), vim.log.levels.WARN)
+              end
+              return
+            end
+            lost_notified = false
+          end
+          graph.list_messages_top(chat_id, top, function(fresh, err)
+            if not alive() then return end
+            vim.schedule(function()
+              if not alive() then return end
+              if err then
+                local e = tostring(err)
+                if e:find("TooManyRequests") or e:find("429") then
+                  throttle_until = os.time() + 60
+                end
+                return
+              end
+              if type(fresh) ~= "table" or #fresh == 0 then return end
+              local cur = {}
+              pcall(function() cur = vim.api.nvim_buf_get_var(buf, "ms_teams_raw_msgs") or {} end)
+              local merged, changed = merge_live_messages(cur, fresh)
+              if not changed then return end
+              local nl = ""
+              pcall(function() nl = vim.api.nvim_buf_get_var(buf, "ms_teams_nextLink") or "" end)
+              cache.save(cache_key, { messages = merged, nextLink = nl })
+              local win = vim.fn.bufwinid(buf)
+              local follow_bottom = false
+              if win ~= -1 then
+                local cur = vim.api.nvim_win_get_cursor(win)[1]
+                follow_bottom = cur >= vim.api.nvim_buf_line_count(buf) - 1
+              end
+              render_buffer(merged, nl, {
+                buf = buf, no_cursor = true, keep_cursor = true,
+                no_open = true, is_cached = false, force = true,
+              })
+              if follow_bottom and win ~= -1 and vim.api.nvim_win_is_valid(win) then
+                pcall(vim.api.nvim_win_set_cursor, win,
+                  { vim.api.nvim_buf_line_count(buf), 0 })
+              end
+            end)
+          end)
+        end
+        vim.defer_fn(tick, interval)
+        if live_lock then
+          -- focusing the chat is an explicit "I'm here": take the poll over
+          vim.api.nvim_create_autocmd({ "BufEnter", "BufWinEnter" }, {
+            buffer = buf,
+            callback = function()
+              if alive() and (live.only_visible == false or vim.fn.bufwinid(buf) ~= -1) then
+                local ok, _, prev = live_lock.steal(chat_id)
+                if ok then announce_steal(prev) end
+                lost_notified = false
+              end
+            end,
+          })
+        end
+        vim.api.nvim_create_autocmd("BufWipeout", {
+          buffer = buf,
+          once = true,
+          callback = function()
+            if live_lock then live_lock.release(chat_id) end
+          end,
+        })
+      end
     end
     -- :e refreshes in place instead of wiping the nofile buffer
     local e_grp = vim.api.nvim_create_augroup("MsTeamsChatDetail" .. buf, { clear = true })

@@ -158,6 +158,16 @@ function M.list_chats(cb, opts)
   fetch("/me/chats?$top=" .. top .. "&" .. expand)
 end
 
+-- newest `top` messages, for live polling of open 1:1 chats
+function M.list_messages_top(chat_id, top, cb)
+  top = math.max(1, math.min(tonumber(top) or 20, 50))
+  local path = string.format("/chats/%s/messages?$top=%d", chat_id, top)
+  graph_request_async("read", "GET", path, nil, function(j, err)
+    if not j then cb(nil, err); return end
+    cb(j.value or {}, nil)
+  end)
+end
+
 function M.list_messages(chat_id, cb, nextLink)
   if nextLink then
     local path = nextLink:gsub("^https://graph.microsoft.com/v1.0", "")

@@ -113,6 +113,17 @@ M.defaults = {
       close = "q",
     },
   },
+  -- Keep open 1:1 chat buffers up to date. Graph has no push for chat
+  -- messages (change notifications need a public HTTPS endpoint), so the
+  -- visible 1:1 buffer is polled. interval_ms is clamped to >= 10000ms to
+  -- stay gentle with throttling; groups/channels are never polled.
+  refresh_one_to_one_chats_opts = {
+    enabled = true,
+    interval_ms = 10000,
+    top = 20,           -- newest messages merged when something changed
+    only_visible = true, -- skip while the buffer is not on screen
+    lock = true,        -- one Neovim instance at a time polls a given chat
+  },
   -- watch: polling while nvim is open (works even if focus is on Chrome)
   watch = {
     enabled = false, -- set true to autostart on setup()

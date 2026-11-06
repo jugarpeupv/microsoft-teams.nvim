@@ -21,9 +21,11 @@ local function is_pid_alive(pid)
   local ok, uv = pcall(require, "vim.uv")
   if not ok then uv = vim.loop end
   if uv and uv.kill then
-    local ok2, err = pcall(uv.kill, pid, 0)
-    if ok2 then return true end
-    if err and tostring(err):find("ESRCH") then return false end
+    -- uv.kill returns 0 on success; ESRCH = gone, EPERM = exists but not ours
+    local ok2, ret, err = pcall(uv.kill, pid, 0)
+    if not ok2 then return true end
+    if ret == 0 then return true end
+    if err and tostring(err):find("EPERM") then return true end
     return false
   end
   -- fallback: no kill support, assume alive if recent
@@ -67,12 +69,35 @@ local function is_locked()
   return false, j
 end
 
+local function lock_desc(j)
+  if not j then return "another Neovim instance" end
+  return string.format("PID %s (%s) cwd=%s",
+    tostring(j.pid or "?"),
+    (j.proc and j.proc ~= "") and j.proc or "nvim",
+    (j.cwd and j.cwd ~= "") and j.cwd or "?")
+end
+
 local function acquire_lock()
   local p = lock_path()
-  local data = { pid = vim.fn.getpid(), started_at = os.time() }
+  local data = {
+    pid = vim.fn.getpid(),
+    started_at = os.time(),
+    heartbeat = os.time(),
+    proc = vim.fn.fnamemodify(vim.v.progpath or "nvim", ":t"),
+    cwd = vim.fn.getcwd(),
+  }
   pcall(vim.fn.mkdir, vim.fn.fnamemodify(p, ":h"), "p")
   pcall(vim.fn.writefile, { vim.json.encode(data) }, p)
   lock_owner = true
+end
+
+local function refresh_lock()
+  if not lock_owner then return end
+  local j = read_lock()
+  if j and tonumber(j.pid) == vim.fn.getpid() then
+    j.heartbeat = os.time()
+    pcall(vim.fn.writefile, { vim.json.encode(j) }, lock_path())
+  end
 end
 
 local function release_lock_if_owner()
@@ -266,6 +291,26 @@ end
 
 local function do_poll()
   if polling then return end
+  -- the newest instance owns the watch: if someone stole it, stop here (and
+  -- say who did it). A missing lock is re-claimed; a dead pid is stolen on
+  -- the next M.start().
+  if lock_owner then
+    local j = read_lock()
+    if j and tonumber(j.pid) and tonumber(j.pid) ~= vim.fn.getpid() then
+      if timer then timer:stop(); timer:close(); timer = nil end
+      polling = false
+      lock_owner = false
+      local desc = lock_desc(j)
+      vim.schedule(function()
+        vim.notify("MSTeams watch: lock taken over by " .. desc .. "; watch stopped here", vim.log.levels.WARN)
+      end)
+      return
+    elseif not j then
+      acquire_lock()
+    else
+      refresh_lock()
+    end
+  end
   local w0 = config.options.watch or {}
   if w0.mentions_only and not me_cache and not me_fetching then
     local now = os.time()
@@ -369,10 +414,12 @@ function M.start(opts)
     vim.notify("MSTeams watch ya activo", vim.log.levels.INFO)
     return timer
   end
-  local locked, info = is_locked()
-  if locked then
-    vim.notify(string.format("MSTeams watch ya activo en PID %s (hace %ds) — no se inicia segundo timer", info.pid, os.time() - (info.started_at or os.time())), vim.log.levels.WARN)
-    return nil
+  -- Steal the watch from any older instance: the editor the user just started
+  -- becomes the poller; the previous one stops on its next tick and is told
+  -- who took over.
+  local prev = read_lock()
+  if prev and tonumber(prev.pid) and tonumber(prev.pid) ~= vim.fn.getpid() then
+    vim.notify("MSTeams watch: taking over from " .. lock_desc(prev), vim.log.levels.INFO)
   end
   local w = config.options.watch or {}
   local interval = w.interval_ms or 60000

@@ -197,6 +197,44 @@ Names resolved through `/users` are persisted in
 `stdpath("cache")/ms-teams/user_names.json`, so the directory lookup
 queue stays idle across sessions instead of re-requesting the same ids.
 
+## Live refresh (1:1 chats)
+
+Microsoft Graph has no push channel usable from a local editor for chat
+messages (change notifications require a public HTTPS endpoint and 60-minute
+subscription renewals; delta is not supported for `chatMessage`). Instead, an
+open 1:1 chat buffer is polled and new/updated messages are merged in place:
+
+```lua
+require("ms-teams").setup({
+  refresh_one_to_one_chats_opts = {
+    enabled = true,
+    interval_ms = 10000,  -- clamped to a 10s minimum
+    top = 20,             -- newest messages merged when something changed
+    only_visible = true,  -- skip while the buffer is not on screen
+    lock = true,          -- single Neovim instance per chat
+  },
+})
+```
+
+Only 1:1 chats are polled; groups, meetings and channels are not. A 429 pauses
+polling for 60s instead of retrying.
+
+With `lock = true` (default) a per-chat lock under
+`stdpath("data")/ms-teams/live/` makes the poll follow the editor you are in:
+opening or focusing a 1:1 chat **steals** the lock from older instances (last
+one wins). The new owner announces the takeover (chat name + PID/process/cwd)
+and the previous owner pauses with its own notice naming the chat, e.g.
+`took over lock from PID 1234 (nvim) cwd=/home/me/proj` (new owner) and
+`live refresh lock for Rubén Panadero was taken over by ...` (old owner).
+Hiding/closing the buffer releases the
+lock, and a dead pid or a heartbeat older than `3 × interval` (min 30s) can be
+taken over. Set `lock = false` to let every instance poll independently.
+
+The chat-list watch (`:MSTeamsWatchStart`, `watch.enabled`) uses the same
+steal semantics for `stdpath("data")/ms-teams/watch.lock`: a newly started
+instance takes over and the previous one stops on its next poll with the same
+PID/process/cwd notice.
+
 ## Searching in a chat
 
 Inside a chat detail buffer:
