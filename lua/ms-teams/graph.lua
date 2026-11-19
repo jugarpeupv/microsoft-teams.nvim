@@ -395,6 +395,164 @@ end
 -- profile photos: binary download cached under stdpath("cache")/avatars and
 -- revalidated with the photo etag, so reopening a user is a no-op. 404 (no
 -- photo) is a normal answer and memoized for AVATAR_TTL.
+-- Local day/week bounds in the configured timezone: UTC ISO strings for
+-- calendarView, plus the local start date and wall-clock "now" for markers.
+-- Python's zoneinfo handles DST; local os.date is the fallback.
+local function range_bounds(kind, date)
+  kind = kind or "day"
+  local tz = config.options.timezone
+  local now = os.time()
+  local function fallback()
+    local base_t
+    if date and date ~= "" then
+      local y, m, d = tostring(date):match("^(%d%d%d%d)%-(%d%d)%-(%d%d)")
+      base_t = y and os.time({ year = tonumber(y), month = tonumber(m), day = tonumber(d), hour = 12 }) or now
+    else
+      base_t = now
+    end
+    local t = os.date("*t", base_t)
+    local base = os.time({ year = t.year, month = t.month, day = t.day, hour = 0, min = 0, sec = 0 })
+    local days_back = kind == "week" and ((t.wday + 5) % 7) or 0
+    local days = kind == "week" and 7 or 1
+    local s = base - days_back * 86400
+    return os.date("!%Y-%m-%dT%H:%M:%SZ", s),
+      os.date("!%Y-%m-%dT%H:%M:%SZ", s + days * 86400),
+      os.date("%Y-%m-%d", s),
+      os.date("%Y-%m-%dT%H:%M:%S", now)
+  end
+  if not tz or tz == "" then return fallback() end
+  local py = [[
+import sys
+from datetime import datetime, timezone, timedelta
+try:
+    from zoneinfo import ZoneInfo
+    tz = ZoneInfo(sys.argv[1])
+except Exception:
+    tz = timezone.utc
+mode = sys.argv[2] if len(sys.argv) > 2 else 'day'
+date = sys.argv[3] if len(sys.argv) > 3 else ''
+if date:
+    base = datetime.strptime(date, '%Y-%m-%d').replace(tzinfo=tz)
+else:
+    base = datetime.now(tz)
+if mode == 'week':
+    start = (base - timedelta(days=base.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+    end = start + timedelta(days=7)
+else:
+    start = base.replace(hour=0, minute=0, second=0, microsecond=0)
+    end = start + timedelta(days=1)
+now = datetime.now(tz)
+print(start.astimezone(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'))
+print(end.astimezone(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'))
+print(start.strftime('%Y-%m-%d'))
+print(now.strftime('%Y-%m-%dT%H:%M:%S'))
+]]
+  local out = vim.fn.system({ "python3", "-c", py, tz, kind, date or "" })
+  if vim.v.shell_error == 0 then
+    local s, e, d, n = out:match("(%S+)\n(%S+)\n(%S+)\n(%S+)")
+    if s and e and d and n then return s, e, d, n end
+  end
+  return fallback()
+end
+
+-- Events in [range start, range end) from the user's default calendar
+-- (calendarView expands recurring instances). cb(events, err, meta{date, now});
+-- times are wall-clock in config.options.timezone thanks to the Prefer header.
+local CALENDAR_SELECT = table.concat({
+  "id", "subject", "start", "end", "isAllDay", "isCancelled",
+  "isOnlineMeeting", "onlineMeeting", "onlineMeetingUrl", "webLink",
+  "location", "locations", "organizer", "attendees", "showAs", "importance",
+  "bodyPreview", "body", "categories", "sensitivity", "responseStatus",
+  "createdDateTime", "lastModifiedDateTime", "recurrence", "seriesMasterId",
+  "type", "onlineMeetingProvider", "allowNewTimeProposals", "isReminderOn",
+  "hasAttachments",
+}, ",")
+
+local function calendar_range(kind, cb, date)
+  local start_iso, end_iso, start_date, now_wall = range_bounds(kind, date)
+  local tz = config.options.timezone or "UTC"
+  local sel = CALENDAR_SELECT
+  local path = "/me/calendarView?startDateTime=" .. start_iso:gsub(":", "%%3A")
+    .. "&endDateTime=" .. end_iso:gsub(":", "%%3A")
+    .. "&$select=" .. sel .. "&$orderby=start/dateTime&$top=50"
+  local headers = { ["Prefer"] = 'outlook.timezone="' .. tz .. '"' }
+  local all = {}
+  local function fetch(p, pages)
+    graph_request_async("read", "GET", p, nil, function(j, err)
+      if not j then
+        if #all > 0 then cb(all, nil, { date = start_date, now = now_wall, kind = kind })
+        else cb(nil, err) end
+        return
+      end
+      for _, e in ipairs(j.value or {}) do table.insert(all, e) end
+      local nxt = j["@odata.nextLink"]
+      if nxt and pages < 10 then
+        fetch(nxt:gsub("^https://graph%.microsoft%.com/v1%.0", ""), pages + 1)
+      else
+        cb(all, nil, { date = start_date, now = now_wall, kind = kind })
+      end
+    end, headers)
+  end
+  fetch(path, 0)
+end
+
+function M.get_calendar_day(cb, date)
+  calendar_range("day", cb, date)
+end
+
+function M.get_calendar_week(cb, date)
+  calendar_range("week", cb, date)
+end
+
+-- Re-fetch a single event (meeting detail refresh, attendee responses, etc.)
+function M.get_event(event_id, cb)
+  local tz = config.options.timezone or "UTC"
+  local path = "/me/events/" .. event_id .. "?$select=" .. CALENDAR_SELECT
+  graph_request_async("read", "GET", path, nil, function(j, err)
+    if not j then cb(nil, err); return end
+    cb(j, nil)
+  end, { ["Prefer"] = 'outlook.timezone="' .. tz .. '"' })
+end
+
+-- Reply to a meeting invitation. response: "accept" | "decline" | "tentative"
+-- opts: { comment = string, send_response = boolean (default true) }
+local RESPONSE_ACTIONS = {
+  accept = "accept",
+  decline = "decline",
+  tentative = "tentativelyAccept",
+}
+
+function M.respond_event(event_id, response, opts, cb)
+  opts = opts or {}
+  local action = RESPONSE_ACTIONS[response]
+  if not action then cb(nil, "invalid response: " .. tostring(response)); return end
+  local body = {
+    comment = opts.comment or "",
+    sendResponse = opts.send_response ~= false,
+  }
+  graph_request_async("read", "POST", "/me/events/" .. event_id .. "/" .. action, body,
+    function(j, err)
+      if not j then cb(nil, err); return end
+      cb(j, nil)
+    end)
+end
+
+-- Create a Teams meeting in the user's default calendar.
+function M.create_event(payload, cb)
+  graph_request_async("read", "POST", "/me/events", payload, function(j, err)
+    if not j then cb(nil, err); return end
+    cb(j, nil)
+  end)
+end
+
+-- Delete an event the user owns (organizer).
+function M.delete_event(event_id, cb)
+  graph_request_async("read", "DELETE", "/me/events/" .. event_id, nil, function(j, err)
+    if not j then cb(nil, err); return end
+    cb(j, nil)
+  end)
+end
+
 local AVATAR_TTL = 7 * 24 * 3600
 local avatar_meta_cache = nil
 

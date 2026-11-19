@@ -115,6 +115,15 @@ local function get_unread_hl_group()
   return "DiagnosticInfo"
 end
 
+local function get_confirmed_hl_group()
+  local cfg = require("ms-teams.config").options
+  if cfg and cfg.highlights and cfg.highlights.meeting_confirmed
+      and cfg.highlights.meeting_confirmed ~= "" then
+    return cfg.highlights.meeting_confirmed
+  end
+  return "DiagnosticOk"
+end
+
 local function get_chat_type_icon(chat)
   local cfg = require("ms-teams.config").options
   if not cfg or not cfg.icons or not cfg.icons.enabled then return "" end
@@ -3746,6 +3755,976 @@ function M.show_user_from_chat(chat)
     end
     M.show_user_detail(uid, "current", member or name)
   end)
+end
+
+-- ── schedule (today / this week) ────────────────────────────────────────
+local function ev_dt(e, key)
+  local v = nv(e and e[key])
+  if type(v) == "table" then return nv(v.dateTime), nv(v.timeZone) end
+  return nil
+end
+
+local function fmt_hm(dt)
+  if not dt then return "" end
+  return dt:match("T(%d%d:%d%d)") or ""
+end
+
+local function fmt_day(s)
+  local y, m, d = tostring(s or ""):match("(%d%d%d%d)%-(%d%d)%-(%d%d)")
+  if y then return d .. "/" .. m .. "/" .. y end
+  return tostring(s or "")
+end
+
+local RESPONSE_LABELS = {
+  accepted = "accepted",
+  declined = "declined",
+  tentativelyAccepted = "tentative",
+  notResponded = "no response",
+  none = "no response",
+  organizer = "organizer",
+}
+
+local WEEKDAYS = { "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday" }
+
+local function add_days(date, n)
+  local y, m, d = tostring(date or ""):match("(%d%d%d%d)%-(%d%d)%-(%d%d)")
+  if not y then return date end
+  local t = os.time({ year = tonumber(y), month = tonumber(m), day = tonumber(d), hour = 12 })
+  return os.date("%Y-%m-%d", t + n * 86400)
+end
+
+local function date_to_os(date)
+  local y, m, d = tostring(date or ""):match("^(%d%d%d%d)%-(%d%d)%-(%d%d)")
+  if not y then return nil end
+  return os.time({ year = tonumber(y), month = tonumber(m), day = tonumber(d), hour = 12 })
+end
+
+local function week_start(date)
+  local t = date_to_os(date)
+  if not t then return date end
+  local tt = os.date("*t", t)
+  local back = (tt.wday + 5) % 7
+  return os.date("%Y-%m-%d", t - back * 86400)
+end
+
+local function event_line(e, now)
+  local sdt = ev_dt(e, "start")
+  local edt = ev_dt(e, "end")
+  local allday = nv(e.isAllDay) == true
+  local start_s = allday and "all day" or fmt_hm(sdt)
+  local end_s = (not allday and fmt_hm(edt) ~= "") and ("–" .. fmt_hm(edt)) or ""
+  local marks = {}
+  if nv(e.isCancelled) then table.insert(marks, "cancelled") end
+  local s19 = sdt and sdt:sub(1, 19) or ""
+  local e19 = edt and edt:sub(1, 19) or ""
+  if not nv(e.isCancelled) and e19 ~= "" and e19 < now then
+    table.insert(marks, "past")
+  elseif s19 ~= "" and s19 <= now and (e19 == "" or e19 >= now) then
+    table.insert(marks, "now")
+  end
+  if nv(e.isOnlineMeeting) then table.insert(marks, "online") end
+  local mark_s = #marks > 0 and ("  [" .. table.concat(marks, ", ") .. "]") or ""
+  local subject = nv(e.subject) or "(no subject)"
+  local loc = nv(nv(e.location) and nv(nv(e.location).displayName)) or ""
+  local line = string.format("%s%s  %s%s", start_s, end_s, subject, mark_s)
+  if loc ~= "" then line = line .. "  @ " .. loc end
+  return line
+end
+
+-- Shared list keymaps: open the meeting in current / vsplit / split.
+local function bind_common_open(buf, get_event)
+  set_key(buf, "common", "open", function()
+    local e = get_event()
+    if e then M.show_meeting(e, "current") end
+  end, { desc = "Meeting details (current window)" })
+  set_key(buf, "common", "open_vsplit", function()
+    local e = get_event()
+    if e then M.show_meeting(e, "vsplit") end
+  end, { desc = "Meeting details (vertical split)" })
+  set_key(buf, "common", "open_split", function()
+    local e = get_event()
+    if e then M.show_meeting(e, "split") end
+  end, { desc = "Meeting details (horizontal split)" })
+end
+
+local function apply_confirmed_hl(buf, confirmed)
+  local ns = vim.api.nvim_create_namespace("ms_teams_schedule_confirmed")
+  pcall(vim.api.nvim_buf_clear_namespace, buf, ns, 0, -1)
+  if not confirmed or #confirmed == 0 then return end
+  local hl = get_confirmed_hl_group()
+  for _, lnum in ipairs(confirmed) do
+    pcall(vim.api.nvim_buf_add_highlight, buf, ns, hl, lnum - 1, 0, eol_col(buf, lnum))
+  end
+end
+
+-- Float with the schedule keymaps; a normal scratch buffer, so it can be
+-- focused, selected and yanked. q/<Esc> closes it.
+local function open_keymap_float(title, items)
+  local lines = { "# " .. title, "" }
+  for _, it in ipairs(items) do
+    table.insert(lines, string.format("%-12s %s", it[1], it[2]))
+  end
+  local width = 20
+  for _, l in ipairs(lines) do width = math.max(width, #l) end
+  width = math.min(width + 2, math.max(20, vim.o.columns - 4))
+  local height = math.min(#lines, math.max(3, vim.o.lines - 6))
+  local buf = vim.api.nvim_create_buf(false, true)
+  vim.api.nvim_buf_set_option(buf, "filetype", "markdown")
+  vim.api.nvim_buf_set_option(buf, "bufhidden", "wipe")
+  vim.api.nvim_buf_set_option(buf, "swapfile", false)
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+  local row = math.max(0, math.floor((vim.o.lines - height) / 2) - 1)
+  local col = math.max(0, math.floor((vim.o.columns - width) / 2))
+  local win = vim.api.nvim_open_win(buf, true, {
+    relative = "editor",
+    width = width,
+    height = height,
+    row = row,
+    col = col,
+    style = "minimal",
+    border = "rounded",
+    title = " " .. title .. " ",
+  })
+  vim.wo[win].wrap = false
+  vim.wo[win].cursorline = true
+  local function close()
+    if vim.api.nvim_win_is_valid(win) then pcall(vim.api.nvim_win_close, win, true) end
+    if vim.api.nvim_buf_is_valid(buf) then pcall(vim.api.nvim_buf_delete, buf, { force = true }) end
+  end
+  vim.keymap.set("n", "q", close, { buffer = buf })
+  vim.keymap.set("n", "<Esc>", close, { buffer = buf })
+end
+
+-- New-meeting form helpers ------------------------------------------------
+local function meeting_field(buf, label)
+  local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+  local pat_paren = "^" .. label .. "%s*%b()%s*:%s*(.*)$"
+  local pat_plain = "^" .. label .. "%s*:%s*(.*)$"
+  for i, l in ipairs(lines) do
+    local v = l:match(pat_paren)
+    if v == nil then v = l:match(pat_plain) end
+    if v ~= nil then return i, (v:gsub("^%s+", ""):gsub("%s+$", "")) end
+  end
+  return nil, nil
+end
+
+local function meeting_block(buf, name)
+  local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+  local begin_pat = "^%-%-%- BEGIN " .. name .. " %-%-%-$"
+  local end_pat = "^%-%-%- END " .. name .. " %-%-%-$"
+  local inside, out = false, {}
+  for _, l in ipairs(lines) do
+    if l:match(begin_pat) then
+      inside = true
+    elseif l:match(end_pat) then
+      inside = false
+      break
+    elseif inside then
+      table.insert(out, l)
+    end
+  end
+  return (table.concat(out, "\n"):gsub("^%s+", ""):gsub("%s+$", ""))
+end
+
+local function parse_meeting_date(v)
+  local d, m, y = tostring(v or ""):match("^(%d%d?)/(%d%d?)/(%d%d%d%d)$")
+  if not d then return nil end
+  local t = os.time({ year = tonumber(y), month = tonumber(m), day = tonumber(d), hour = 12 })
+  local tt = os.date("*t", t)
+  if tt.year ~= tonumber(y) or tt.month ~= tonumber(m) or tt.day ~= tonumber(d) then
+    return nil
+  end
+  return t
+end
+
+local function parse_meeting_time(v)
+  local h, m = tostring(v or ""):match("^(%d%d?):(%d%d)$")
+  if not h then return nil end
+  h, m = tonumber(h), tonumber(m)
+  if h > 23 or m > 59 then return nil end
+  return h, m
+end
+
+local function parse_meeting_attendees(v)
+  local out, bad = {}, {}
+  for raw in tostring(v or ""):gmatch("[^,\n]+") do
+    local entry = raw:gsub("^%s+", ""):gsub("%s+$", "")
+    if entry ~= "" then
+      -- one entry must contain at most one <email>; two angle groups mean
+      -- the user forgot the comma/newline between attendees
+      local lt = select(2, entry:gsub("<", ""))
+      local gt = select(2, entry:gsub(">", ""))
+      if lt ~= gt or lt > 1 then
+        table.insert(bad, entry)
+      else
+        local name, email
+        if lt == 1 then
+          name, email = entry:match("^(.-)%s*<([^<>]+)>$")
+          name = name and name:gsub("^%s+", ""):gsub("%s+$", "")
+          if name and name:find("[<>]") then name, email = nil, nil end
+        else
+          email = entry
+        end
+        email = email and email:gsub("^%s+", ""):gsub("%s+$", "")
+        if email and email:match("^[^@%s]+@[^@%s]+%.[^@%s]+$") then
+          table.insert(out, {
+            name = (name and name ~= "") and name or nil,
+            address = email,
+          })
+        else
+          table.insert(bad, entry)
+        end
+      end
+    end
+  end
+  return out, bad
+end
+
+local function prompt_date(default, cb)
+  vim.ui.input({ prompt = "Date (DD/MM/YYYY): ", default = fmt_day(default) }, function(v)
+    if v == nil then return end
+    local t = parse_meeting_date(v)
+    if not t then
+      vim.notify("invalid date, use DD/MM/YYYY", vim.log.levels.ERROR)
+      return
+    end
+    cb(os.date("%Y-%m-%d", t))
+  end)
+end
+
+-- Editable form buffer: :w (or <C-s>) creates the Teams meeting. Each field
+-- shows its expected format until valid, then a green check.
+function M.new_meeting(default_date, on_created)
+  for _, b in ipairs(vim.api.nvim_list_bufs()) do
+    if vim.api.nvim_buf_is_valid(b)
+        and vim.api.nvim_buf_get_name(b):find("ms-teams://meeting-new", 1, true) then
+      local win = vim.fn.bufwinid(b)
+      if win ~= -1 then
+        vim.api.nvim_set_current_win(win)
+      else
+        vim.cmd("vsplit")
+        vim.api.nvim_win_set_buf(0, b)
+      end
+      vim.notify("finish or close the existing new-meeting buffer", vim.log.levels.INFO)
+      return
+    end
+  end
+
+  local buf = vim.api.nvim_create_buf(true, false)
+  vim.api.nvim_buf_set_option(buf, "buftype", "acwrite")
+  vim.api.nvim_buf_set_option(buf, "swapfile", false)
+  vim.api.nvim_buf_set_option(buf, "buflisted", true)
+  vim.api.nvim_buf_set_option(buf, "filetype", "markdown")
+  pcall(vim.api.nvim_buf_set_name, buf, "ms-teams://meeting-new")
+  local function hints_line()
+    local parts = {}
+    local k = km("new_meeting", "save")
+    if k then table.insert(parts, k .. " create") end
+    k = km("new_meeting", "close")
+    if k then table.insert(parts, k .. " close") end
+    return "Hints: " .. table.concat(parts, " | ")
+  end
+
+  local date = default_date or os.date("%Y-%m-%d")
+  local lines = {
+    "# New Teams meeting",
+    "",
+    "## Edit the values and save (:w) to create it.",
+    "",
+    "Subject: ",
+    "Date (DD/MM/YYYY): " .. fmt_day(date),
+    "Start (HH:MM): 09:00",
+    "Duration (minutes): 30",
+    "Attendees (comma separated, multiline):",
+    "--- BEGIN ATTENDEES ---",
+    "",
+    "--- END ATTENDEES ---",
+    "",
+    "Description (multiline):",
+    "--- BEGIN DESCRIPTION ---",
+    "",
+    "--- END DESCRIPTION ---",
+    "",
+    hints_line(),
+  }
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+  vim.cmd("vsplit")
+  vim.api.nvim_win_set_buf(0, buf)
+
+  local ns = vim.api.nvim_create_namespace("ms_teams_new_meeting")
+  local function validate()
+    if not vim.api.nvim_buf_is_valid(buf) then return false end
+    pcall(vim.api.nvim_buf_clear_namespace, buf, ns, 0, -1)
+    local l_sub, subj = meeting_field(buf, "Subject")
+    local l_date, dval = meeting_field(buf, "Date")
+    local l_start, sval = meeting_field(buf, "Start")
+    local l_dur, durval = meeting_field(buf, "Duration")
+    local l_att = meeting_field(buf, "Attendees")
+    local attval = meeting_block(buf, "ATTENDEES")
+    local l_desc = meeting_field(buf, "Description")
+    local desc = meeting_block(buf, "DESCRIPTION")
+
+    local date_os = dval and parse_meeting_date(dval) or nil
+    local hh, mi = sval and parse_meeting_time(sval) or nil
+    local dur = tonumber(durval)
+    local emails, bad_emails = parse_meeting_attendees(attval)
+
+    local ok, first_bad = true, nil
+    local green = { { "  ✓", "DiagnosticOk" } }
+    local function red(reason) return { { "  ✗ " .. reason, "DiagnosticError" } } end
+    local function hint(text) return { { "  " .. text, "Comment" } } end
+    local function mark(lnum, chunks, bad)
+      if not lnum then return end
+      local line = vim.api.nvim_buf_get_lines(buf, lnum - 1, lnum, false)[1] or ""
+      pcall(vim.api.nvim_buf_set_extmark, buf, ns, lnum - 1, #line, {
+        virt_text = chunks, virt_text_pos = "eol", hl_mode = "combine",
+      })
+      if bad then ok = false; first_bad = first_bad or lnum end
+    end
+
+    if not l_sub then ok = false end
+    if not subj or subj == "" then
+      mark(l_sub, red("required"), true)
+    else
+      mark(l_sub, green)
+    end
+
+    if not l_date then ok = false end
+    if not dval or dval == "" then
+      mark(l_date, hint("DD/MM/YYYY"), true)
+    elseif not date_os then
+      mark(l_date, red("DD/MM/YYYY"), true)
+    else
+      mark(l_date, green)
+    end
+
+    if not l_start then ok = false end
+    if not sval or sval == "" then
+      mark(l_start, hint("HH:MM"), true)
+    elseif not hh then
+      mark(l_start, red("HH:MM"), true)
+    else
+      mark(l_start, green)
+    end
+
+    if not l_dur then ok = false end
+    if not dur or dur <= 0 then
+      mark(l_dur, red("positive minutes"), true)
+    else
+      mark(l_dur, green)
+    end
+
+    if not l_att then ok = false end
+    if bad_emails and #bad_emails > 0 then
+      mark(l_att, red("bad email: " .. table.concat(bad_emails, ", ")), true)
+    elseif emails and #emails > 0 then
+      mark(l_att, green)
+    else
+      mark(l_att, { { "  ✓", "DiagnosticOk" }, { " optional", "Comment" } })
+    end
+
+    if not l_desc then ok = false end
+    if desc and desc ~= "" then
+      mark(l_desc, green)
+    else
+      mark(l_desc, hint("optional"))
+    end
+
+    return ok, first_bad, {
+      subject = subj,
+      date = date_os,
+      hh = hh,
+      mi = mi,
+      duration = dur,
+      attendees = emails or {},
+      description = desc or "",
+    }
+  end
+
+  local creating = false
+  local function save()
+    if creating then return end
+    local ok, first_bad, v = validate()
+    if not ok then
+      vim.schedule(function()
+        vim.notify("fix the marked fields before saving", vim.log.levels.WARN)
+        if first_bad then pcall(vim.api.nvim_win_set_cursor, 0, { first_bad, 0 }) end
+      end)
+      return
+    end
+    local t = os.date("*t", v.date)
+    local start_os = os.time({
+      year = t.year, month = t.month, day = t.day,
+      hour = v.hh, min = v.mi, sec = 0,
+    })
+    local end_os = start_os + v.duration * 60
+    local tz = require("ms-teams.config").options.timezone or "UTC"
+    local payload = {
+      subject = v.subject,
+      start = { dateTime = os.date("%Y-%m-%dT%H:%M:%S", start_os), timeZone = tz },
+      ["end"] = { dateTime = os.date("%Y-%m-%dT%H:%M:%S", end_os), timeZone = tz },
+      isOnlineMeeting = true,
+      onlineMeetingProvider = "teamsForBusiness",
+    }
+    if #v.attendees > 0 then
+      payload.attendees = {}
+      for _, a in ipairs(v.attendees) do
+        local ea = { address = a.address }
+        if a.name and a.name ~= "" then ea.name = a.name end
+        table.insert(payload.attendees, { emailAddress = ea, type = "required" })
+      end
+    end
+    if v.description ~= "" then
+      payload.body = { contentType = "text", content = v.description }
+    end
+    creating = true
+    vim.api.nvim_buf_set_option(buf, "modifiable", false)
+    vim.notify("creating Teams meeting...", vim.log.levels.INFO)
+    graph.create_event(payload, function(ev, err)
+      vim.schedule(function()
+        creating = false
+        if not vim.api.nvim_buf_is_valid(buf) then return end
+        vim.api.nvim_buf_set_option(buf, "modifiable", true)
+        if err or not ev then
+          vim.notify("create meeting failed: " .. tostring(err), vim.log.levels.ERROR)
+          return
+        end
+        vim.notify("Teams meeting created", vim.log.levels.INFO)
+        if on_created then on_created() end
+        pcall(vim.api.nvim_buf_delete, buf, { force = true })
+        M.show_meeting(ev, "vsplit")
+      end)
+    end)
+  end
+
+  local grp = vim.api.nvim_create_augroup("MsTeamsNewMeeting" .. buf, { clear = true })
+  vim.api.nvim_create_autocmd({ "TextChanged", "TextChangedI" }, {
+    group = grp,
+    buffer = buf,
+    callback = function() validate() end,
+  })
+  vim.api.nvim_create_autocmd("BufWriteCmd", {
+    group = grp,
+    buffer = buf,
+    callback = save,
+  })
+
+  set_key(buf, "new_meeting", "save", save, { desc = "Create meeting" })
+  set_key(buf, "new_meeting", "close", function()
+    vim.api.nvim_buf_delete(buf, { force = true })
+  end)
+  vim.defer_fn(validate, 50)
+end
+
+local function open_schedule_buf(name, open_mode)
+  local buf
+  for _, b in ipairs(vim.api.nvim_list_bufs()) do
+    if vim.api.nvim_buf_is_valid(b) and vim.api.nvim_buf_get_name(b) == name then
+      buf = b
+      break
+    end
+  end
+  if not buf then
+    buf = vim.api.nvim_create_buf(true, false)
+    vim.api.nvim_buf_set_option(buf, "filetype", "markdown")
+    set_listed_scratch(buf, name)
+  end
+  local win = vim.fn.bufwinid(buf)
+  local min_height = math.max(12, math.min(25, math.floor(vim.o.lines * 0.5)))
+  if win ~= -1 then
+    vim.api.nvim_set_current_win(win)
+    if vim.api.nvim_win_get_height(win) < 12 then
+      pcall(vim.api.nvim_win_set_height, win, min_height)
+    end
+  elseif open_mode == "current" then
+    vim.api.nvim_win_set_buf(0, buf)
+  else
+    vim.cmd("split")
+    vim.api.nvim_win_set_buf(0, buf)
+    pcall(vim.cmd, "resize " .. min_height)
+  end
+  pcall(vim.api.nvim_buf_set_option, buf, "buflisted", true)
+  vim.wo.wrap = false
+  local wrap_grp = vim.api.nvim_create_augroup("MsTeamsScheduleWrap" .. buf, { clear = true })
+  vim.api.nvim_create_autocmd("BufWinEnter", {
+    group = wrap_grp,
+    buffer = buf,
+    callback = function() vim.wo.wrap = false end,
+  })
+  return buf
+end
+
+function M.show_schedule(open_mode, date)
+  local opts = require("ms-teams.config").options.schedule or {}
+  local buf = open_schedule_buf("ms-teams://schedule", open_mode)
+  local line_event, current_date = {}, date
+  local function keymap_items()
+    local items = {}
+    local function add(section, action, label)
+      local k = km(section, action)
+      if k then table.insert(items, { k, label }) end
+    end
+    add("common", "open", "details (current window)")
+    add("common", "open_vsplit", "details (vertical split)")
+    add("common", "open_split", "details (horizontal split)")
+    add("schedule", "week", "week view")
+    add("schedule", "new", "new meeting")
+    add("schedule", "next", "next day")
+    add("schedule", "prev", "previous day")
+    add("schedule", "date", "go to date")
+    add("schedule", "current", "current day")
+    add("schedule", "refresh", "refresh")
+    add("schedule", "help", "keymaps")
+    add("schedule", "close", "close")
+    return items
+  end
+  local function hint_line()
+    local k = km("schedule", "help")
+    return k and ("Hints: " .. k .. " see keymappings") or ""
+  end
+  local function render(events, meta)
+    if not vim.api.nvim_buf_is_valid(buf) then return end
+    line_event = {}
+    current_date = (meta and meta.date) or current_date
+    local list = {}
+    for _, e in ipairs(events) do
+      if not (opts.hide_cancelled and nv(e.isCancelled)) then table.insert(list, e) end
+    end
+    local title = (meta and meta.date == os.date("%Y-%m-%d")) and "Today's meetings" or "Meetings"
+    local lines = { "# " .. title .. " — " .. fmt_day(meta and meta.date) .. " (" .. #list .. ")",
+      hint_line(), "" }
+    local now = (meta and meta.now) or ""
+    local confirmed = {}
+    for _, e in ipairs(list) do
+      table.insert(lines, event_line(e, now))
+      line_event[#lines] = e
+      if nv(nv(e.responseStatus) and nv(nv(e.responseStatus).response)) == "accepted" then
+        table.insert(confirmed, #lines)
+      end
+    end
+    if #list == 0 then table.insert(lines, "_no meetings_") end
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+    apply_confirmed_hl(buf, confirmed)
+  end
+  local function load(d)
+    d = d or current_date or os.date("%Y-%m-%d")
+    current_date = d
+    if vim.api.nvim_buf_is_valid(buf) then
+      vim.api.nvim_buf_set_lines(buf, 0, -1, false, { "# Meetings — " .. fmt_day(d), "", "_loading..._" })
+    end
+    graph.get_calendar_day(function(events, err, meta)
+      vim.schedule(function()
+        if not vim.api.nvim_buf_is_valid(buf) then return end
+        if err then
+          vim.api.nvim_buf_set_lines(buf, 0, -1, false,
+            { "# Meetings — " .. fmt_day(d), "", "_failed: " .. tostring(err):sub(1, 200) .. "_" })
+          return
+        end
+        render(events or {}, meta)
+      end)
+    end, d)
+  end
+
+  bind_common_open(buf, function() return line_event[vim.api.nvim_win_get_cursor(0)[1]] end)
+  pcall(vim.api.nvim_buf_set_var, buf, "ms_teams_schedule_reload", load)
+  set_key(buf, "schedule", "week", function() M.show_schedule_week("current", current_date) end,
+    { desc = "Week view" })
+  set_key(buf, "schedule", "new", function()
+    M.new_meeting(current_date or os.date("%Y-%m-%d"), load)
+  end, { desc = "New Teams meeting" })
+  set_key(buf, "schedule", "next", function()
+    load(add_days(current_date or os.date("%Y-%m-%d"), 1))
+  end, { desc = "Next day" })
+  set_key(buf, "schedule", "prev", function()
+    load(add_days(current_date or os.date("%Y-%m-%d"), -1))
+  end, { desc = "Previous day" })
+  set_key(buf, "schedule", "date", function()
+    prompt_date(current_date or os.date("%Y-%m-%d"), load)
+  end, { desc = "Go to date" })
+  set_key(buf, "schedule", "current", function()
+    load(os.date("%Y-%m-%d"))
+  end, { desc = "Current day" })
+  set_key(buf, "schedule", "help", function()
+    open_keymap_float("Schedule keymaps", keymap_items())
+  end, { desc = "Keymaps" })
+  set_key(buf, "schedule", "refresh", load, { desc = "Refresh meetings" })
+  set_key(buf, "schedule", "close", function() vim.api.nvim_buf_delete(buf, { force = true }) end)
+  load(date)
+end
+
+function M.show_schedule_week(open_mode, date)
+  local opts = require("ms-teams.config").options.schedule or {}
+  local buf = open_schedule_buf("ms-teams://schedule-week", open_mode)
+  local line_event, line_day = {}, {}
+  local current_date = date and week_start(date) or nil
+  local function keymap_items()
+    local items = {}
+    local function add(section, action, label)
+      local k = km(section, action)
+      if k then table.insert(items, { k, label }) end
+    end
+    add("common", "open", "details (current window)")
+    add("common", "open_vsplit", "details (vertical split)")
+    add("common", "open_split", "details (horizontal split)")
+    add("schedule_week", "day", "day view")
+    add("schedule_week", "new", "new meeting")
+    add("schedule_week", "next", "next week")
+    add("schedule_week", "prev", "previous week")
+    add("schedule_week", "date", "go to date")
+    add("schedule_week", "current", "current week")
+    add("schedule_week", "refresh", "refresh")
+    add("schedule_week", "help", "keymaps")
+    add("schedule_week", "close", "close")
+    return items
+  end
+  local function hint_line()
+    local k = km("schedule_week", "help")
+    return k and ("Hints: " .. k .. " see keymappings") or ""
+  end
+  local function cursor_day()
+    return line_day[vim.api.nvim_win_get_cursor(0)[1]] or current_date or os.date("%Y-%m-%d")
+  end
+  local function render(events, meta)
+    if not vim.api.nvim_buf_is_valid(buf) then return end
+    line_event, line_day = {}, {}
+    local list = {}
+    for _, e in ipairs(events) do
+      if not (opts.hide_cancelled and nv(e.isCancelled)) then table.insert(list, e) end
+    end
+    local start_date = (meta and meta.date) or ""
+    current_date = start_date
+    local last_date = add_days(start_date, 6)
+    local days = {}
+    for i = 0, 6 do table.insert(days, add_days(start_date, i)) end
+    local by_day = {}
+    for _, e in ipairs(list) do
+      local sdt = ev_dt(e, "start")
+      local d = sdt and sdt:sub(1, 10) or start_date
+      if d < start_date then d = start_date end
+      if d >= start_date and d <= last_date then
+        by_day[d] = by_day[d] or {}
+        table.insert(by_day[d], e)
+      end
+    end
+    local lines = { "# Week — " .. fmt_day(start_date) .. " – " .. fmt_day(last_date) .. " (" .. #list .. ")",
+      hint_line(), "" }
+    local now = (meta and meta.now) or ""
+    local confirmed = {}
+    for i, d in ipairs(days) do
+      local evs = by_day[d] or {}
+      table.insert(lines, "## " .. WEEKDAYS[i] .. " " .. fmt_day(d) .. " (" .. #evs .. ")")
+      line_day[#lines] = d
+      if #evs == 0 then table.insert(lines, "_no meetings_") end
+      for _, e in ipairs(evs) do
+        table.insert(lines, event_line(e, now))
+        line_event[#lines] = e
+        line_day[#lines] = d
+        if nv(nv(e.responseStatus) and nv(nv(e.responseStatus).response)) == "accepted" then
+          table.insert(confirmed, #lines)
+        end
+      end
+      table.insert(lines, "")
+    end
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+    apply_confirmed_hl(buf, confirmed)
+  end
+  local function load(d)
+    d = week_start(d or current_date or os.date("%Y-%m-%d"))
+    current_date = d
+    if vim.api.nvim_buf_is_valid(buf) then
+      vim.api.nvim_buf_set_lines(buf, 0, -1, false, { "# Week — " .. fmt_day(d), "", "_loading..._" })
+    end
+    graph.get_calendar_week(function(events, err, meta)
+      vim.schedule(function()
+        if not vim.api.nvim_buf_is_valid(buf) then return end
+        if err then
+          vim.api.nvim_buf_set_lines(buf, 0, -1, false,
+            { "# Week — " .. fmt_day(d), "", "_failed: " .. tostring(err):sub(1, 200) .. "_" })
+          return
+        end
+        render(events or {}, meta)
+      end)
+    end, d)
+  end
+
+  bind_common_open(buf, function() return line_event[vim.api.nvim_win_get_cursor(0)[1]] end)
+  pcall(vim.api.nvim_buf_set_var, buf, "ms_teams_schedule_reload", load)
+  set_key(buf, "schedule_week", "day", function()
+    local today = os.date("%Y-%m-%d")
+    local target
+    if current_date == week_start(today) then
+      target = today
+    else
+      target = current_date or week_start(today)
+    end
+    M.show_schedule("current", target)
+  end, { desc = "Day view" })
+  set_key(buf, "schedule_week", "new", function()
+    M.new_meeting(cursor_day(), load)
+  end, { desc = "New Teams meeting" })
+  set_key(buf, "schedule_week", "next", function()
+    load(add_days(current_date or os.date("%Y-%m-%d"), 7))
+  end, { desc = "Next week" })
+  set_key(buf, "schedule_week", "prev", function()
+    load(add_days(current_date or os.date("%Y-%m-%d"), -7))
+  end, { desc = "Previous week" })
+  set_key(buf, "schedule_week", "date", function()
+    prompt_date(current_date or os.date("%Y-%m-%d"), load)
+  end, { desc = "Go to date" })
+  set_key(buf, "schedule_week", "current", function()
+    load(os.date("%Y-%m-%d"))
+  end, { desc = "Current week" })
+  set_key(buf, "schedule_week", "help", function()
+    open_keymap_float("Week keymaps", keymap_items())
+  end, { desc = "Keymaps" })
+  set_key(buf, "schedule_week", "refresh", load, { desc = "Refresh this week's meetings" })
+  set_key(buf, "schedule_week", "close", function() vim.api.nvim_buf_delete(buf, { force = true }) end)
+  load(date)
+end
+
+function M.show_meeting(event, open_mode)
+  if not event or event == vim.NIL then return end
+  local id = nv(event.id) or tostring(os.time())
+  local safe = id:gsub("[^%w%-_]", "_"):sub(1, 80)
+  local bufname = "ms-teams://meeting/" .. safe
+  local buf
+  for _, b in ipairs(vim.api.nvim_list_bufs()) do
+    if vim.api.nvim_buf_is_valid(b) and vim.api.nvim_buf_get_name(b) == bufname then
+      buf = b
+      break
+    end
+  end
+  if not buf then
+    buf = vim.api.nvim_create_buf(true, false)
+    vim.api.nvim_buf_set_option(buf, "filetype", "markdown")
+    set_listed_scratch(buf, bufname)
+  end
+  pcall(vim.api.nvim_buf_set_option, buf, "buflisted", true)
+  local win = vim.fn.bufwinid(buf)
+  if win ~= -1 then
+    vim.api.nvim_set_current_win(win)
+  else
+    if open_mode == "vsplit" then
+      vim.cmd("vsplit")
+    elseif open_mode == "split" then
+      vim.cmd("split")
+    end
+    vim.api.nvim_win_set_buf(0, buf)
+  end
+
+  local event_id = id
+  local resp = nv(nv(event.responseStatus) and nv(nv(event.responseStatus).response))
+  local sdt, stz = ev_dt(event, "start")
+  local edt = ev_dt(event, "end")
+  local allday = nv(event.isAllDay) == true
+  local om = nv(event.onlineMeeting)
+  local join = (om and nv(om.joinUrl)) or nv(event.onlineMeetingUrl) or ""
+  local web = nv(event.webLink) or ""
+  local body = extract_message_plain({ body = nv(event.body) })
+  local body_url = body:match("https?://[^%s<>\"']+")
+  local url = join ~= "" and join or (web ~= "" and web or (body_url or ""))
+
+  local lines = { "# " .. (nv(event.subject) or "(no subject)"), "", "## Details", "" }
+  local function add(label, val)
+    val = nv(val)
+    if val ~= nil and tostring(val) ~= "" then
+      table.insert(lines, "- **" .. label .. "**: " .. tostring(val))
+    end
+  end
+  local when = allday and ("all day, " .. fmt_day(sdt))
+    or (fmt_hm(sdt) .. "–" .. fmt_hm(edt) .. " " .. fmt_day(sdt) .. (stz and (" (" .. stz .. ")") or ""))
+  add("When", when)
+  add("Status", nv(event.showAs))
+  add("Type", nv(event.type))
+  add("Importance", nv(event.importance))
+  if nv(event.isCancelled) then add("Cancelled", "yes") end
+  if nv(event.isOnlineMeeting) then add("Online", nv(event.onlineMeetingProvider) or "yes") end
+  local org = nv(nv(event.organizer) and nv(nv(event.organizer).emailAddress))
+  if org then
+    local oname = nv(org.name) or ""
+    local oaddr = nv(org.address) or ""
+    add("Organizer", oname .. (oaddr ~= "" and (" <" .. oaddr .. ">") or ""))
+  end
+  add("Location", nv(nv(event.location) and nv(nv(event.location).displayName)))
+  if join ~= "" then add("Join URL", join) end
+  if web ~= "" then add("Web link", web) end
+  local cats = nv(event.categories)
+  if type(cats) == "table" and #cats > 0 then add("Categories", table.concat(cats, ", ")) end
+  add("Sensitivity", nv(event.sensitivity))
+  add("Response", nv(nv(event.responseStatus) and nv(nv(event.responseStatus).response)))
+  add("Created", nv(event.createdDateTime))
+  add("Updated", nv(event.lastModifiedDateTime))
+  if nv(event.seriesMasterId) then add("Series", "recurring instance") end
+  if nv(event.hasAttachments) then add("Attachments", "yes") end
+
+  table.insert(lines, "")
+  table.insert(lines, "## Description")
+  table.insert(lines, "")
+  if body ~= "" then
+    for line in body:gmatch("[^\n]+") do table.insert(lines, line) end
+  else
+    table.insert(lines, "_no description_")
+  end
+  table.insert(lines, "")
+
+  local atts = nv(event.attendees)
+  if type(atts) == "table" and #atts > 0 then
+    table.insert(lines, "## Attendees (" .. #atts .. ")")
+    for _, a in ipairs(atts) do
+      if a ~= vim.NIL then
+        local em = nv(a.emailAddress)
+        local name = (em and nv(em.name)) or "?"
+        local addr = (em and nv(em.address)) or ""
+        local st = nv(nv(a.status) and nv(nv(a.status).response)) or ""
+        st = RESPONSE_LABELS[st] or st
+        local ty = nv(a.type) or ""
+        table.insert(lines, string.format("- %s%s%s%s", name,
+          addr ~= "" and (" <" .. addr .. ">") or "",
+          st ~= "" and (" — " .. st) or "",
+          ty ~= "" and (" (" .. ty .. ")") or ""))
+      end
+    end
+    table.insert(lines, "")
+  end
+
+  local hint = {}
+  local k = km("meeting_detail", "open_url")
+  if k then table.insert(hint, k .. " open URL") end
+  k = km("meeting_detail", "copy_url")
+  if k then table.insert(hint, k .. " copy URL") end
+  k = km("meeting_detail", "accept")
+  if k then table.insert(hint, k .. " accept") end
+  k = km("meeting_detail", "decline")
+  if k then table.insert(hint, k .. " decline") end
+  k = km("meeting_detail", "tentative")
+  if k then table.insert(hint, k .. " tentative") end
+  k = km("meeting_detail", "refresh")
+  if k then table.insert(hint, k .. " refresh") end
+  if resp == "organizer" then
+    k = km("meeting_detail", "delete")
+    if k then table.insert(hint, k .. " delete") end
+  end
+  k = km("meeting_detail", "close")
+  if k then table.insert(hint, k .. " close") end
+  table.insert(lines, "Hints: " .. table.concat(hint, " | "))
+
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+  vim.api.nvim_buf_set_var(buf, "ms_teams_meeting_url", url)
+  vim.api.nvim_buf_set_var(buf, "ms_teams_meeting_event", event)
+
+  set_key(buf, "meeting_detail", "open_url", function()
+    local u = vim.b[buf].ms_teams_meeting_url
+    if not u or u == "" then vim.notify("no URL for this meeting", vim.log.levels.INFO); return end
+    if vim.ui and vim.ui.open then vim.ui.open(u) else vim.fn.jobstart({ "open", u }, { detach = true }) end
+  end, { desc = "Open meeting URL" })
+  set_key(buf, "meeting_detail", "copy_url", function()
+    local u = vim.b[buf].ms_teams_meeting_url
+    if not u or u == "" then vim.notify("no URL for this meeting", vim.log.levels.INFO); return end
+    pcall(vim.fn.setreg, "+", u)
+    vim.notify("meeting URL copied", vim.log.levels.INFO)
+  end, { desc = "Copy meeting URL" })
+  set_key(buf, "meeting_detail", "close", function() vim.api.nvim_buf_delete(buf, { force = true }) end)
+
+  local function respond(kind)
+    if not event_id then
+      vim.notify("meeting has no id", vim.log.levels.WARN)
+      return
+    end
+    if resp == "organizer" then
+      vim.notify("you are the organizer of this meeting", vim.log.levels.INFO)
+      return
+    end
+    if nv(event.isCancelled) then
+      vim.notify("this meeting is cancelled", vim.log.levels.WARN)
+      return
+    end
+    local labels = { accept = "ACCEPT", decline = "DECLINE", tentative = "TENTATIVE" }
+    local function send()
+      graph.respond_event(event_id, kind, { send_response = true }, function(_, err)
+        vim.schedule(function()
+          if err then
+            vim.notify("meeting response failed: " .. tostring(err), vim.log.levels.ERROR)
+            return
+          end
+          local new = kind == "accept" and "accepted"
+            or (kind == "decline" and "declined" or "tentativelyAccepted")
+          if type(event.responseStatus) ~= "table" then event.responseStatus = {} end
+          event.responseStatus.response = new
+          vim.notify("meeting " .. new, vim.log.levels.INFO)
+          M.show_meeting(event, "current")
+        end)
+      end)
+    end
+    local prompt = "Send " .. (labels[kind] or kind) .. " response to the organizer?"
+    if vim.ui and vim.ui.select then
+      vim.ui.select({ "Yes", "No" }, { prompt = prompt }, function(choice)
+        if choice == "Yes" then send() end
+      end)
+    else
+      if vim.fn.confirm(prompt, "&Yes\n&No", 2) == 1 then send() end
+    end
+  end
+  set_key(buf, "meeting_detail", "accept", function() respond("accept") end,
+    { desc = "Accept meeting" })
+  set_key(buf, "meeting_detail", "decline", function() respond("decline") end,
+    { desc = "Decline meeting" })
+  set_key(buf, "meeting_detail", "tentative", function() respond("tentative") end,
+    { desc = "Tentatively accept meeting" })
+  set_key(buf, "meeting_detail", "refresh", function()
+    if not event_id then
+      vim.notify("meeting has no id", vim.log.levels.WARN)
+      return
+    end
+    vim.notify("refreshing meeting...", vim.log.levels.INFO)
+    graph.get_event(event_id, function(fresh, err)
+      vim.schedule(function()
+        if err or not fresh then
+          vim.notify("refresh failed: " .. tostring(err), vim.log.levels.ERROR)
+          return
+        end
+        M.show_meeting(fresh, "current")
+      end)
+    end)
+  end, { desc = "Refresh meeting" })
+  set_key(buf, "meeting_detail", "delete", function()
+    if not event_id then
+      vim.notify("meeting has no id", vim.log.levels.WARN)
+      return
+    end
+    if resp ~= "organizer" then
+      vim.notify("only meetings you created can be deleted", vim.log.levels.WARN)
+      return
+    end
+    local function do_delete()
+      graph.delete_event(event_id, function(_, err)
+        vim.schedule(function()
+          if err then
+            vim.notify("delete failed: " .. tostring(err), vim.log.levels.ERROR)
+            return
+          end
+          vim.notify("meeting deleted", vim.log.levels.INFO)
+          -- refresh any open day/week schedule buffers
+          for _, b in ipairs(vim.api.nvim_list_bufs()) do
+            if vim.api.nvim_buf_is_valid(b) then
+              local ok, reload = pcall(vim.api.nvim_buf_get_var, b, "ms_teams_schedule_reload")
+              if ok and type(reload) == "function" then pcall(reload) end
+            end
+          end
+          if vim.api.nvim_buf_is_valid(buf) then
+            pcall(vim.api.nvim_buf_delete, buf, { force = true })
+          end
+        end)
+      end)
+    end
+    local prompt = "Delete this meeting? Attendees will be notified."
+    if vim.ui and vim.ui.select then
+      vim.ui.select({ "Yes", "No" }, { prompt = prompt }, function(choice)
+        if choice == "Yes" then do_delete() end
+      end)
+    else
+      if vim.fn.confirm(prompt, "&Yes\n&No", 2) == 1 then do_delete() end
+    end
+  end, { desc = "Delete meeting" })
 end
 
 function M.show_messages(chat, open)

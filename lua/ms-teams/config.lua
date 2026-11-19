@@ -36,6 +36,8 @@ M.defaults = {
   highlights = {
     unread = "DiagnosticInfo",
     search = "DiagnosticUnderlineError",
+    -- accepted meetings in the day/week schedule (unaccepted use default)
+    meeting_confirmed = "DiagnosticOk",
   },
    -- icons for chats: type (emoji defaults, configurable)
    icons = {
@@ -62,6 +64,12 @@ M.defaults = {
   -- Per-buffer keymaps. Override any action; nil/false disables the mapping.
   -- Defaults are deep-merged, so you only need to set what changes.
   keymaps = {
+    -- shared by list buffers: open the item in current window / vsplit / split
+    common = {
+      open = "<CR>",
+      open_vsplit = "<C-v>",
+      open_split = "<C-s>",
+    },
     -- chat list buffer (:MSTeamsChats)
     chat_list = {
       open = "<CR>",
@@ -112,6 +120,42 @@ M.defaults = {
       refresh = "R",
       close = "q",
     },
+    schedule = {
+      week = "<Tab>",
+      new = "<C-n>",
+      next = "K",
+      prev = "J",
+      date = "gd",
+      current = "go",
+      help = "g?",
+      refresh = "R",
+      close = "q",
+    },
+    schedule_week = {
+      day = "<S-Tab>",
+      new = "<C-n>",
+      next = "K",
+      prev = "J",
+      date = "gd",
+      current = "go",
+      help = "g?",
+      refresh = "R",
+      close = "q",
+    },
+    new_meeting = {
+      save = "<C-s>",
+      close = "q",
+    },
+    meeting_detail = {
+      open_url = "gx",
+      copy_url = "yu",
+      accept = "A",
+      decline = "D",
+      tentative = "T",
+      refresh = "R",
+      delete = "X",
+      close = "q",
+    },
   },
   -- Keep open 1:1 chat buffers up to date. Graph has no push for chat
   -- messages (change notifications need a public HTTPS endpoint), so the
@@ -135,6 +179,11 @@ M.defaults = {
     notify_self = true, -- preview doesn't contain sender, so keep true
     mentions_only = true, -- only notify when you / @Everyone / @Todos are mentioned
     debug = false,
+  },
+  -- Today's meetings (:MSTeamsSchedule). hide_cancelled=false shows all,
+  -- including all-day and already-finished events (marked in the list).
+  schedule = {
+    hide_cancelled = false,
   },
   -- channels carry no server-side read state; unread is inferred from the
   -- latest message vs local reference (mr override or messages cache). When

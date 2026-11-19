@@ -1,0 +1,474 @@
+*ms-teams.txt*          Microsoft Teams chats inside Neovim
+                                                        *ms-teams*
+
+==============================================================================
+CONTENTS                                                *ms-teams-contents*
+
+  1. Overview ................................ |ms-teams-overview|
+  2. Setup ................................... |ms-teams-setup|
+  3. Authentication .......................... |ms-teams-authentication|
+  4. Architecture ............................ |ms-teams-architecture|
+  5. Commands ................................ |ms-teams-commands|
+  6. Keymaps ................................. |ms-teams-keymaps|
+  7. User detail ............................. |ms-teams-user-detail|
+  8. Schedule ................................ |ms-teams-schedule|
+  9. Live refresh (1:1 chats) ................ |ms-teams-live-refresh|
+ 10. Searching in a chat ..................... |ms-teams-search|
+ 11. Storage ................................. |ms-teams-storage|
+
+==============================================================================
+1. OVERVIEW                                             *ms-teams-overview*
+
+Read and answer Microsoft Teams chats inside Neovim.
+
+This plugin is still early-stage and unstable: breaking changes happen
+without notice and parts of the UI are rough. Use at your own risk.
+
+Authentication is built on top of DavMail; see
+|ms-teams-authentication|. In short, the plugin reuses the DavMail
+refresh token and exchanges it for Microsoft Graph access tokens.
+
+Requirements:
+  - Neovim 0.9+
+  - `curl` and `python3` in `PATH`
+  - telescope.nvim for MSTeamsFind/MSTeamsNewChat
+  - Optional: `terminal-notifier` (macOS) or `notify-send` (Linux) for
+    watch notifications
+  - Optional: image.nvim + ImageMagick for inline profile avatars
+
+==============================================================================
+2. SETUP                                                    *ms-teams-setup*
+
+lazy.nvim example: >
+
+  {
+    "jugarpeupv/microsoft-teams.nvim",
+    cmd = {
+      "MSTeamsChats", "MSTeamsLogin", "MSTeamsFind", "MSTeamsTeams",
+      "MSTeamsSchedule", "MSTeamsScheduleWeek",
+    },
+    keys = {
+      { "<leader>ee", "<cmd>MSTeamsChats<cr>" },
+      { "<leader>ef", "<cmd>MSTeamsFind<cr>" },
+    },
+    config = function()
+      require("ms-teams").setup({
+        davmail = {
+          enabled = true,
+          auth_cmd = "davmail-token",
+        },
+        -- pin a Chrome profile holding the M365 session for gx:
+        -- open_cmd = {
+        --   "open", "-a", "Google Chrome", "--args",
+        --   "--profile-directory=Profile 3",
+        -- },
+        watch = { enabled = true, interval_ms = 120000 },
+      })
+    end,
+  }
+<
+The complete setup options are the defaults in
+`lua/ms-teams/config.lua` (`M.defaults`).
+
+The plugin requires |telescope.nvim|. For watch notifications install
+`terminal-notifier` (macOS) or `notify-send` (Linux).
+
+==============================================================================
+3. AUTHENTICATION                                *ms-teams-authentication*
+
+The plugin does not implement its own OAuth login. It reuses the refresh
+token written by DavMail and exchanges it for Microsoft Graph access
+tokens.
+
+3.1 Authenticate with DavMail
+-----------------------------
+
+Authenticate once with DavMail's interactive token mode
+(`davmail-token`, a JavaFX browser window for the Microsoft login). It
+writes `oauth_tokens.env`; the path comes from
+`davmail.oauth.tokenFilePath` in `~/.davmail.properties`.
+
+The `davmail-token` alias runs the DavMail jar in token mode. Add it to
+your shell profile and adjust the jar path to your install: >
+
+  alias davmail-token='JAVA_HOME=$HOME/.sdkman/candidates/java/current \
+    java --add-exports java.base/sun.net.www.protocol.https=ALL-UNNAMED \
+    -jar /opt/homebrew/Cellar/davmail/6.8.1/libexec/davmail.jar \
+    <(cat ~/.davmail.properties; echo "davmail.mode=O365Interactive") -token'
+<
+It loads `~/.davmail.properties` (including `davmail.oauth.scope` and
+`davmail.oauth.tokenFilePath`), forces `davmail.mode=O365Interactive`,
+and `-token` prints or saves the refresh token instead of starting the
+gateway.
+
+3.2 How the plugin uses the token
+---------------------------------
+
+`lua/ms-teams/davmail_token.lua` reads the refresh token and
+`lua/ms-teams/auth.lua` exchanges it for Graph access tokens, cached in
+`stdpath("data")/ms-teams/davmail_access.json` with mode 600.
+
+  - Plaintext tokens are supported and tested.
+  - Tokens stored as `{AES}` are decrypted by delegating to DavMail's
+    own `O365Token.load()` through a small Java helper compiled against
+    `davmail.jar`. This path is untested. The decryption password comes
+    from `davmail.password` in `setup()`, else `davmail.oauth.password`
+    in `.davmail.properties`, else an empty string.
+  - If the token file is missing or empty, the plugin can auto-launch
+    the configured `davmail.auth_cmd` (default `davmail-token`).
+  - Extra Graph scopes beyond the ones DavMail requests go in
+    `davmail.oauth.scope` in `.davmail.properties`; re-run
+    `davmail-token` afterwards to reconsent.
+
+The relevant setup options: >
+
+  require("ms-teams").setup({
+    davmail = {
+      enabled = true,
+      auth_cmd = "davmail-token",
+      -- password = "...", -- only for {AES} tokens
+    },
+  })
+<
+3.3 Legacy OAuth flow
+---------------------
+
+A legacy first-party client (`a8759234-4b8b-4d94-8c0a-ee1ab73af270`)
+with its own OAuth flow still exists in `lua/ms-teams/auth.lua`, but it
+is untested. DavMail mode is the only supported path right now.
+
+==============================================================================
+4. ARCHITECTURE                                      *ms-teams-architecture*
+
+>
+  DavMail oauth_tokens.env -> davmail_token.lua -> auth.lua
+        (refresh token,       (decrypt + refresh    (token
+         {AES} or plain)       -> access token)      provider)
+                                                        |
+                                                        v
+                                             graph.lua -> Microsoft Graph
+                                             (curl via      (chats, messages,
+                                              vim.system)    teams, tabs, files)
+                                                        |
+                                                        v
+                                             ui.lua -> scratch buffers
+                                             (ms-teams://... + Telescope
+                                              render + gx)    pickers)
+  watch.lua -> poll lastMessagePreview -> terminal-notifier / notify-send
+  cache.lua -> chats/teams/messages JSON under stdpath("data")/ms-teams
+  config.lua -> setup() options (scope, icons, watch, open_cmd, davmail)
+<
+  - Auth flow: every Graph call goes through `auth.get_token()` /
+    `ensure_token_async()`, which prefer the DavMail token when
+    `davmail.enabled` is true.
+  - Tabs/files: `tabReference` attachments are resolved via
+    `GET /chats/{id}/tabs`; SharePoint files prefer a `createLink`
+    (`/:x:/...?e=...`) sharing URL so they open without an interactive
+    login. `gx` opens SharePoint URLs with `?web=1` (Excel Online,
+    collaborative) using the configurable `open_cmd`.
+  - Watch: single-instance polling (`data_dir/watch.lock`) while Neovim
+    is open; notifies on new messages/mentions even if focus is in
+    Chrome.
+
+==============================================================================
+5. COMMANDS                                              *ms-teams-commands*
+
+:MSTeamsLogin                                          *:MSTeamsLogin*
+:MSTeamsCode {url}                                      *:MSTeamsCode*
+:MSTeamsLoginCancel                                *:MSTeamsLoginCancel*
+        Legacy OAuth flow (untested; DavMail mode is supported).
+
+:MSTeamsRegisterProtocol                    *:MSTeamsRegisterProtocol*
+        macOS `ms-appx-web://` protocol handler (legacy flow).
+
+:MSTeamsStatus                                        *:MSTeamsStatus*
+        Token status and expiry.
+
+:MSTeamsTokenScopes                              *:MSTeamsTokenScopes*
+        Scopes of the current access token.
+
+:MSTeamsChats                                          *:MSTeamsChats*
+        Recent chats list. `R` refresh, `g?` participants, `mr`/`mu` mark
+        read/unread. Chats with the same name get a short id suffix.
+
+:MSTeamsSchedule                                    *:MSTeamsSchedule*
+        Today's meetings. `<CR>`/`<C-v>`/`<C-s>` details, `<Tab>` week,
+        `R` refresh, `q` close.
+
+:MSTeamsScheduleWeek                            *:MSTeamsScheduleWeek*
+        This week's meetings. `<CR>`/`<C-v>`/`<C-s>` details, `<S-Tab>`
+        day, `R` refresh, `q` close.
+
+:MSTeamsTeams                                          *:MSTeamsTeams*
+        Teams and channels.
+
+:MSTeamsFind                                            *:MSTeamsFind*
+        Telescope fuzzy find over chats (`<C-b>` unread/all).
+
+:MSTeamsNewChat                                      *:MSTeamsNewChat*
+        New chat picking a user via Telescope.
+
+:MSTeamsReply                                          *:MSTeamsReply*
+        Reply in the current chat buffer (`S` in a chat also works).
+
+:MSTeamsWatchStart                                *:MSTeamsWatchStart*
+:MSTeamsWatchStop                                  *:MSTeamsWatchStop*
+:MSTeamsWatchStatus                              *:MSTeamsWatchStatus*
+:MSTeamsWatchPoll                                  *:MSTeamsWatchPoll*
+:MSTeamsWatchRestart                            *:MSTeamsWatchRestart*
+        Watch polling controls.
+
+==============================================================================
+6. KEYMAPS                                                *ms-teams-keymaps*
+
+Keymaps are configurable per buffer under `keymaps`:
+
+  - `common`          shared list keymaps (schedule day/week)
+  - `chat_list`       |:MSTeamsChats| list
+  - `msteams_finder`  |:MSTeamsFind| picker
+  - `chat_detail`     chat detail buffer
+  - `user_detail`     user detail buffer
+  - `schedule`        |:MSTeamsSchedule| day view
+  - `schedule_week`   |:MSTeamsScheduleWeek| week view
+  - `new_meeting`     new meeting form
+  - `meeting_detail`  meeting detail buffer
+
+Defaults are deep-merged, so only override what changes. Setting an
+action to `false` (or `""`) removes its mapping and its hint.
+
+Example: >
+
+  require("ms-teams").setup({
+    keymaps = {
+      chat_list = {
+        open = "go",            -- default: <CR>
+        mark_read = "mr",       -- also works on a visual selection
+        user_detail = "mp",     -- 1:1 chat under cursor
+      },
+      msteams_finder = {
+        open = "<CR>",
+        user_detail = "<C-i>",  -- 1:1 only; groups/channels rejected
+        quickfix = "<C-q>",
+      },
+      chat_detail = {
+        user_detail = "gu",     -- default: mp (1:1 only)
+        close = false,          -- disable q
+      },
+      user_detail = {
+        open_photo = "gx",
+        refresh = "R",
+      },
+      common = {
+        open = "<CR>",
+        open_vsplit = "<C-v>",
+        open_split = "<C-s>",
+      },
+      schedule = {
+        week = "<Tab>", new = "<C-n>",
+        next = "K", prev = "J", date = "gd", current = "go",
+        help = "g?", refresh = "R", close = "q",
+      },
+      schedule_week = {
+        day = "<S-Tab>", new = "<C-n>",
+        next = "K", prev = "J", date = "gd", current = "go",
+        help = "g?", refresh = "R", close = "q",
+      },
+      new_meeting = { save = "<C-s>", close = "q" },
+      meeting_detail = {
+        open_url = "gx", copy_url = "yu",
+        accept = "A", decline = "D", tentative = "T",
+        refresh = "R", delete = "X", close = "q",
+      },
+    },
+  })
+<
+The complete list of actions and default keys is the source of truth in
+`lua/ms-teams/config.lua` (`M.defaults.keymaps`).
+
+==============================================================================
+7. USER DETAIL                                        *ms-teams-user-detail*
+
+`mp` opens the selected user's detail buffer
+(`ms-teams://user-detail/<id>`):
+
+  - `<C-i>` in |:MSTeamsFind| (1:1 chats only; groups/channels show a
+    notice; override with `keymaps.msteams_finder.user_detail`),
+  - `mp` in |:MSTeamsChats| on a 1:1 chat (override with
+    `keymaps.chat_list.user_detail`),
+  - `mp` in a 1:1 chat buffer (override with
+    `keymaps.chat_detail.user_detail`; `nil`/`false` disables it),
+  - `<CR>` on a participant in `g?`.
+
+The buffer shows the Graph profile fields the token can read (name,
+email, job title, department, company, office, phones, language, city,
+country, account status, creation date) plus the profile photo. Profiles
+are cached in `stdpath("cache")/ms-teams/user_profiles.json`, so data
+fetched once stays visible during 429 windows; `R` forces a refresh
+(override with `keymaps.user_detail.refresh`). If the profile call is
+throttled and nothing is cached, the title still uses the name learned
+from chat members or the persisted identity cache, the member email is
+shown when available, and the id is shown as a field instead of the
+title.
+
+When image.nvim is available the avatar is rendered inline at the top of
+the buffer, cropped into a circle with ImageMagick like Teams; otherwise
+the cached path is shown and `gx` opens it. Photos are cached under
+`stdpath("cache")/ms-teams/avatars` and revalidated with their etag, so
+reopening a user costs no network.
+
+Names resolved through `/users` are persisted in
+`stdpath("cache")/ms-teams/user_names.json`, so the directory lookup
+queue stays idle across sessions instead of re-requesting the same ids.
+
+==============================================================================
+8. SCHEDULE                                            *ms-teams-schedule*
+
+:MSTeamsSchedule opens `ms-teams://schedule` with the current natural day's
+events from the default calendar (`/me/calendarView`, expanded recurrences)
+in `config.options.timezone`. All-day, cancelled and already-finished
+events are shown and marked (`[past]`, `[now]`, `[cancelled]`, `[online]`);
+set `schedule.hide_cancelled = true` to hide cancelled ones.
+
+:MSTeamsScheduleWeek opens `ms-teams://schedule-week` with Monday-Sunday of
+the current week, grouped under `## Monday 17/11/2026 (N)` headers (empty
+days show `_no meetings_`). From the day view `<Tab>` opens the week and
+from the week `<S-Tab>` goes back to the day, replacing the current window:
+if the displayed week is the current week it opens today, otherwise it
+opens that week's Monday. Both list buffers have `wrap` off.
+
+`J` / `K` move one day in the day view and one week in the week view. `gd`
+prompts for a date (`DD/MM/YYYY`): in the day view it shows that day; in
+the week view it jumps to the Monday-Sunday week containing that date.
+`go` returns to the current day/week.
+
+The hint line under the header is just
+`Hints: g? see keymappings`; `g?` opens a floating buffer listing every
+keymap for that schedule view. The float is a normal scratch buffer you
+can focus, select and yank; `q`/`<Esc>` closes it.
+
+Both lists share the `keymaps.common` keys: `<CR>` opens the meeting
+detail in the current window, `<C-v>` in a vertical split and `<C-s>` in a
+horizontal split. `<C-n>` opens the new-meeting form in a vertical split: >
+
+  # New Teams meeting
+
+  ## Edit the values and save (:w) to create it.
+
+  Subject:
+  Date (DD/MM/YYYY): 19/11/2026
+  Start (HH:MM): 09:00
+  Duration (minutes): 30
+  Attendees (comma separated, multiline):
+  --- BEGIN ATTENDEES ---
+
+  --- END ATTENDEES ---
+
+  Description (multiline):
+  --- BEGIN DESCRIPTION ---
+
+  --- END DESCRIPTION ---
+<
+Every field shows its expected format and a green check when valid (red
+cross otherwise); the required subject shows a red `required` until
+filled, and all invalid attendee entries are reported together. Attendees
+accept both `email@example.com` and `Name <email@example.com>`, separated
+by commas and/or newlines. Attendees and description are multiline blocks
+between their markers. Saving with `:w` or `<C-s>` creates the Teams
+meeting and sends the invites. `R` refreshes the list and `q` closes it.
+
+Events you have accepted are highlighted with
+`highlights.meeting_confirmed` (default `DiagnosticOk`); the rest keep the
+default highlight.
+
+`<CR>` on an event opens `ms-teams://meeting/<id>` with the full details:
+time, status, type, importance, organizer, location, join URL, web link,
+categories, response, created/updated, series, then the description and,
+as the last section, every attendee with their response (`accepted`,
+`declined`, `tentative`, `no response`) and role. `gx` opens the join URL
+(falling back to the web link or the first URL in the description), `yu`
+copies it, `R` re-fetches the event (useful after attendees reply) and `q`
+closes the detail.
+
+Reply to the invitation from the detail with `A` (accept), `D` (decline)
+or `T` (tentative); a confirmation prompt first asks whether to send the
+response to the organizer (`sendResponse: true`), then the buffer updates.
+Organizers and cancelled events are rejected with a notice. Override the
+keys with `keymaps.meeting_detail.accept/decline/tentative`.
+
+If you are the organizer, `X` deletes the meeting after a confirmation
+prompt (attendees are notified) and refreshes any open day/week list.
+Meetings you do not organize cannot be deleted from here.
+
+Requires `Calendars.Read`/`Calendars.ReadWrite` in the token (already part
+of the DavMail scopes used here).
+
+==============================================================================
+9. LIVE REFRESH (1:1 CHATS)                       *ms-teams-live-refresh*
+
+Microsoft Graph has no push channel usable from a local editor for chat
+messages (change notifications require a public HTTPS endpoint and
+60-minute subscription renewals; delta is not supported for chatMessage).
+Instead, an open 1:1 chat buffer is polled and new/updated messages are
+merged in place: >
+
+  require("ms-teams").setup({
+    refresh_one_to_one_chats_opts = {
+      enabled = true,
+      interval_ms = 10000,  -- clamped to a 10s minimum
+      top = 20,             -- newest messages merged on change
+      only_visible = true,  -- skip while the buffer is not on screen
+      lock = true,          -- single Neovim instance per chat
+    },
+  })
+<
+Only 1:1 chats are polled; groups, meetings and channels are not. A 429
+pauses polling for 60s instead of retrying.
+
+With `lock = true` (default) a per-chat lock under
+`stdpath("data")/ms-teams/live/` makes the poll follow the editor you are
+in: opening or focusing a 1:1 chat steals the lock from older instances
+(last one wins). The new owner announces the takeover (chat name +
+PID/process/cwd) and the previous owner pauses with its own notice naming
+the chat, e.g. `took over lock from PID 1234 (nvim) cwd=/home/me/proj`
+(new owner) and `live refresh lock for <chat> was taken over by ...` (old
+owner). Hiding/closing the buffer releases the lock, and a dead pid or a
+heartbeat older than `3 * interval` (min 30s) can be taken over. Set
+`lock = false` to let every instance poll independently.
+
+The chat-list watch (|:MSTeamsWatchStart|, `watch.enabled`) uses the same
+steal semantics for `stdpath("data")/ms-teams/watch.lock`: a newly started
+instance takes over and the previous one stops on its next poll with the
+same PID/process/cwd notice.
+
+==============================================================================
+10. SEARCHING IN A CHAT                                  *ms-teams-search*
+
+Inside a chat detail buffer:
+
+  - `g/`: search full history (server-side, smart-case: `hello` is
+    case-insensitive, `Hello` is case-sensitive). Results open in a
+    vertical split as snippets; `<CR>` (also `gx`/`gf`) moves the detail
+    cursor to the message, loading older history in the background if
+    needed, while focus stays in results. `<C-q>` sends results to the
+    quickfix list. `q` closes.
+  - `gF`: same search in a Telescope picker; `<CR>` jumps to the message,
+    `<C-q>` / `<M-q>` send all / selected results to the quickfix list,
+    then navigate with `:cnext` / `:cprev`.
+  - Jumped matches are underlined red (configurable via
+    `setup({ highlights = { search = "DiagnosticUnderlineError" } })`).
+
+==============================================================================
+11. STORAGE                                             *ms-teams-storage*
+
+  - `stdpath("data")/ms-teams/davmail_access.json` - cached Graph access
+    token (`chmod 600`)
+  - `stdpath("data")/ms-teams/chats.json`, `teams*.json` - list caches
+  - `stdpath("cache")/ms-teams/attachments` - downloaded images/files
+  - `stdpath("cache")/ms-teams/avatars` - cached profile photos
+    (etag-revalidated)
+  - `stdpath("cache")/ms-teams/user_profiles.json` - cached user profiles
+    (429-safe, `R` refreshes)
+  - `stdpath("cache")/ms-teams/user_names.json` - persisted id to
+    displayName cache
+
+ vim:tw=78:ts=8:noet:ft=help:norl:
