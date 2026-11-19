@@ -1,5 +1,211 @@
 local M = {}
 
+-- Configuration types. These annotations power completion and hover in
+-- `require("ms-teams").setup({...})` for LuaLS/EmmyLua users.
+---@class MsTeams.DavmailConfig
+---@field enabled? boolean Reuse the DavMail refresh token.
+---@field token_file? string Path to DavMail's oauth_tokens.env.
+---@field username? string DavMail username / email.
+---@field client_id? string OAuth client id used for the refresh.
+---@field tenant_id? string Tenant id ("common" by default).
+---@field redirect_uri? string OAuth redirect URI.
+---@field fingerprint? string DavMail token fingerprint.
+---@field password? string Password for {AES} tokens.
+---@field auth_cmd? string|string[]|false Command to obtain a token, or false to disable auto-launch.
+---@field auth_max_attempts? integer Fruitless auto-launch attempts before going quiet.
+
+---@class MsTeams.ClientConfig
+---@field client_id? string
+---@field redirect_uri? string
+---@field scope? string
+---@field name? string
+
+---@class MsTeams.HighlightsConfig
+---@field unread? string Highlight group for unread rows.
+---@field meeting_confirmed? string Highlight group for accepted meetings.
+
+---@class MsTeams.ChatTypeIcons
+---@field meeting? string
+---@field oneOnOne? string
+---@field groupChat? string
+---@field channel? string
+---@field default? string
+
+---@class MsTeams.IconsConfig
+---@field enabled? boolean
+---@field chatType? MsTeams.ChatTypeIcons
+---@field keycap_style? "circled"|"nerd"
+---@field keycap_icons? table<string, string>
+
+---@class MsTeams.KeymapsCommon
+---@field open? string|false
+---@field open_vsplit? string|false
+---@field open_split? string|false
+
+---@class MsTeams.KeymapsChatList
+---@field open? string|false
+---@field open_split? string|false
+---@field open_vsplit? string|false
+---@field search? string|false
+---@field help? string|false
+---@field toggle_unread? string|false
+---@field toggle_meeting? string|false
+---@field toggle_limit? string|false
+---@field refresh? string|false
+---@field hide? string|false
+---@field mark_read? string|false
+---@field mark_unread? string|false
+---@field user_detail? string|false
+---@field close? string|false
+
+---@class MsTeams.KeymapsFinder
+---@field open? string|false
+---@field open_split? string|false
+---@field open_vsplit? string|false
+---@field toggle_unread? string|false
+---@field mark_read? string|false
+---@field mark_unread? string|false
+---@field quickfix? string|false
+---@field quickfix_all? string|false
+---@field user_detail? string|false
+
+---@class MsTeams.KeymapsChatDetail
+---@field jump? string|false
+---@field reply? string|false
+---@field participants? string|false
+---@field help? string|false
+---@field search? string|false
+---@field open_link? string|false
+---@field refresh? string|false
+---@field load_older? string|false
+---@field mark_read? string|false
+---@field mark_unread? string|false
+---@field reactions_split? string|false
+---@field reactions_vsplit? string|false
+---@field user_detail? string|false
+---@field close? string|false
+
+---@class MsTeams.KeymapsUserDetail
+---@field open_photo? string|false
+---@field refresh? string|false
+---@field help? string|false
+---@field close? string|false
+
+---@class MsTeams.KeymapsChatSearch
+---@field search? string|false
+---@field jump? string|false
+---@field jump_focus? string|false
+---@field quickfix? string|false
+---@field help? string|false
+---@field close? string|false
+
+---@class MsTeams.KeymapsTeams
+---@field open? string|false
+---@field open_split? string|false
+---@field open_vsplit? string|false
+---@field search? string|false
+---@field help? string|false
+---@field refresh? string|false
+---@field close? string|false
+
+---@class MsTeams.KeymapsSchedule
+---@field week? string|false
+---@field new? string|false
+---@field next? string|false
+---@field prev? string|false
+---@field date? string|false
+---@field current? string|false
+---@field help? string|false
+---@field refresh? string|false
+---@field close? string|false
+
+---@class MsTeams.KeymapsScheduleWeek
+---@field day? string|false
+---@field new? string|false
+---@field next? string|false
+---@field prev? string|false
+---@field date? string|false
+---@field current? string|false
+---@field help? string|false
+---@field refresh? string|false
+---@field close? string|false
+
+---@class MsTeams.KeymapsNewMeeting
+---@field save? string|false
+---@field help? string|false
+---@field close? string|false
+
+---@class MsTeams.KeymapsMeetingDetail
+---@field open_url? string|false
+---@field copy_url? string|false
+---@field accept? string|false
+---@field decline? string|false
+---@field tentative? string|false
+---@field refresh? string|false
+---@field delete? string|false
+---@field help? string|false
+---@field close? string|false
+
+---@class MsTeams.KeymapsConfig
+---@field common? MsTeams.KeymapsCommon
+---@field chat_list? MsTeams.KeymapsChatList
+---@field msteams_finder? MsTeams.KeymapsFinder
+---@field chat_detail? MsTeams.KeymapsChatDetail
+---@field user_detail? MsTeams.KeymapsUserDetail
+---@field chat_search? MsTeams.KeymapsChatSearch
+---@field teams? MsTeams.KeymapsTeams
+---@field schedule? MsTeams.KeymapsSchedule
+---@field schedule_week? MsTeams.KeymapsScheduleWeek
+---@field new_meeting? MsTeams.KeymapsNewMeeting
+---@field meeting_detail? MsTeams.KeymapsMeetingDetail
+
+---@class MsTeams.LiveRefreshConfig
+---@field enabled? boolean
+---@field interval_ms? integer
+---@field top? integer
+---@field only_visible? boolean
+---@field lock? boolean
+
+---@class MsTeams.WatchConfig
+---@field enabled? boolean
+---@field interval_ms? integer
+---@field limit? integer
+---@field notifier? string|false
+---@field sound? string|false
+---@field vim_notify? boolean
+---@field notify_self? boolean
+---@field mentions_only? boolean
+---@field debug? boolean
+
+---@class MsTeams.ScheduleConfig
+---@field hide_cancelled? boolean
+
+---@class MsTeams.ChannelsConfig
+---@field unread_max_age_days? integer
+---@field auto_fetch? boolean
+
+---@class MsTeams.Config
+---@field data_dir? string
+---@field davmail? MsTeams.DavmailConfig
+---@field client? MsTeams.ClientConfig
+---@field graph_base? string
+---@field chat_top? integer
+---@field chat_search_top? integer
+---@field message_top? integer
+---@field date_format? string
+---@field timezone? string
+---@field highlights? MsTeams.HighlightsConfig
+---@field icons? MsTeams.IconsConfig
+---@field debug? boolean
+---@field auth_debug? boolean
+---@field open_cmd? string[]
+---@field keymaps? MsTeams.KeymapsConfig
+---@field refresh_one_to_one_chats_opts? MsTeams.LiveRefreshConfig
+---@field watch? MsTeams.WatchConfig
+---@field schedule? MsTeams.ScheduleConfig
+---@field channels? MsTeams.ChannelsConfig
+
+---@type MsTeams.Config
 M.defaults = {
   -- single source for storage
   data_dir = vim.fn.stdpath("data") .. "/ms-teams",
@@ -35,7 +241,6 @@ M.defaults = {
   -- highlights: group used for unread chats/messages (defaults to "DiagnosticInfo")
   highlights = {
     unread = "DiagnosticInfo",
-    search = "DiagnosticUnderlineError",
     -- accepted meetings in the day/week schedule (unaccepted use default)
     meeting_confirmed = "DiagnosticOk",
   },
@@ -102,9 +307,9 @@ M.defaults = {
     chat_detail = {
       jump = "<CR>",
       reply = "S",
-      participants = "g?",
-      search = "g/",
-      search_telescope = "gF",
+      participants = "gp",
+      help = "g?",
+      search = "F",
       open_link = "gx",
       refresh = "R",
       load_older = "gR",
@@ -117,6 +322,26 @@ M.defaults = {
     },
     user_detail = {
       open_photo = "gx",
+      refresh = "R",
+      help = "g?",
+      close = "q",
+    },
+    -- chat search results buffer (F in a chat)
+    chat_search = {
+      search = "F",
+      jump = "<CR>",
+      jump_focus = "<S-CR>",
+      quickfix = "<C-q>",
+      help = "g?",
+      close = "q",
+    },
+    -- :MSTeamsTeams teams/channels list
+    teams = {
+      open = "<CR>",
+      open_split = "<C-s>",
+      open_vsplit = "<C-v>",
+      search = "g/",
+      help = "g?",
       refresh = "R",
       close = "q",
     },
@@ -144,6 +369,7 @@ M.defaults = {
     },
     new_meeting = {
       save = "<C-s>",
+      help = "g?",
       close = "q",
     },
     meeting_detail = {
@@ -154,6 +380,7 @@ M.defaults = {
       tentative = "T",
       refresh = "R",
       delete = "X",
+      help = "g?",
       close = "q",
     },
   },
@@ -198,10 +425,13 @@ M.defaults = {
   },
 }
 
+---@type MsTeams.Config
 M.options = {}
 
+---@param opts? MsTeams.Config
+---@return MsTeams.Config
 function M.setup(opts)
-  M.options = vim.tbl_deep_extend("force", M.defaults, opts or {})
+  M.options = vim.tbl_deep_extend("force", M.defaults, opts or {}) --[[@as MsTeams.Config]]
   vim.fn.mkdir(M.options.data_dir, "p")
   return M.options
 end

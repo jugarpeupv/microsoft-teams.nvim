@@ -1,9 +1,14 @@
+-- Disclaimer: this plugin is vibe coded. The author's contribution is mainly
+-- the specification and checking that it works. Use at your own risk.
 local config = require("ms-teams.config")
 local auth = require("ms-teams.auth")
 local ui = require("ms-teams.ui")
 
+---@class MsTeams
+---@field setup fun(opts?: MsTeams.Config)
 local M = {}
 
+---@param opts? MsTeams.Config
 function M.setup(opts)
   vim.opt.hidden = true
   config.setup(opts)

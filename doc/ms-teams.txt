@@ -21,7 +21,9 @@ CONTENTS                                                *ms-teams-contents*
 
 Read and answer Microsoft Teams chats inside Neovim.
 
-This plugin is still early-stage and unstable: breaking changes happen
+This plugin is vibe coded: it was built with heavy AI assistance. The
+author's contribution is mainly the specification and checking that it
+works. It is still early-stage and unstable: breaking changes happen
 without notice and parts of the UI are rough. Use at your own risk.
 
 Authentication is built on top of DavMail; see
@@ -68,7 +70,10 @@ lazy.nvim example: >
   }
 <
 The complete setup options are the defaults in
-`lua/ms-teams/config.lua` (`M.defaults`).
+`lua/ms-teams/config.lua` (`M.defaults`). They are annotated as
+`MsTeams.Config` (EmmyLua/LuaLS), so LuaLS-compatible language servers
+provide completion and hover for the keys passed to
+`require("ms-teams").setup({...})`.
 
 The plugin requires |telescope.nvim|. For watch notifications install
 `terminal-notifier` (macOS) or `notify-send` (Linux).
@@ -106,7 +111,9 @@ gateway.
 
 `lua/ms-teams/davmail_token.lua` reads the refresh token and
 `lua/ms-teams/auth.lua` exchanges it for Graph access tokens, cached in
-`stdpath("data")/ms-teams/davmail_access.json` with mode 600.
+`stdpath("data")/ms-teams/davmail_access.json` with mode 600. The
+exchange uses the public Outlook (Microsoft Office) client ID, so no
+admin consent is required in your tenant.
 
   - Plaintext tokens are supported and tested.
   - Tokens stored as `{AES}` are decrypted by delegating to DavMail's
@@ -188,8 +195,9 @@ is untested. DavMail mode is the only supported path right now.
         Scopes of the current access token.
 
 :MSTeamsChats                                          *:MSTeamsChats*
-        Recent chats list. `R` refresh, `g?` participants, `mr`/`mu` mark
-        read/unread. Chats with the same name get a short id suffix.
+        Recent chats list. `R` refresh, `g?` keymaps, `mp` user detail,
+        `mr`/`mu` mark read/unread. Chats with the same name get a short id
+        suffix.
 
 :MSTeamsSchedule                                    *:MSTeamsSchedule*
         Today's meetings. `<CR>`/`<C-v>`/`<C-s>` details, `<Tab>` week,
@@ -227,6 +235,8 @@ Keymaps are configurable per buffer under `keymaps`:
   - `chat_list`       |:MSTeamsChats| list
   - `msteams_finder`  |:MSTeamsFind| picker
   - `chat_detail`     chat detail buffer
+  - `chat_search`     in-chat search results buffer
+  - `teams`           |:MSTeamsTeams| teams/channels list
   - `user_detail`     user detail buffer
   - `schedule`        |:MSTeamsSchedule| day view
   - `schedule_week`   |:MSTeamsScheduleWeek| week view
@@ -235,6 +245,9 @@ Keymaps are configurable per buffer under `keymaps`:
 
 Defaults are deep-merged, so only override what changes. Setting an
 action to `false` (or `""`) removes its mapping and its hint.
+
+Buffer sections with a `help` action (default `g?`) open a floating
+scratch buffer with that buffer's keymaps; `q`/`<Esc>` closes it.
 
 Example: >
 
@@ -252,11 +265,21 @@ Example: >
       },
       chat_detail = {
         user_detail = "gu",     -- default: mp (1:1 only)
+        participants = "gp",    -- default: gp
+        help = "g?",            -- keymaps float
         close = false,          -- disable q
+      },
+      chat_search = {
+        search = "F",           -- edit the query and search again
+        jump = "<CR>",          -- jump, keep focus in results
+        jump_focus = "<S-CR>",  -- jump and focus the chat
+        quickfix = "<C-q>",
+        help = "g?", close = "q",
       },
       user_detail = {
         open_photo = "gx",
         refresh = "R",
+        help = "g?",
       },
       common = {
         open = "<CR>",
@@ -273,11 +296,11 @@ Example: >
         next = "K", prev = "J", date = "gd", current = "go",
         help = "g?", refresh = "R", close = "q",
       },
-      new_meeting = { save = "<C-s>", close = "q" },
+      new_meeting = { save = "<C-s>", help = "g?", close = "q" },
       meeting_detail = {
         open_url = "gx", copy_url = "yu",
         accept = "A", decline = "D", tentative = "T",
-        refresh = "R", delete = "X", close = "q",
+        refresh = "R", delete = "X", help = "g?", close = "q",
       },
     },
   })
@@ -297,7 +320,7 @@ The complete list of actions and default keys is the source of truth in
     `keymaps.chat_list.user_detail`),
   - `mp` in a 1:1 chat buffer (override with
     `keymaps.chat_detail.user_detail`; `nil`/`false` disables it),
-  - `<CR>` on a participant in `g?`.
+  - `<CR>` on a participant in `gp`.
 
 The buffer shows the Graph profile fields the token can read (name,
 email, job title, department, company, office, phones, language, city,
@@ -342,7 +365,7 @@ the week view it jumps to the Monday-Sunday week containing that date.
 `go` returns to the current day/week.
 
 The hint line under the header is just
-`Hints: g? see keymappings`; `g?` opens a floating buffer listing every
+`Hints: g? see keymaps`; `g?` opens a floating buffer listing every
 keymap for that schedule view. The float is a normal scratch buffer you
 can focus, select and yank; `q`/`<Esc>` closes it.
 
@@ -445,17 +468,24 @@ same PID/process/cwd notice.
 
 Inside a chat detail buffer:
 
-  - `g/`: search full history (server-side, smart-case: `hello` is
+  - `F`: search full history (server-side, smart-case: `hello` is
     case-insensitive, `Hello` is case-sensitive). Results open in a
-    vertical split as snippets; `<CR>` (also `gx`/`gf`) moves the detail
-    cursor to the message, loading older history in the background if
-    needed, while focus stays in results. `<C-q>` sends results to the
-    quickfix list. `q` closes.
-  - `gF`: same search in a Telescope picker; `<CR>` jumps to the message,
-    `<C-q>` / `<M-q>` send all / selected results to the quickfix list,
-    then navigate with `:cnext` / `:cprev`.
-  - Jumped matches are underlined red (configurable via
-    `setup({ highlights = { search = "DiagnosticUnderlineError" } })`).
+    vertical split as snippets; `<CR>` (also `gx`/`gf`) jumps to the
+    message in the existing chat buffer, reusing it instead of opening a
+    new one. If that buffer is hidden it is shown in a vertical split;
+    if it no longer exists it is opened with `:vsplit`. Missing history
+    is loaded in the background and focus stays in results. `<S-CR>`
+    does the same but moves focus to the chat buffer. `<C-q>` sends
+    results to the quickfix list. `q` closes. Press `F` in the results
+    buffer to edit the current query and run the search again in place.
+    Quickfix entries point at the open chat buffer, so `<CR>` there jumps
+    to the message instead of opening another chat.
+  - The jumped query becomes the current search (`/` register and
+    `hlsearch`), so the match keeps the normal Search highlight across
+    re-renders until you run `:nohlsearch` or start another search. For
+    four seconds after the jump the whole message text also gets a red
+    underline (`MsTeamsSearchFlash`); only the underline is coloured, so
+    the text keeps the colorscheme foreground.
 
 ==============================================================================
 11. STORAGE                                             *ms-teams-storage*
