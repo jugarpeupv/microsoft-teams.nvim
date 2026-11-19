@@ -34,5 +34,5 @@ jobs:
         run: >-
           npx --yes
           --package semantic-release@24
-          --package conventional-changelog-conventionalcommits@10
+          --package conventional-changelog-conventionalcommits@9
           semantic-release
