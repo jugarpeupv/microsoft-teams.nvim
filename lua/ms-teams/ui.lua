@@ -2902,7 +2902,7 @@ local function detail_chat_id(buf)
   return nil
 end
 
--- Temporary red underline over the whole message; removed after 4s. The
+-- Temporary red underline over the whole message; removed after 2s. The
 -- highlight only sets the underline colour, so the text keeps the user's
 -- colorscheme foreground. The normal Search highlight (hlsearch) stays until
 -- :nohlsearch.
@@ -2947,7 +2947,7 @@ local function flash_message(detail_buf, lnum)
     if vim.api.nvim_buf_is_valid(detail_buf) then
       pcall(vim.api.nvim_buf_clear_namespace, detail_buf, search_flash_ns, 0, -1)
     end
-  end, 4000)
+  end, 2000)
 end
 
 local function jump_to_message(detail_buf, lnum, query, keep_focus)

@@ -483,7 +483,7 @@ Inside a chat detail buffer:
   - The jumped query becomes the current search (`/` register and
     `hlsearch`), so the match keeps the normal Search highlight across
     re-renders until you run `:nohlsearch` or start another search. For
-    four seconds after the jump the whole message text also gets a red
+    two seconds after the jump the whole message text also gets a red
     underline (`MsTeamsSearchFlash`); only the underline is coloured, so
     the text keeps the colorscheme foreground.
 
