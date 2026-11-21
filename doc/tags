@@ -4,6 +4,7 @@
 :MSTeamsLogin	ms-teams.txt	/*:MSTeamsLogin*
 :MSTeamsLoginCancel	ms-teams.txt	/*:MSTeamsLoginCancel*
 :MSTeamsNewChat	ms-teams.txt	/*:MSTeamsNewChat*
+:MSTeamsNotifications	ms-teams.txt	/*:MSTeamsNotifications*
 :MSTeamsRegisterProtocol	ms-teams.txt	/*:MSTeamsRegisterProtocol*
 :MSTeamsReply	ms-teams.txt	/*:MSTeamsReply*
 :MSTeamsSchedule	ms-teams.txt	/*:MSTeamsSchedule*
@@ -23,6 +24,7 @@ ms-teams-commands	ms-teams.txt	/*ms-teams-commands*
 ms-teams-contents	ms-teams.txt	/*ms-teams-contents*
 ms-teams-keymaps	ms-teams.txt	/*ms-teams-keymaps*
 ms-teams-live-refresh	ms-teams.txt	/*ms-teams-live-refresh*
+ms-teams-notifications	ms-teams.txt	/*ms-teams-notifications*
 ms-teams-overview	ms-teams.txt	/*ms-teams-overview*
 ms-teams-schedule	ms-teams.txt	/*ms-teams-schedule*
 ms-teams-search	ms-teams.txt	/*ms-teams-search*

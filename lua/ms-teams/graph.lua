@@ -403,6 +403,13 @@ local function range_bounds(kind, date)
   local tz = config.options.timezone
   local now = os.time()
   local function fallback()
+    if kind == "upcoming" then
+      local s = now
+      return os.date("!%Y-%m-%dT%H:%M:%SZ", s),
+        os.date("!%Y-%m-%dT%H:%M:%SZ", s + 7 * 86400),
+        os.date("%Y-%m-%d", s),
+        os.date("%Y-%m-%dT%H:%M:%S", now)
+    end
     local base_t
     if date and date ~= "" then
       local y, m, d = tostring(date):match("^(%d%d%d%d)%-(%d%d)%-(%d%d)")
@@ -437,6 +444,9 @@ else:
     base = datetime.now(tz)
 if mode == 'week':
     start = (base - timedelta(days=base.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+    end = start + timedelta(days=7)
+elif mode == 'upcoming':
+    start = datetime.now(tz)
     end = start + timedelta(days=7)
 else:
     start = base.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -502,6 +512,12 @@ end
 
 function M.get_calendar_week(cb, date)
   calendar_range("week", cb, date)
+end
+
+-- Upcoming events in the next 7 days (calendarView), used to surface pending
+-- meeting invitations in the notifications view.
+function M.get_upcoming_invites(cb)
+  calendar_range("upcoming", cb, nil)
 end
 
 -- Re-fetch a single event (meeting detail refresh, attendee responses, etc.)

@@ -230,6 +230,25 @@ local function notify(chat, preview)
     if fp then sender = nv(fp.displayName) or (type(fp)=="string" and fp or nil) end
   end
   if sender and sender ~= "" then body = sender .. ": " .. body end
+  -- remember this notification for :MSTeamsNotifications
+  pcall(function()
+    local cache = require("ms-teams.cache")
+    cache.add_notification({
+      kind = (config.options.watch and config.options.watch.mentions_only) and "mention" or "activity",
+      chat_id = nv(chat.id),
+      chat_name = title,
+      chat_type = nv(chat.chatType),
+      team_id = nv(chat.teamId),
+      message_id = nv(preview.id),
+      created_at = nv(preview.createdDateTime),
+      preview = body,
+      ts = os.time(),
+    })
+  end)
+  -- keep an open notifications buffer in sync with new watch activity
+  vim.schedule(function()
+    pcall(ui.reload_notifications_buffers)
+  end)
   local is_meeting = nv(chat.chatType) == "meeting"
   local joinUrl = nv(chat.webUrl) or nv(chat.onlineMeetingUrl)
   if is_meeting and joinUrl and joinUrl ~= "" then

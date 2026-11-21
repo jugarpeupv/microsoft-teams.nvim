@@ -58,6 +58,8 @@ and `{AES}` password), run inside Neovim:
 - Live refresh of visible 1:1 chats every 10s, with a per-chat lock so
   only one Neovim instance polls each chat.
 - Watch polling with `terminal-notifier` / `notify-send` notifications.
+- Notifications view (`:MSTeamsNotifications`): unread chats, mentions,
+  pending meeting invites and recent watch activity.
 - Per-buffer configurable keymaps (`g?` opens a floating keymap list) and
   throttle-safe caches.
 

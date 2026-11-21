@@ -99,6 +99,14 @@ local M = {}
 ---@field help? string|false
 ---@field close? string|false
 
+---@class MsTeams.KeymapsNotifications
+---@field open? string|false
+---@field open_vsplit? string|false
+---@field open_split? string|false
+---@field refresh? string|false
+---@field help? string|false
+---@field close? string|false
+
 ---@class MsTeams.KeymapsTeams
 ---@field open? string|false
 ---@field open_split? string|false
@@ -153,6 +161,7 @@ local M = {}
 ---@field chat_detail? MsTeams.KeymapsChatDetail
 ---@field user_detail? MsTeams.KeymapsUserDetail
 ---@field chat_search? MsTeams.KeymapsChatSearch
+---@field notifications? MsTeams.KeymapsNotifications
 ---@field teams? MsTeams.KeymapsTeams
 ---@field schedule? MsTeams.KeymapsSchedule
 ---@field schedule_week? MsTeams.KeymapsScheduleWeek
@@ -332,6 +341,15 @@ M.defaults = {
       jump = "<CR>",
       jump_focus = "<S-CR>",
       quickfix = "<C-q>",
+      help = "g?",
+      close = "q",
+    },
+    -- synthesized notifications / activity buffer (:MSTeamsNotifications)
+    notifications = {
+      open = "<CR>",
+      open_vsplit = "<C-v>",
+      open_split = "<C-s>",
+      refresh = "R",
       help = "g?",
       close = "q",
     },

@@ -141,4 +141,48 @@ function M.save_me(me)
   pcall(vim.fn.system, { "chmod", "600", path })
 end
 
+-- Recent watch/notification history for :MSTeamsNotifications. Stored under
+-- data (not cache) so it survives cache cleanup; capped to keep the file small.
+local function notifications_path()
+  local dir = vim.fn.stdpath("data") .. "/ms-teams"
+  vim.fn.mkdir(dir, "p")
+  return dir .. "/notifications.json"
+end
+
+function M.get_notifications(limit)
+  local path = notifications_path()
+  if vim.fn.filereadable(path) ~= 1 then return {} end
+  local ok, j = pcall(vim.json.decode, table.concat(vim.fn.readfile(path), "\n"))
+  if not ok or type(j) ~= "table" or type(j.items) ~= "table" then return {} end
+  local items = j.items
+  if limit and #items > limit then
+    local out = {}
+    for i = 1, limit do out[i] = items[i] end
+    return out
+  end
+  return items
+end
+
+function M.add_notification(entry)
+  if type(entry) ~= "table" then return end
+  local path = notifications_path()
+  local items = M.get_notifications()
+  local key = tostring(entry.chat_id or "") .. "|"
+    .. tostring(entry.message_id or entry.created_at or "")
+  local out = { entry }
+  for _, it in ipairs(items) do
+    local k = tostring(it.chat_id or "") .. "|"
+      .. tostring(it.message_id or it.created_at or "")
+    if k ~= key then table.insert(out, it) end
+    if #out >= 200 then break end
+  end
+  vim.fn.writefile({ vim.json.encode({ items = out }) }, path)
+  pcall(vim.fn.system, { "chmod", "600", path })
+end
+
+function M.clear_notifications()
+  local path = notifications_path()
+  if vim.fn.filereadable(path) == 1 then vim.fn.delete(path) end
+end
+
 return M

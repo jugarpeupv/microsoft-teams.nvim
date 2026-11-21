@@ -2300,6 +2300,7 @@ function M.pick_chats()
       chat.viewpoint.lastMessageReadDateTime = now_iso
       -- clears highlight on this list + any other list buffer, no re-render
       M.update_chat_list_unread_state(cid, false)
+      pcall(M.reload_notifications_buffers)
     end
     set_key(buf, "chat_list", "mark_read", function()
       local lnum = vim.api.nvim_win_get_cursor(0)[1]
@@ -2378,6 +2379,7 @@ function M.pick_chats()
       if chat.viewpoint == vim.NIL then chat.viewpoint = {} end
       chat.viewpoint.lastMessageReadDateTime = "1970-01-01T00:00:00Z"
       M.update_chat_list_unread_state(cid, true)
+      pcall(M.reload_notifications_buffers)
     end
     set_key(buf, "chat_list", "mark_unread", function()
       local lnum = vim.api.nvim_win_get_cursor(0)[1]
@@ -4827,6 +4829,445 @@ function M.show_meeting(event, open_mode)
   end, { desc = "Delete meeting" })
 end
 
+-- Synthesized notifications/activity view. Teams' real activity feed has no
+-- public Graph read API, so this aggregates what we do have: unread chats,
+-- mentions seen by the watcher, pending meeting invites and recent watch
+-- activity.
+function M.show_notifications(open_mode)
+  local buf = open_schedule_buf("ms-teams://notifications", open_mode)
+  local cache = require("ms-teams.cache")
+  local graph = require("ms-teams.graph")
+  local state = { chats = nil, invites = nil, invite_loading = true, chat_loading = false }
+  local line_item = {}
+  local seen_mention = {}
+
+  local function get_me_info()
+    local me = cache.load("me", 86400 * 365)
+    if me and me.id then return me end
+    return { id = vim.g.ms_teams_me_id, displayName = vim.g.ms_teams_me_name }
+  end
+
+  local function preview_text(p)
+    local raw = nv(p.body)
+    if type(raw) == "table" then raw = nv(raw.content) end
+    raw = raw or nv(p.summary) or ""
+    raw = tostring(raw):gsub("<[^>]+>", "")
+      :gsub("&nbsp;", " "):gsub("&amp;", "&"):gsub("&lt;", "<")
+      :gsub("&gt;", ">"):gsub("&quot;", '"')
+    raw = raw:gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
+    if #raw > 160 then raw = raw:sub(1, 157) .. "..." end
+    return raw
+  end
+
+  local function preview_sender(p)
+    local f = nv(p.from)
+    local s = f and sender_display_name(f) or nil
+    return (s and s ~= "" and s) or nil
+  end
+
+  local function mentions_me(p, me)
+    if not p then return false end
+    local raw = nv(p.body)
+    if type(raw) == "table" then raw = nv(raw.content) end
+    local low = tostring(raw or nv(p.summary) or ""):lower()
+    if low:find("everyone", 1, true) or low:find("todos", 1, true)
+        or low:find("@channel", 1, true) or low:find("@general", 1, true) then
+      return true
+    end
+    if me and me.displayName and me.displayName ~= ""
+        and low:find(me.displayName:lower(), 1, true) then
+      return true
+    end
+    local mentions = nv(p.mentions)
+    if mentions and type(mentions) == "table" then
+      for _, m in ipairs(mentions) do
+        if m ~= vim.NIL then
+          local mid = nv(m.id) or (nv(m.mentioned) and nv(nv(m.mentioned).id))
+          if mid and me and me.id and mid == me.id then return true end
+          local mname = nv(m.displayName)
+          if mname and me and me.displayName and mname == me.displayName then return true end
+        end
+      end
+    end
+    return false
+  end
+
+  local function chat_of(it)
+    if it.chat then return it.chat end
+    return {
+      id = it.chat_id,
+      topic = it.chat_name,
+      chatType = it.chat_type or "group",
+      teamId = it.team_id,
+    }
+  end
+
+  local function history_item(it)
+    return {
+      kind = it.kind,
+      chat = chat_of(it),
+      chat_id = it.chat_id,
+      chat_name = it.chat_name,
+      message_id = it.message_id,
+      created_at = it.created_at,
+      preview = it.preview or "",
+      ts = it.ts,
+    }
+  end
+
+  local function build()
+    local me = get_me_info()
+    local chats = state.chats or {}
+    local by_id = {}
+    for _, c in ipairs(chats) do
+      local id = nv(c.id)
+      if id then by_id[id] = c end
+    end
+    local function mention_read(it)
+      local c = by_id[it.chat_id]
+      local last_read = cache.get_last_read(it.chat_id)
+      if not last_read and c then
+        local vp = nv(c.viewpoint)
+        last_read = vp and nv(vp.lastMessageReadDateTime)
+      end
+      if last_read and last_read ~= "" and it.created_at and it.created_at ~= ""
+          and it.created_at <= last_read then
+        return true
+      end
+      if c and not has_unread(c) then return true end
+      return false
+    end
+    local hist = cache.get_notifications(80)
+    local mentions, activity = {}, {}
+    seen_mention = {}
+    for _, it in ipairs(hist) do
+      local item = history_item(it)
+      local c = by_id[it.chat_id]
+      if c then item.chat = c end
+      if item.kind == "mention" then
+        if not mention_read(item) then
+          local key = tostring(item.chat_id or "") .. "|"
+            .. tostring(item.message_id or item.created_at or "")
+          if not seen_mention[key] then
+            seen_mention[key] = true
+            table.insert(mentions, item)
+          end
+        end
+      else
+        table.insert(activity, item)
+      end
+    end
+
+    local unread = {}
+    for _, c in ipairs(chats) do
+      if c ~= vim.NIL and nv(c.id) and nv(c.id) ~= "48:notes" and has_unread(c) then
+        local p = nv(c.lastMessagePreview)
+        local item = {
+          kind = "chat",
+          chat = c,
+          chat_id = nv(c.id),
+          message_id = p and nv(p.id) or nil,
+          created_at = p and nv(p.createdDateTime) or nv(c.lastUpdatedDateTime),
+          preview = p and preview_text(p) or "",
+          sender = p and preview_sender(p) or nil,
+        }
+        table.insert(unread, item)
+        if p and mentions_me(p, me) then
+          local key = tostring(item.chat_id or "") .. "|"
+            .. tostring(item.message_id or item.created_at or "")
+          if not seen_mention[key] then
+            seen_mention[key] = true
+            table.insert(mentions, {
+              kind = "mention",
+              chat = c,
+              chat_id = item.chat_id,
+              message_id = item.message_id,
+              created_at = item.created_at,
+              preview = (item.sender and (item.sender .. ": ") or "") .. item.preview,
+            })
+          end
+        end
+      end
+    end
+
+    local function tkey(it) return it.created_at or "" end
+    table.sort(mentions, function(a, b) return tkey(a) > tkey(b) end)
+    table.sort(unread, function(a, b) return tkey(a) > tkey(b) end)
+    table.sort(activity, function(a, b) return tkey(a) > tkey(b) end)
+
+    local invites = {}
+    for _, e in ipairs(state.invites or {}) do
+      if e ~= vim.NIL and not nv(e.isCancelled) then
+        local rs = nv(e.responseStatus)
+        local resp = rs and nv(rs.response) or ""
+        if resp == "notResponded" or resp == "none" then
+          table.insert(invites, { kind = "meeting", event = e })
+        end
+      end
+    end
+    table.sort(invites, function(a, b)
+      local as = nv(nv(a.event.start) and nv(nv(a.event.start).dateTime)) or ""
+      local bs = nv(nv(b.event.start) and nv(nv(b.event.start).dateTime)) or ""
+      return as < bs
+    end)
+
+    local lines = { "# Teams notifications", "" }
+    local map = {}
+    local function add(title, items, fmt)
+      table.insert(lines, "## " .. title .. " (" .. #items .. ")")
+      if #items == 0 then
+        table.insert(lines, "_none_")
+      else
+        for _, it in ipairs(items) do
+          local text = fmt(it)
+          if text and text ~= "" then
+            table.insert(lines, text)
+            map[#lines] = it
+          end
+        end
+      end
+      table.insert(lines, "")
+    end
+    local function fmt_chat(it)
+      local name = it.chat and format_chat(it.chat) or it.chat_name or "chat"
+      local time = it.created_at and format_date(it.created_at) or ""
+      local body = it.preview or ""
+      if body == "" then body = "new message" end
+      if it.sender and it.sender ~= "" and not body:find(it.sender, 1, true) then
+        body = it.sender .. ": " .. body
+      end
+      return string.format("● **%s** — %s%s", name, body,
+        time ~= "" and ("  _" .. time .. "_") or "")
+    end
+    add("Mentions", mentions, fmt_chat)
+    add("Unread chats", unread, fmt_chat)
+    add("Meeting invites", invites, function(it)
+      local e = it.event
+      local subject = nv(e.subject) or "(no subject)"
+      local start = nv(nv(e.start) and nv(nv(e.start).dateTime)) or ""
+      local org = nv(nv(e.organizer) and nv(nv(e.organizer).emailAddress))
+      local orgname = org and (nv(org.name) or nv(org.address)) or ""
+      local when = start ~= "" and (fmt_day(start) .. " " .. fmt_hm(start)) or ""
+      return string.format("● **%s** — %s%s", subject, when ~= "" and when or "pending",
+        orgname ~= "" and ("  _" .. orgname .. "_") or "")
+    end)
+    add("Recent activity", activity, fmt_chat)
+
+    if state.chat_loading then
+      table.insert(lines, "_loading chats..._")
+      table.insert(lines, "")
+    end
+    if state.invite_loading then
+      table.insert(lines, "_loading meeting invites..._")
+      table.insert(lines, "")
+    end
+    table.insert(lines, "---")
+    local hint = keymap_hint("notifications")
+    if hint then table.insert(lines, hint) end
+    return lines, map
+  end
+
+  local function render()
+    if not vim.api.nvim_buf_is_valid(buf) then return end
+    local lines, map = build()
+    local win = vim.fn.bufwinid(buf)
+    local view = nil
+    if win ~= -1 then
+      view = vim.api.nvim_win_call(win, function() return vim.fn.winsaveview() end)
+    end
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+    line_item = map
+    pcall(vim.api.nvim_buf_set_var, buf, "ms_teams_notifications_line_map", map)
+    if view and win ~= -1 then
+      pcall(vim.api.nvim_win_call, win, function() vim.fn.winrestview(view) end)
+    end
+  end
+
+  local function load(refresh)
+    local cc = cache.load("chats")
+    if cc and cc.chats then state.chats = cc.chats end
+    state.chat_loading = not state.chats
+    state.invites = nil
+    state.invite_loading = true
+    render()
+    if refresh or not state.chats then
+      graph.list_chats(function(chats, err)
+        vim.schedule(function()
+          if err or type(chats) ~= "table" then
+            if err then
+              vim.notify("notifications: chats failed: " .. tostring(err), vim.log.levels.WARN)
+            end
+          else
+            state.chats = chats
+            cache.save("chats", { chats = chats })
+          end
+          state.chat_loading = false
+          render()
+        end)
+      end, { all = true, limit = 100 })
+    end
+    graph.get_upcoming_invites(function(events, err)
+      vim.schedule(function()
+        if not events then
+          if err then
+            vim.notify("notifications: invites failed: " .. tostring(err), vim.log.levels.WARN)
+          end
+          events = {}
+        end
+        state.invites = events
+        state.invite_loading = false
+        render()
+      end)
+    end)
+  end
+
+  -- Fetch pages from the newest message backwards until target_id is found.
+  -- The open chat may have loaded only the latest (until-read) page with no
+  -- next link, so a mention can be older than what is already in the buffer.
+  local function fetch_history(chat, target_id, cb)
+    local chat_id = nv(chat.id)
+    if not chat_id then cb(false, {}, nil); return end
+    local is_channel = nv(chat.chatType) == "channel" and nv(chat.teamId) ~= nil
+    local team_id = nv(chat.teamId)
+    local function list(nl, page_cb)
+      if is_channel then
+        graph.list_channel_messages(team_id, chat_id, page_cb, nl)
+      else
+        graph.list_messages(chat_id, page_cb, nl)
+      end
+    end
+    local all, seen, pages, done = {}, {}, 0, false
+    local function step(nl)
+      pages = pages + 1
+      list(nl, function(msgs, err, next2)
+        if done then return end
+        if err or not msgs then
+          done = true
+          cb(false, all, next2)
+          return
+        end
+        local found = false
+        for _, m in ipairs(msgs) do
+          if m ~= vim.NIL and nv(m.id) and not seen[nv(m.id)] then
+            seen[nv(m.id)] = true
+            table.insert(all, m)
+            if nv(m.id) == target_id then found = true end
+          end
+        end
+        if found or not (next2 and next2 ~= "") or pages >= 40 then
+          done = true
+          cb(found, all, next2)
+          return
+        end
+        step(next2)
+      end)
+    end
+    step(nil)
+  end
+
+  local function open_item(item, mode)
+    if not item then vim.notify("no notification on this line", vim.log.levels.WARN); return end
+    if item.kind == "meeting" then
+      M.show_meeting(item.event, mode or "current")
+      return
+    end
+    local chat = item.chat or chat_of(item)
+    local target = item.message_id
+    local chat_id = nv(chat.id)
+    local function has_target(b)
+      if not b or not vim.api.nvim_buf_is_valid(b) then return false end
+      local okm, m = pcall(vim.api.nvim_buf_get_var, b, "ms_teams_id_to_lnum")
+      return okm and type(m) == "table" and m[target] ~= nil
+    end
+    local function jump_when_ready(attempts)
+      local b = resolve_detail_buf(chat, nil, target)
+      if has_target(b) then
+        ensure_message_and_jump(chat, b, target, "", false)
+        return
+      end
+      if attempts > 0 then
+        vim.defer_fn(function() jump_when_ready(attempts - 1) end, 150)
+      end
+    end
+    if not target then
+      M.show_messages(chat, mode or "current")
+      return
+    end
+    local existing = resolve_detail_buf(chat, nil, target)
+    if has_target(existing) then
+      ensure_message_and_jump(chat, existing, target, "", false)
+      return
+    end
+    vim.notify("loading history for notification...", vim.log.levels.INFO)
+    fetch_history(chat, target, function(found, all, next2)
+      if chat_id and all and #all > 0 then
+        local safe_id = chat_id:gsub("[^%w%-_:.]", "_"):sub(1, 60)
+        cache.save("messages_" .. safe_id, { messages = all, nextLink = next2 or "" })
+      end
+      if not found then
+        vim.notify("notification message was not found in the chat history", vim.log.levels.WARN)
+        M.show_messages(chat, mode or "current")
+        return
+      end
+      local b = resolve_detail_buf(chat, nil, target)
+      if b and silent_rerender(b, all, next2) and has_target(b) then
+        ensure_message_and_jump(chat, b, target, "", false)
+        return
+      end
+      M.show_messages(chat, mode or "current")
+      vim.defer_fn(function() jump_when_ready(20) end, 150)
+    end)
+  end
+
+  local function current_item()
+    local lnum = vim.api.nvim_win_get_cursor(0)[1]
+    return line_item[lnum]
+  end
+
+  set_key(buf, "notifications", "open", function()
+    open_item(current_item(), "current")
+  end, { desc = "Open notification" })
+  set_key(buf, "notifications", "open_vsplit", function()
+    open_item(current_item(), "vsplit")
+  end, { desc = "Open notification in vertical split" })
+  set_key(buf, "notifications", "open_split", function()
+    open_item(current_item(), "split")
+  end, { desc = "Open notification in split" })
+  set_key(buf, "notifications", "refresh", function() load(true) end,
+    { desc = "Refresh notifications" })
+  set_key(buf, "notifications", "help", function()
+    open_keymap_float("Notification keymaps", collect_keymap_items("notifications", {
+      { "open", "open notification" },
+      { "open_vsplit", "open in vertical split" },
+      { "open_split", "open in split" },
+      { "refresh", "refresh" },
+      { "help", "see keymaps" },
+      { "close", "close" },
+    }))
+  end, { desc = "Keymaps" })
+  set_key(buf, "notifications", "close", function()
+    if vim.api.nvim_buf_is_valid(buf) then
+      pcall(vim.api.nvim_buf_delete, buf, { force = true })
+    end
+  end)
+  pcall(vim.api.nvim_buf_set_var, buf, "ms_teams_notifications_reload", function()
+    local cc = cache.load("chats")
+    if cc and cc.chats then state.chats = cc.chats end
+    render()
+  end)
+  load(false)
+end
+
+function M.reload_notifications_buffers()
+  for _, b in ipairs(vim.api.nvim_list_bufs()) do
+    if vim.api.nvim_buf_is_valid(b)
+        and vim.api.nvim_buf_get_name(b):find("ms-teams://notifications", 1, true) then
+      local ok, reload = pcall(vim.api.nvim_buf_get_var, b, "ms_teams_notifications_reload")
+      if ok and type(reload) == "function" then pcall(reload) end
+    end
+  end
+end
+
 function M.show_messages(chat, open)
   open = open or "split"
   local chat_id = nv(chat.id)
@@ -5820,6 +6261,7 @@ function M.show_messages(chat, open)
             chat.viewpoint.lastMessageReadDateTime = now_iso
             -- Immediately update highlight on existing chats list buffer
             M.update_chat_list_unread_state(chat_id, false)
+            pcall(M.reload_notifications_buffers)
             vim.schedule(function()
               if vim.api.nvim_buf_is_valid(buf) then
                 local ns = vim.b[buf].ms_teams_ns or vim.api.nvim_create_namespace("ms_teams_msg_unread")
@@ -5909,6 +6351,7 @@ function M.show_messages(chat, open)
           chat.viewpoint.lastMessageReadDateTime = new_last_read
           -- Immediately update highlight on existing chats list buffer
           M.update_chat_list_unread_state(chat_id, true)
+          pcall(M.reload_notifications_buffers)
           require("ms-teams.graph").mark_chat_unread(chat_id, new_last_read, function(_, err_graph)
             if err_graph then
               vim.notify("mark_chat_unread remote failed: " .. tostring(err_graph), vim.log.levels.WARN)
@@ -7036,6 +7479,7 @@ function M.find_chats(opts)
             if chat.viewpoint == vim.NIL then chat.viewpoint = {} end
             chat.viewpoint.lastMessageReadDateTime = now_iso
             M.update_chat_list_unread_state(chat_id, false)
+            pcall(M.reload_notifications_buffers)
             refresh_picker_keep_selection("marked as read: " .. format_chat(chat))
           end)
         end)
@@ -7061,6 +7505,7 @@ function M.find_chats(opts)
             if chat.viewpoint == vim.NIL then chat.viewpoint = {} end
             chat.viewpoint.lastMessageReadDateTime = "1970-01-01T00:00:00Z"
             M.update_chat_list_unread_state(chat_id, true)
+            pcall(M.reload_notifications_buffers)
             refresh_picker_keep_selection("marked as unread: " .. format_chat(chat))
           end)
         end)

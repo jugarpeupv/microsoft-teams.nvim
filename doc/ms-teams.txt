@@ -14,7 +14,8 @@ CONTENTS                                                *ms-teams-contents*
   8. Schedule ................................ |ms-teams-schedule|
   9. Live refresh (1:1 chats) ................ |ms-teams-live-refresh|
  10. Searching in a chat ..................... |ms-teams-search|
- 11. Storage ................................. |ms-teams-storage|
+ 11. Notifications ........................... |ms-teams-notifications|
+ 12. Storage ................................. |ms-teams-storage|
 
 ==============================================================================
 1. OVERVIEW                                             *ms-teams-overview*
@@ -46,8 +47,9 @@ lazy.nvim example: >
   {
     "jugarpeupv/microsoft-teams.nvim",
     cmd = {
-      "MSTeamsChats", "MSTeamsLogin", "MSTeamsFind", "MSTeamsTeams",
-      "MSTeamsSchedule", "MSTeamsScheduleWeek",
+      "MSTeamsChats", "MSTeamsNotifications", "MSTeamsLogin",
+      "MSTeamsFind", "MSTeamsTeams", "MSTeamsSchedule",
+      "MSTeamsScheduleWeek",
     },
     keys = {
       { "<leader>ee", "<cmd>MSTeamsChats<cr>" },
@@ -199,6 +201,11 @@ is untested. DavMail mode is the only supported path right now.
         `mr`/`mu` mark read/unread. Chats with the same name get a short id
         suffix.
 
+:MSTeamsNotifications                          *:MSTeamsNotifications*
+        Synthesized activity view: unread chats, mentions, pending
+        meeting invitations and recent watch activity. `<CR>`/`<C-v>`/
+        `<C-s>` open, `R` refresh, `g?` keymaps, `q` close.
+
 :MSTeamsSchedule                                    *:MSTeamsSchedule*
         Today's meetings. `<CR>`/`<C-v>`/`<C-s>` details, `<Tab>` week,
         `R` refresh, `q` close.
@@ -236,6 +243,7 @@ Keymaps are configurable per buffer under `keymaps`:
   - `msteams_finder`  |:MSTeamsFind| picker
   - `chat_detail`     chat detail buffer
   - `chat_search`     in-chat search results buffer
+  - `notifications`   |:MSTeamsNotifications| activity buffer
   - `teams`           |:MSTeamsTeams| teams/channels list
   - `user_detail`     user detail buffer
   - `schedule`        |:MSTeamsSchedule| day view
@@ -275,6 +283,10 @@ Example: >
         jump_focus = "<S-CR>",  -- jump and focus the chat
         quickfix = "<C-q>",
         help = "g?", close = "q",
+      },
+      notifications = {
+        open = "<CR>", open_vsplit = "<C-v>", open_split = "<C-s>",
+        refresh = "R", help = "g?", close = "q",
       },
       user_detail = {
         open_photo = "gx",
@@ -488,11 +500,40 @@ Inside a chat detail buffer:
     the text keeps the colorscheme foreground.
 
 ==============================================================================
-11. STORAGE                                             *ms-teams-storage*
+11. NOTIFICATIONS                              *ms-teams-notifications*
+
+`:MSTeamsNotifications` opens `ms-teams://notifications`, a synthesized
+activity view. The real Teams activity feed (the bell) has no public
+Microsoft Graph read API, so this aggregates the data the plugin can
+access:
+
+  - Mentions: recent mention notifications recorded by the watch, plus
+    unread chats whose last message mentions you.
+  - Unread chats: chats with unread messages, newest first.
+  - Meeting invites: events in the next 7 days that you have not
+    responded to.
+  - Recent activity: recent watch notifications (when `mentions_only`
+    is false).
+
+`<CR>` opens the selected chat or meeting in the current window,
+`<C-v>` in a vertical split and `<C-s>` in a horizontal split. When a
+notification has a message id, the plugin loads older history until
+that message is found and jumps to it; if the chat is already open it
+is reused. Marking a chat read removes its mentions from this view.
+`R` refreshes chats and invites, `g?` opens the keymap float and `q`
+closes. The watch updates an open notifications buffer automatically.
+
+This is an approximation: the Teams notification feed itself is not
+exposed by the public Graph API.
+
+==============================================================================
+12. STORAGE                                             *ms-teams-storage*
 
   - `stdpath("data")/ms-teams/davmail_access.json` - cached Graph access
     token (`chmod 600`)
   - `stdpath("data")/ms-teams/chats.json`, `teams*.json` - list caches
+  - `stdpath("data")/ms-teams/notifications.json` - recent watch/activity
+    history for |:MSTeamsNotifications|
   - `stdpath("cache")/ms-teams/attachments` - downloaded images/files
   - `stdpath("cache")/ms-teams/avatars` - cached profile photos
     (etag-revalidated)
