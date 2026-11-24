@@ -161,12 +161,21 @@ local function preview_id(chat)
   return (id or "") .. "|" .. ct
 end
 
+local function is_system_message(m)
+  if not m then return false end
+  if nv(m.eventDetail) then return true end
+  local mt = nv(m.messageType)
+  return mt ~= nil and mt ~= "" and mt ~= "message"
+end
+
 local function has_unread(chat)
   local vp = nv(chat.viewpoint)
   local lr = vp and nv(vp.lastMessageReadDateTime)
-  if not lr then return false end
+  -- Graph's 1970/0001 placeholders mean "no read receipt", not "unread".
+  if not lr or lr == "" or lr:sub(1, 4) == "1970" or lr:sub(1, 4) == "0001" then return false end
   local p = get_preview(chat)
-  local lu = p and nv(p.createdDateTime) or nv(chat.lastUpdatedDateTime)
+  if not p or is_system_message(p) then return false end
+  local lu = nv(p.createdDateTime)
   if not lu then return false end
   return lu > lr
 end

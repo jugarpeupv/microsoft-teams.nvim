@@ -71,6 +71,15 @@ end
 local tab_throttle_until = 0
 local refresh_inflight = false
 
+-- channel unread probes: list_channels carries no preview/read state, so the
+-- newest message must be fetched per channel. Those probes are paced and
+-- throttled: a burst trips Graph 429 and retrying extends the penalty.
+local channel_probe_busy = false
+local channel_probe_cooldown_until = 0
+local channel_probe_recent = {}
+local CHANNEL_PROBE_INTERVAL_MS = 400
+local CHANNEL_PROBE_TTL = 600
+
 -- tabReference attachments carry {"tabId": "..."} JSON in content; the file
 -- URL is resolved via GET /chats/{id}/tabs -> configuration.contentUrl
 local function url_decode(s)
@@ -216,14 +225,60 @@ local function get_other_user_id(chat)
   return nil
 end
 
-local function is_message_unread(msg, chat)
+local function is_epoch_read(iso)
+  -- Graph uses 1970-01-01 (and sometimes 0001-01-01) as "no read receipt".
+  -- Treat it (and an empty value) as unknown, not as "everything is unread".
+  return type(iso) ~= "string" or iso == ""
+    or iso:sub(1, 4) == "1970" or iso:sub(1, 4) == "0001"
+end
+
+local function is_system_message(m)
+  if not m then return false end
+  if nv(m.eventDetail) then return true end
+  local mt = nv(m.messageType)
+  return mt ~= nil and mt ~= "" and mt ~= "message"
+end
+
+-- channel ids, including the historical @thread.v2 vs @thread.tacv2 variant
+-- (that suffix change used to produce different cache keys)
+local function channel_ids(cid)
+  if not cid or cid == "" then return {} end
+  local ids = { cid }
+  if cid:sub(-13) == "@thread.tacv2" then
+    table.insert(ids, cid:sub(1, -14) .. "@thread.v2")
+  elseif cid:sub(-10) == "@thread.v2" then
+    table.insert(ids, cid:sub(1, -11) .. "@thread.tacv2")
+  end
+  return ids
+end
+
+-- last-read override for either id variant
+local function channel_last_read(cid)
   local cache = require("ms-teams.cache")
-  local override = cache.get_last_read(nv(chat.id))
+  local live = cache.get_last_read(cid)
+  if live and live ~= "" then return live end
+  for _, id in ipairs(channel_ids(cid)) do
+    if id ~= cid then
+      local v = cache.get_last_read(id)
+      if v and v ~= "" then return v end
+    end
+  end
+  return nil
+end
+
+local function is_message_unread(msg, chat)
+  if is_system_message(msg) then return false end
+  local cache = require("ms-teams.cache")
+  local override = nv(chat.chatType) == "channel" and channel_last_read(nv(chat.id))
+    or cache.get_last_read(nv(chat.id))
   local lr = override
+  local from_viewpoint = false
   if not lr then
     local vp = nv(chat.viewpoint)
     lr = vp and nv(vp.lastMessageReadDateTime)
+    from_viewpoint = lr ~= nil
   end
+  if from_viewpoint and is_epoch_read(lr) then return false end
   local ct = nv(msg.createdDateTime)
   if not lr or not ct then return false end
   if ct <= lr then return false end
@@ -236,6 +291,7 @@ end
 -- the mu point also render highlighted (review mode). List-level
 -- has_unread() intentionally keeps excluding self.
 local function is_message_unread_or_review(msg, chat)
+  if is_system_message(msg) then return false end
   if is_message_unread(msg, chat) then return true end
   local rf = require("ms-teams.cache").get_review_from(nv(chat.id))
   if not rf or rf == "" then return false end
@@ -244,35 +300,90 @@ local function is_message_unread_or_review(msg, chat)
   return ct > rf
 end
 
--- newest message date previously seen for a channel, across id variants
--- (@thread.v2 vs @thread.tacv2 historically produced different cache keys)
-local function channel_seen_newest(cid)
-  if not cid or cid == "" then return nil end
-  local ids = { cid }
-  if cid:sub(-13) == "@thread.tacv2" then
-    table.insert(ids, cid:sub(1, -14) .. "@thread.v2")
-  elseif cid:sub(-10) == "@thread.v2" then
-    table.insert(ids, cid:sub(1, -11) .. "@thread.tacv2")
-  end
-  local cache = require("ms-teams.cache")
-  local newest = nil
-  local seen_keys = {}
-  for _, id in ipairs(ids) do
+-- ISO-8601 UTC timestamps compare lexicographically, but fractional seconds
+-- break that ('.' sorts before 'Z'), so normalize to second precision first.
+local function iso_gt(a, b)
+  if type(a) ~= "string" or type(b) ~= "string" or a == "" or b == "" then return false end
+  local na = a:gsub("%.%d+Z$", "Z")
+  local nb = b:gsub("%.%d+Z$", "Z")
+  return na > nb
+end
+
+-- cache keys for a channel, across id variants
+local function channel_cache_keys(cid)
+  local keys, seen = {}, {}
+  for _, id in ipairs(channel_ids(cid)) do
     local key = "messages_" .. id:gsub("[^%w%-_:.]", "_"):sub(1, 60)
-    if not seen_keys[key] then
-      seen_keys[key] = true
-      local okc, cc = pcall(cache.load, key)
-      if okc and cc and cc.messages then
-        for _, m in ipairs(cc.messages) do
-          if m ~= vim.NIL then
-            local dt = nv(m.createdDateTime) or ""
-            if dt ~= "" and (not newest or dt > newest) then newest = dt end
+    if not seen[key] then seen[key] = true; table.insert(keys, key) end
+  end
+  return keys
+end
+
+local function channel_cached_messages(cid)
+  local cache = require("ms-teams.cache")
+  local msgs, seen = {}, {}
+  for _, key in ipairs(channel_cache_keys(cid)) do
+    local okc, cc = pcall(cache.load, key)
+    if okc and cc and type(cc.messages) == "table" then
+      for _, m in ipairs(cc.messages) do
+        if m ~= vim.NIL then
+          local from = nv(m.from) and nv(nv(m.from).user)
+          local mk = nv(m.id) or ((nv(m.createdDateTime) or "") .. "|"
+            .. ((from and nv(from.id)) or ""))
+          if not seen[mk] then
+            seen[mk] = true
+            table.insert(msgs, m)
           end
         end
       end
     end
   end
+  return msgs
+end
+
+-- newest message date previously seen for a channel
+local function channel_seen_newest(cid)
+  local newest = nil
+  for _, m in ipairs(channel_cached_messages(cid)) do
+    local dt = nv(m.createdDateTime) or ""
+    if dt ~= "" and (not newest or iso_gt(dt, newest)) then newest = dt end
+  end
   return newest
+end
+
+-- a real (not system) message from someone else, newer than `ref`
+local function message_unread_after(m, ref)
+  if not m or not ref or ref == "" then return false end
+  if is_system_message(m) then return false end
+  local ct = nv(m.createdDateTime)
+  if not ct or not iso_gt(ct, ref) then return false end
+  local from = nv(m.from) and nv(nv(m.from).user)
+  if from and is_from_me(from) then return false end
+  return true
+end
+
+-- channel unread evidence already available locally (disk message cache and
+-- open detail buffers). This lets the list agree with the detail pane without
+-- waiting for the paced latest-message probe.
+local function channel_unread_local(cid, ref)
+  if not cid or not ref or ref == "" then return false end
+  for _, m in ipairs(channel_cached_messages(cid)) do
+    if message_unread_after(m, ref) then return true end
+  end
+  for _, b in ipairs(vim.api.nvim_list_bufs()) do
+    if vim.api.nvim_buf_is_valid(b) then
+      local ok_id, bid = pcall(vim.api.nvim_buf_get_var, b, "ms_teams_chat_id")
+      if ok_id and bid == cid then
+        local ok_raw, raw = pcall(vim.api.nvim_buf_get_var, b, "ms_teams_raw_msgs")
+        if ok_raw and type(raw) == "table" then
+          for _, m in ipairs(raw) do
+            if message_unread_after(m, ref) then return true end
+          end
+        end
+      end
+    end
+  end
+  return false
 end
 
 -- unread evidence in already-open detail buffers (fresher than the disk
@@ -298,15 +409,34 @@ end
 
 local function has_unread(chat)
   local cache = require("ms-teams.cache")
-  local override = cache.get_last_read(nv(chat.id))
+  local override = nv(chat.chatType) == "channel" and channel_last_read(nv(chat.id))
+    or cache.get_last_read(nv(chat.id))
   local lr = override
+  local from_viewpoint = false
   if not lr then
     local vp = nv(chat.viewpoint)
     lr = vp and nv(vp.lastMessageReadDateTime)
+    from_viewpoint = lr ~= nil
+  end
+  if from_viewpoint and is_epoch_read(lr) then
+    -- unknown read state: this placeholder must not mark the chat unread
+    return false
   end
   local preview = nv(chat.lastMessagePreview)
-  local lu = preview and nv(preview.createdDateTime) or nv(chat.lastUpdatedDateTime)
-  if not lu then return false end
+  if preview and is_system_message(preview) then
+    -- Member joined/left, call events, renames, etc. are not new messages in
+    -- Teams; only honor an explicit local "mark unread" override.
+    if override and is_epoch_read(override) then return true end
+    return false
+  end
+  local lu = preview and nv(preview.createdDateTime)
+  if not lu then
+    -- No last message: lastUpdatedDateTime only reflects metadata/meeting
+    -- changes and must not create unread state. Only an explicit local
+    -- mark-unread (mu) wins.
+    if override and is_epoch_read(override) then return true end
+    return false
+  end
   if lr then
     if lu <= lr then return false end
   else
@@ -768,7 +898,8 @@ end
 
 local function get_last_read_iso(chat)
   local cache = require("ms-teams.cache")
-  local override = cache.get_last_read(nv(chat.id))
+  local override = nv(chat.chatType) == "channel" and channel_last_read(nv(chat.id))
+    or cache.get_last_read(nv(chat.id))
   if override then return override end
   local vp = nv(chat.viewpoint)
   return vp and nv(vp.lastMessageReadDateTime)
@@ -1536,12 +1667,12 @@ function M.pick_chats()
   if vim.g.ms_teams_show_meeting == nil then vim.g.ms_teams_show_meeting = true end
   local enriching = false
   local enriched = {}
-  -- channel latest-message probes are costly (one fetch per channel) and
-  -- run ONLY on explicit R (one-shot, consumed below) - never on plain
-  -- opens or background renders, so opening the list stays paint-cheap.
-  -- list_chats-covered channels still resolve via preview/has_unread.
-  local channel_probe_allowed = false
+  -- channel latest-message probes run in the background after a render. A
+  -- plain open only probes channels that already have a local read reference;
+  -- R forces a round for every channel missing from list_chats.
+  local channel_probe_force_next = false
   local teams_data = nil
+  local teams_partial_reason = nil
   local channels_map = {}
   -- last channels load cycle hit errors (e.g. throttling): teams render a
   -- retry hint instead of a bare, ambiguous (0)
@@ -1652,18 +1783,28 @@ function M.pick_chats()
     end
   end, 4000)
   local function ensure_teams_open()
-    local tc = cache.load("teams", 300)
-    if tc and tc.teams then
+    local tc = cache.load("teams_associated", 300)
+    if tc and tc.teams and tc.source == "associated" then
       teams_data = tc.teams
       local cm = cache.load("teams_channels")
       if cm then channels_map = cm end
       gate_check("teams")
       return
     end
-    require("ms-teams.graph").list_teams(function(nt, err)
+    require("ms-teams.graph").list_teams(function(nt, err, meta)
       if nt and #nt > 0 and not err then
         teams_data = nt
-        cache.save("teams", { teams = nt })
+        teams_partial_reason = (meta and meta.partial)
+          and ("teams list partial: associated teams unavailable (" .. tostring(meta.reason or "throttled") .. "); retry later")
+          or nil
+        if meta and meta.partial then
+          vim.schedule(function()
+            vim.notify("ms-teams: associated teams unavailable (" .. tostring(meta.reason or "throttled")
+              .. "); showing joined teams. Retry later or press R in :MSTeamsTeams.", vim.log.levels.WARN)
+          end)
+        else
+          cache.save("teams_associated", { teams = nt, source = "associated" })
+        end
         load_all_channels(nt, function(fetched, had_error)
           if fetched then cache.save("teams_channels", channels_map) end
           channels_error = had_error or false
@@ -1780,20 +1921,43 @@ function M.pick_chats()
     end
     local unread_by_id = {}
     for _, c in ipairs(all_for_search) do if has_unread(c) then unread_by_id[nv(c.id)] = true end end
-    -- channel unread: list_channels objects carry no preview/viewpoint, so
-    -- consult enrichment state (latest message vs local read reference)
+    -- channel unread: list_channels objects carry no preview/viewpoint. Prefer
+    -- the paced latest-message probe state; when it is missing or stale, local
+    -- evidence (last_read override + cached/open messages) still has to win,
+    -- otherwise the list disagrees with the detail pane.
+    local channel_unread_memo = {}
     local function channel_is_unread(cid)
       if not cid then return false end
-      if unread_by_id[cid] then return true end
-      local st = channel_state[cid]
-      if not st then return false end
-      -- live mr/mu override always wins over stored state
-      local ok_lr, live = pcall(require("ms-teams.cache").get_last_read, cid)
-      if ok_lr and live and live ~= "" then
-        return st.dt > live and not st.from_self
+      local memo = channel_unread_memo[cid]
+      if memo ~= nil then return memo end
+      local result = false
+      if unread_by_id[cid] then
+        result = true
+      else
+        local live = channel_last_read(cid)
+        local st = channel_state[cid]
+        if st then
+          local other_dt = st.newest_other_dt
+            or ((not st.from_self) and st.dt or nil)
+          if live and live ~= "" then
+            -- live mr/mu override always wins over stored state
+            if is_epoch_read(live) then
+              result = (other_dt ~= nil and other_dt ~= "") or st.known_other == true
+            else
+              result = other_dt ~= nil and other_dt ~= "" and iso_gt(other_dt, live)
+            end
+          elseif st.ref and other_dt then
+            result = iso_gt(other_dt, st.ref)
+          else
+            result = st.known_other == true
+          end
+        end
+        if not result and live and live ~= "" then
+          result = channel_unread_local(cid, live)
+        end
       end
-      if st.ref then return st.dt > st.ref and not st.from_self end
-      return st.known_other == true
+      channel_unread_memo[cid] = result
+      return result
     end
     local header = "# Teams chats (" .. #display .. "/" .. #all_for_search .. " shown"
       .. (current_filter and current_filter ~= "" and ' | filter: "' .. current_filter .. '"' or "")
@@ -1825,6 +1989,9 @@ function M.pick_chats()
     if teams_data and #teams_data > 0 then
       table.insert(lines, "")
       table.insert(lines, "# Teams (" .. #teams_data .. ")")
+      if teams_partial_reason then
+        table.insert(lines, "  _" .. teams_partial_reason .. "_")
+      end
       local teams_header_lnum = #lines - 1
       sorted_teams = vim.deepcopy(teams_data)
       table.sort(sorted_teams, function(a,b) return (a.displayName or ""):lower() < (b.displayName or ""):lower() end)
@@ -1879,16 +2046,11 @@ function M.pick_chats()
       end
     end
     pcall(vim.api.nvim_buf_set_var, buf, "ms_teams_channel_unread", channel_unread)
-    -- enrich team channels missing from list_chats (e.g. Random): fetch the
-    -- latest message per channel; get_chat does NOT work for channel ids
-    -- and list_channels carries no preview data. Retries are time-gated
-    -- (failures retry after 5 min, states revalidate after 15 min) so a
-    -- throttled round never latches the buffer into a stale state.
-    -- Gated by channel_probe_allowed (explicit R only, one-shot).
+    -- enrich team channels missing from list_chats (e.g. Random): list_channels
+    -- carries no preview/read state, so the newest message per channel must be
+    -- fetched. Probes are paced; a plain open only probes channels that already
+    -- have a local read reference, while R forces every missing channel.
     do
-      local now = os.time()
-      local ok_att, attempted = pcall(vim.api.nvim_buf_get_var, buf, "ms_teams_teams_attempted")
-      if not (ok_att and type(attempted) == "table") then attempted = {} end
       local chat_by_chid_all = {}
       for _, c in ipairs(all_for_search) do
         if nv(c.chatType) == "channel" then
@@ -1903,90 +2065,142 @@ function M.pick_chats()
           if ch ~= vim.NIL then
             local cid = nv(ch.id)
             if cid and not chat_by_chid_all[cid] then
-              local st = channel_state[cid]
-              local fresh = st and st.at and (now - st.at) < 900
-              local last_att = attempted[cid] or 0
-                if not fresh and (now - last_att) >= 300 then
-                  table.insert(missing, { cid = cid, team_id = team.id })
-                end
+              table.insert(missing, { cid = cid, team_id = team.id })
             end
           end
         end
       end
-      pcall(vim.api.nvim_buf_set_var, buf, "ms_teams_teams_attempted", attempted)
-        if #missing > 0 and channel_probe_allowed then
-          -- one-shot per R press: plain opens/background renders skip this
-          channel_probe_allowed = false
-          local to_fetch = {}
-          for i = 1, math.min(8, #missing) do table.insert(to_fetch, missing[i]) end
-          local pending = #to_fetch
-          local changed = false
-          local failed = 0
-          local first_err = nil
-          local function finish_one()
-            pending = pending - 1
-            if pending == 0 then
-              if failed > 0 then
-                vim.notify(string.format("ms-teams: channel unread check failed for %d/%d channels (%s)", failed, #to_fetch, tostring(first_err or "?"):sub(1, 120)), vim.log.levels.WARN)
-              end
-              if changed then
-                vim.schedule(function()
-                  if vim.api.nvim_buf_is_valid(buf) then
-                    local okAll, _ = pcall(vim.api.nvim_buf_get_var, buf, "ms_teams_all_chats")
-                    if okAll then
-                      request_render(all_for_search, all_for_search, false, current_filter or "", { background = true })
-                    end
-                  end
-                end)
-              end
+      local force = channel_probe_force_next
+      local now = os.time()
+      local auto_fetch = true
+      local ok_cfg, cfg = pcall(require, "ms-teams.config")
+      if ok_cfg and cfg.options and cfg.options.channels
+          and cfg.options.channels.auto_fetch == false then
+        auto_fetch = false
+      end
+      if not channel_probe_busy and now >= channel_probe_cooldown_until
+          and (force or auto_fetch) then
+        channel_probe_force_next = false
+        local eligible = {}
+        for _, item in ipairs(missing) do
+          local st = channel_state[item.cid]
+          local fresh = st and st.at and (now - st.at) < 900
+          local recent = channel_probe_recent[item.cid]
+          if force or (not fresh and (not recent or (now - recent) >= CHANNEL_PROBE_TTL)) then
+            local has_ref = false
+            if channel_last_read(item.cid) then
+              has_ref = true
+            elseif channel_seen_newest(item.cid) then
+              has_ref = true
+            end
+            if force or has_ref then table.insert(eligible, item) end
+          end
+        end
+        if #eligible > 0 then
+          channel_probe_busy = true
+          local idx, changed, failed, first_err = 0, false, 0, nil
+          local function probe_finish()
+            channel_probe_busy = false
+            if failed > 0 and force then
+              vim.schedule(function()
+                vim.notify(string.format(
+                  "ms-teams: channel unread check failed for %d/%d channels (%s)",
+                  failed, #eligible, tostring(first_err or "?"):sub(1, 120)),
+                  vim.log.levels.WARN)
+              end)
+            end
+            if changed or channel_probe_force_next then
+              vim.schedule(function()
+                if vim.api.nvim_buf_is_valid(buf) then
+                  request_render(all_for_search, all_for_search, false, current_filter or "", { background = true })
+                end
+              end)
             end
           end
-          for _, item in ipairs(to_fetch) do
-            require("ms-teams.graph").list_channel_messages(item.team_id, item.cid, function(msgs, err, _)
+          local function step()
+            if not vim.api.nvim_buf_is_valid(buf) then
+              channel_probe_busy = false
+              return
+            end
+            if os.time() < channel_probe_cooldown_until then
+              probe_finish()
+              return
+            end
+            idx = idx + 1
+            if idx > #eligible then probe_finish(); return end
+            local item = eligible[idx]
+            channel_probe_recent[item.cid] = os.time()
+            require("ms-teams.graph").list_channel_messages(item.team_id, item.cid, function(msgs, err)
               if err or not msgs then
                 failed = failed + 1
                 if not first_err then first_err = err end
-              end
-              if not err and msgs and #msgs > 0 then
-                local latest, latest_dt = nil, ""
+                local es = tostring(err or "")
+                if es:find("TooManyRequests", 1, true) or es:find("429", 1, true) then
+                  -- stop the whole round; retrying while throttled only
+                  -- extends the penalty. Retry this channel after cooldown.
+                  channel_probe_recent[item.cid] = nil
+                  channel_probe_cooldown_until = os.time() + 300
+                  probe_finish()
+                  return
+                end
+              else
+                local latest_dt, latest_self = "", false
+                local other_dt = nil
                 for _, m in ipairs(msgs) do
-                  if m ~= vim.NIL then
+                  if m ~= vim.NIL and not is_system_message(m) then
                     local dt = nv(m.createdDateTime) or ""
-                    if dt > latest_dt then latest_dt = dt; latest = m end
+                    if dt ~= "" then
+                      local fr = nv(m.from) and nv(nv(m.from).user)
+                      if latest_dt == "" or iso_gt(dt, latest_dt) then
+                        latest_dt = dt
+                        latest_self = fr ~= nil and is_from_me(fr) or false
+                      end
+                      if fr and not is_from_me(fr) then
+                        if not other_dt or iso_gt(dt, other_dt) then other_dt = dt end
+                      end
+                    end
                   end
                 end
-                if latest and latest_dt ~= "" then
-                  local cache = require("ms-teams.cache")
-                  local ref = cache.get_last_read(item.cid)
-                  if not ref then
-                    ref = channel_seen_newest(item.cid)
-                  end
-                  local f0 = latest.from and nv(latest.from)
-                  local pfrom = f0 and nv(f0.user)
-                  local from_self = (pfrom and is_from_me(pfrom)) and true or false
-                  local known_other = (pfrom and not from_self) and true or false
-                  -- without local reference, only recent messages count: a
-                  -- years-old latest message was surely seen already
-                  if not ref and known_other then
+                if latest_dt ~= "" then
+                  local ref = channel_last_read(item.cid)
+                  if not ref or ref == "" then ref = channel_seen_newest(item.cid) end
+                  -- no local reference: only a recent message from someone
+                  -- else is treated as unread (years-old history is not)
+                  local known_other = false
+                  if (not ref or ref == "") and other_dt then
                     local max_age = 30
-                    local ok_cfg, cfg = pcall(require, "ms-teams.config")
-                    if ok_cfg and cfg.options and cfg.options.channels and cfg.options.channels.unread_max_age_days then
+                    if ok_cfg and cfg.options and cfg.options.channels
+                        and cfg.options.channels.unread_max_age_days then
                       max_age = cfg.options.channels.unread_max_age_days
                     end
                     local cutoff = os.date("!%Y-%m-%dT%H:%M:%SZ", os.time() - max_age * 86400)
-                    if latest_dt < cutoff then known_other = false end
+                    known_other = iso_gt(other_dt, cutoff)
                   end
-                  if ref or known_other then
-                    channel_state[item.cid] = { dt = latest_dt, ref = ref, from_self = from_self, known_other = known_other, at = os.time() }
+                  local old = channel_state[item.cid]
+                  local newst = {
+                    dt = latest_dt,
+                    newest_other_dt = other_dt,
+                    ref = ref,
+                    from_self = latest_self,
+                    known_other = known_other,
+                    at = os.time(),
+                  }
+                  if not old or old.dt ~= newst.dt
+                      or old.newest_other_dt ~= newst.newest_other_dt
+                      or old.ref ~= newst.ref or old.from_self ~= newst.from_self
+                      or old.known_other ~= newst.known_other then
                     changed = true
                   end
+                  channel_state[item.cid] = newst
                 end
               end
-              finish_one()
+              vim.defer_fn(step, CHANNEL_PROBE_INTERVAL_MS)
             end)
           end
+          step()
         end
       end
+    end
     -- dirty check to avoid flicker when content unchanged
     local do_render_list = true
     if vim.api.nvim_buf_is_valid(buf) then
@@ -2186,9 +2400,9 @@ function M.pick_chats()
     end, {desc="Toggle show more/less chats"})
     set_key(buf, "chat_list", "refresh", function()
       vim.notify("refreshing...",vim.log.levels.INFO)
-      -- allow one round of channel latest-message probes on the render
-      -- this refresh produces; plain opens never probe
-      channel_probe_allowed = true
+      -- force one channel latest-message probe round on the render this
+      -- refresh produces; plain opens only probe channels with local state
+      channel_probe_force_next = true
       require("ms-teams.graph").list_chats(function(nc,err)
         if err then vim.notify("refresh failed: "..err,vim.log.levels.ERROR); return end
         -- Preservar members ya enriquecidos del cache anterior si el nuevo chat no los trae
@@ -2206,10 +2420,20 @@ function M.pick_chats()
           end
         end
         cache.save("chats",{chats=nc})
-        require("ms-teams.graph").list_teams(function(nt, err2)
+        require("ms-teams.graph").list_teams(function(nt, err2, meta)
           if nt and #nt>0 and not err2 then
             teams_data = nt
-            cache.save("teams",{teams=nt})
+            teams_partial_reason = (meta and meta.partial)
+              and ("teams list partial: associated teams unavailable (" .. tostring(meta.reason or "throttled") .. "); retry later")
+              or nil
+            if meta and meta.partial then
+              vim.schedule(function()
+                vim.notify("ms-teams: associated teams unavailable (" .. tostring(meta.reason or "throttled")
+                  .. "); showing joined teams. Retry later.", vim.log.levels.WARN)
+              end)
+            else
+              cache.save("teams_associated",{teams=nt, source="associated"})
+            end
             load_all_channels(nt, function(fetched, had_error)
               if fetched then cache.save("teams_channels", channels_map) end
               channels_error = had_error or false
@@ -5282,7 +5506,7 @@ function M.show_messages(chat, open)
   local cache_key = "messages_" .. safe_id_cache
   -- channels carry no server viewpoint: infer read position from previously
   -- cached messages (transient, per open) so detail highlights match chats
-  if is_channel and not cache.get_last_read(chat_id) then
+  if is_channel and not channel_last_read(chat_id) then
     local seen_newest = channel_seen_newest(chat_id)
     if seen_newest then
       chat.viewpoint = { lastMessageReadDateTime = seen_newest }
@@ -6233,6 +6457,50 @@ function M.show_messages(chat, open)
       nl = nl or (fallback_lnum and math.max(1, math.min(fallback_lnum, lc)) or nil)
       if nl then pcall(vim.api.nvim_win_set_cursor, win, { nl, fallback_col or 0 }) end
     end
+    -- Explicit refresh (R / :e) of the open detail: keep the cursor anchored
+    -- to the message it was on and merge the fresh page into the messages
+    -- already loaded. A plain refetch returns only the first page (50 for
+    -- chats, 5 for channels), so replacing the buffer would drop load_older
+    -- history, shift the Last-read divider and clamp the cursor to the bottom.
+    local function refresh_in_place()
+      -- guard against reused buffers (mapping closure outliving the chat):
+      -- merging fresh messages into another chat's buffer would mix them.
+      local ok_cid, cur_cid = pcall(vim.api.nvim_buf_get_var, buf, "ms_teams_chat_id")
+      if ok_cid and cur_cid and cur_cid ~= chat_id then
+        vim.notify("ms-teams: buffer chat changed, reopen the chat and retry", vim.log.levels.WARN)
+        return
+      end
+      local win = vim.fn.bufwinid(buf)
+      local cur_pos = { 1, 0 }
+      if win ~= -1 then
+        local okc, c = pcall(vim.api.nvim_win_get_cursor, win)
+        if okc and c then cur_pos = c end
+      end
+      local anchor_id, anchor_off = anchor_at(cur_pos[1])
+      vim.notify("refreshing messages...", vim.log.levels.INFO)
+      do_list_messages(chat_id, function(fresh, err, freshNext)
+        if err then vim.notify("refresh failed: " .. err, vim.log.levels.ERROR); return end
+        vim.schedule(function()
+          if not vim.api.nvim_buf_is_valid(buf) then return end
+          local ok_cid2, cid2 = pcall(vim.api.nvim_buf_get_var, buf, "ms_teams_chat_id")
+          if ok_cid2 and cid2 and cid2 ~= chat_id then return end
+          local old = {}
+          pcall(function() old = vim.api.nvim_buf_get_var(buf, "ms_teams_raw_msgs") or {} end)
+          local merged = select(1, merge_live_messages(old, fresh or {}))
+          -- nextLink must continue from the oldest *retained* message: keep
+          -- the buffer's own link when it still holds loaded history.
+          local old_nl = nil
+          pcall(function()
+            local v = vim.api.nvim_buf_get_var(buf, "ms_teams_nextLink")
+            if type(v) == "string" then old_nl = v end
+          end)
+          local nl = (old_nl ~= nil and #old > 0) and old_nl or (freshNext or "")
+          cache.save(cache_key, { messages = merged, nextLink = nl })
+          rerender_at_anchor(merged, nl, anchor_id, anchor_off, cur_pos[1], cur_pos[2])
+          vim.notify(string.format("refreshed %d messages", #(fresh or {})), vim.log.levels.INFO)
+        end)
+      end)
+    end
     set_key(buf, "chat_detail", "mark_read", function()
       local cur_pos = vim.api.nvim_win_get_cursor(0)
       -- guard against stale closures (reused buffers): act only if this
@@ -6377,17 +6645,7 @@ function M.show_messages(chat, open)
     set_key(buf, "chat_detail", "load_older", do_load_older, { desc = "Teams load 50 older messages" })
 
     set_key(buf, "chat_detail", "refresh", function()
-      vim.notify("refreshing messages...", vim.log.levels.INFO)
-      do_list_messages(chat_id, function(fresh, err, freshNext)
-        if err then vim.notify("refresh failed: "..err, vim.log.levels.ERROR); return end
-        vim.schedule(function()
-          if not vim.api.nvim_buf_is_valid(buf) then return end
-          cache.save(cache_key, {messages=fresh, nextLink=freshNext})
-          -- re-render in same buffer without changing window layout
-          render_buffer(fresh, freshNext, {is_cached=false, buf=buf, no_open=true})
-          vim.notify(string.format("refreshed %d messages", #fresh), vim.log.levels.INFO)
-        end)
-      end)
+      refresh_in_place()
     end, { desc = "Teams refresh messages" })
     set_key(buf, "chat_detail", "jump", function()
       -- reactions line opens the reaction detail instead of jumping
@@ -6556,21 +6814,11 @@ function M.show_messages(chat, open)
     local e_grp = vim.api.nvim_create_augroup("MsTeamsChatDetail" .. buf, { clear = true })
     vim.api.nvim_create_autocmd("BufReadCmd", { group = e_grp, buffer = buf, callback = function()
       if not vim.api.nvim_buf_is_valid(buf) then return end
-      local cur = vim.api.nvim_win_get_cursor(0)[1]
       -- :e detaches treesitter synchronously before BufReadCmd fires; restore after re-render
-      vim.notify("refreshing messages...", vim.log.levels.INFO)
-      do_list_messages(chat_id, function(fresh, err, freshNext)
-        if err then vim.notify("refresh failed: "..err, vim.log.levels.ERROR); return end
-        vim.schedule(function()
-          if not vim.api.nvim_buf_is_valid(buf) then return end
-          cache.save(cache_key, {messages=fresh, nextLink=freshNext})
-          render_buffer(fresh, freshNext, {is_cached=false, buf=buf, no_open=true, target_cursor=cur})
-          vim.defer_fn(function()
-            if vim.api.nvim_buf_is_valid(buf) then pcall(vim.treesitter.start, buf) end
-          end, 50)
-          vim.notify(string.format("refreshed %d messages", #fresh), vim.log.levels.INFO)
-        end)
-      end)
+      refresh_in_place()
+      vim.defer_fn(function()
+        if vim.api.nvim_buf_is_valid(buf) then pcall(vim.treesitter.start, buf) end
+      end, 50)
     end })
   end
 
@@ -7675,12 +7923,17 @@ end
 
 function M.pick_teams()
   local cache = require("ms-teams.cache")
+  local cached = cache.load("teams_associated", 300)
+  if not (cached and cached.source == "associated" and cached.teams and #cached.teams > 0) then
+    cached = nil
+  end
   local buf = vim.api.nvim_create_buf(true, false)
   vim.api.nvim_buf_set_option(buf, "filetype", "markdown")
   set_listed_scratch(buf, "ms-teams://teams")
   local current_filter = nil
   local show_all_limit = false
   local teams_data = nil
+  local partial_reason = nil
   local channels_map = {}
   local function clean(s)
     local t = (nv(s) or ""):gsub("\n", " "):gsub("\r", " ")
@@ -7741,6 +7994,7 @@ function M.pick_teams()
     end
     local lines = {
       "# Teams (" .. #teams .. ")"
+        .. (partial_reason and (" - partial: " .. partial_reason) or "")
         .. (current_filter and current_filter ~= "" and ' | filter: "' .. clean(current_filter) .. '"' or "")
         .. (is_cached and " - cached" or "")
         .. (show_all_limit and " - all teams" or " - top 20")
@@ -7755,6 +8009,26 @@ function M.pick_teams()
     local unread_by_id = {}
     local cc = cache.load("chats", 300)
     if cc and cc.chats then for _, c in ipairs(cc.chats) do if has_unread(c) then unread_by_id[nv(c.id)] = true end end end
+    -- channels carry no server read state; infer unread from the local
+    -- last-read override plus cached/open messages so this view agrees with
+    -- :MSTeamsChats and the channel detail pane
+    local channel_unread_memo = {}
+    local function channel_unread_teams(cid)
+      if not cid then return false end
+      local m = channel_unread_memo[cid]
+      if m ~= nil then return m end
+      local res = false
+      if unread_by_id[cid] then
+        res = true
+      else
+        local live = channel_last_read(cid)
+        if live then
+          res = channel_unread_local(cid, live)
+        end
+      end
+      channel_unread_memo[cid] = res
+      return res
+    end
     local unread_lines = {}
     local count = 0
     local max_teams = show_all_limit and #sorted or math.min(#sorted, 20)
@@ -7763,7 +8037,9 @@ function M.pick_teams()
       if count >= max_teams then break end
       local channels = channels_map[team.id] or {}
       local team_has_unread = false
-      for _, ch in ipairs(channels) do if ch ~= vim.NIL and unread_by_id[nv(ch.id)] then team_has_unread = true; break end end
+      for _, ch in ipairs(channels) do
+        if ch ~= vim.NIL and channel_unread_teams(nv(ch.id)) then team_has_unread = true; break end
+      end
       table.insert(lines, "## " .. clean(team.displayName) .. " (" .. #channels .. ")")
       lnum = #lines
       line_map[lnum] = { type = "team", team = team }
@@ -7775,7 +8051,7 @@ function M.pick_teams()
           table.insert(lines, channel_icon_teams ~= "" and (channel_icon_teams .. "  " .. ch_name_teams) or ch_name_teams)
           lnum = #lines
           line_map[lnum] = { type = "channel", team = team, channel = ch }
-          if unread_by_id[nv(ch.id)] then unread_lines[lnum] = true end
+          if channel_unread_teams(nv(ch.id)) then unread_lines[lnum] = true end
         end
       end
       if #channels == 0 then
@@ -7823,9 +8099,17 @@ function M.pick_teams()
     vim.notify(string.format("found %d/%d teams", #filtered, #teams_data), vim.log.levels.INFO)
   end
   local function refresh_teams()
-    require("ms-teams.graph").list_teams(function(new_teams, err)
+    require("ms-teams.graph").list_teams(function(new_teams, err, meta)
       if err then vim.notify("refresh failed: " .. err, vim.log.levels.ERROR); return end
-      cache.save("teams", { teams = new_teams })
+      partial_reason = (meta and meta.partial)
+        and ("associated teams unavailable (" .. tostring(meta.reason or "throttled") .. "); retry later")
+        or nil
+      if meta and meta.partial then
+        vim.notify("associated teams unavailable (" .. tostring(meta.reason or "throttled")
+          .. "); showing joined teams. Retry later.", vim.log.levels.WARN)
+      else
+        cache.save("teams_associated", { teams = new_teams, source = "associated" })
+      end
       load_all_channels(new_teams, function(fetched)
         if fetched then cache.save("teams_channels", channels_map) end
         render_and_bind(new_teams, false)
@@ -7870,9 +8154,17 @@ function M.pick_teams()
     channels_map = cache.load("teams_channels") or {}
     render_and_bind(teams_data, true)
     vim.defer_fn(function()
-      require("ms-teams.graph").list_teams(function(new_teams, err)
+      require("ms-teams.graph").list_teams(function(new_teams, err, meta)
         if err or not new_teams then return end
-        cache.save("teams", { teams = new_teams })
+        partial_reason = (meta and meta.partial)
+          and ("associated teams unavailable (" .. tostring(meta.reason or "throttled") .. "); retry later")
+          or nil
+        if meta and meta.partial then
+          vim.notify("associated teams unavailable (" .. tostring(meta.reason or "throttled")
+            .. "); showing joined teams. Retry later.", vim.log.levels.WARN)
+        else
+          cache.save("teams_associated", { teams = new_teams, source = "associated" })
+        end
         load_all_channels(new_teams, function(fetched)
           if fetched then cache.save("teams_channels", channels_map) end
           if vim.api.nvim_buf_is_valid(buf) and vim.api.nvim_buf_get_name(buf):find("ms%-teams://teams") then
@@ -7886,9 +8178,17 @@ function M.pick_teams()
   end
   vim.api.nvim_buf_set_lines(buf, 0, -1, false, { "# Teams", "", "Loading teams...", "" })
   vim.api.nvim_win_set_buf(0, buf)
-  require("ms-teams.graph").list_teams(function(teams, err)
+  require("ms-teams.graph").list_teams(function(teams, err, meta)
     if err then vim.notify("ms-teams list_teams: " .. tostring(err), vim.log.levels.ERROR); return end
-    cache.save("teams", { teams = teams })
+    partial_reason = (meta and meta.partial)
+      and ("associated teams unavailable (" .. tostring(meta.reason or "throttled") .. "); retry later")
+      or nil
+    if meta and meta.partial then
+      vim.notify("associated teams unavailable (" .. tostring(meta.reason or "throttled")
+        .. "); showing joined teams. Retry later.", vim.log.levels.WARN)
+    else
+      cache.save("teams_associated", { teams = teams, source = "associated" })
+    end
     load_all_channels(teams, function(fetched)
       if fetched then cache.save("teams_channels", channels_map) end
       render_and_bind(teams, false)

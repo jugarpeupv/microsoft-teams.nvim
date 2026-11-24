@@ -746,24 +746,64 @@ function M.hide_chat(chat_id, cb)
 end
 
 function M.list_teams(cb)
-  local all = {}
+  -- associatedTeams also includes host teams of shared channels, not just
+  -- teams the user is a direct member of. That matches the Teams client's
+  -- "Teams and channels" list better than joinedTeams.
+  local all, seen = {}, {}
+  local function collect(j)
+    for _, t in ipairs(j.value or {}) do
+      local id = t and t.id
+      if id and not seen[id] then
+        seen[id] = true
+        table.insert(all, t)
+      end
+    end
+  end
+  local function joined_fallback(err)
+    local fallback = {}
+    local function fetch(url)
+      graph_request_async("read", "GET", url, nil, function(j, e)
+        if not j then
+          if #fallback > 0 then
+            cb(fallback, nil, { source = "joined", partial = true, reason = e or err })
+          else
+            cb(nil, e or err, { source = "joined", partial = true, reason = e or err })
+          end
+          return
+        end
+        for _, t in ipairs(j.value or {}) do table.insert(fallback, t) end
+        local nextLink = j["@odata.nextLink"]
+        if nextLink and nextLink ~= "" then
+          fetch(nextLink:gsub("^https://graph.microsoft.com/v1.0", ""))
+        else
+          cb(fallback, nil, { source = "joined", partial = true, reason = err })
+        end
+      end)
+    end
+    fetch("/me/joinedTeams?%24select=id,displayName,description,webUrl")
+  end
   local function fetch(url)
     graph_request_async("read", "GET", url, nil, function(j, err)
       if not j then
-        if #all > 0 then cb(all, nil) else cb(nil, err) end
+        if #all > 0 then
+          cb(all, nil, { source = "associated", partial = true, reason = err })
+        else
+          joined_fallback(err)
+        end
         return
       end
-      for _, t in ipairs(j.value or {}) do table.insert(all, t) end
+      collect(j)
       local nextLink = j["@odata.nextLink"]
       if nextLink and nextLink ~= "" then
-        local path = nextLink:gsub("^https://graph.microsoft.com/v1.0", "")
-        fetch(path)
+        fetch(nextLink:gsub("^https://graph.microsoft.com/v1.0", ""))
+      elseif #all > 0 then
+        cb(all, nil, { source = "associated" })
       else
-        cb(all, nil)
+        joined_fallback(nil)
       end
     end)
   end
-  fetch("/me/joinedTeams?%24select=id,displayName,description,webUrl")
+  fetch("/me/teamwork/associatedTeams")
 end
 
 function M.list_groups(cb)

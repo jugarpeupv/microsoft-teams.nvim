@@ -199,7 +199,14 @@ is untested. DavMail mode is the only supported path right now.
 :MSTeamsChats                                          *:MSTeamsChats*
         Recent chats list. `R` refresh, `g?` keymaps, `mp` user detail,
         `mr`/`mu` mark read/unread. Chats with the same name get a short id
-        suffix.
+        suffix. Graph's 1970-01-01 read placeholder is treated as unknown,
+        so it does not mark the chat unread. System events (member
+        joined/left, calls, renames) do not mark the chat unread either.
+        Channels carry no server read state: their unread mark is inferred
+        from the local `mr`/`mu` reference plus cached/open messages, and a
+        paced background probe of the latest message covers channels seen
+        before. `R` rechecks every channel; probes pause automatically
+        after a Graph 429.
 
 :MSTeamsNotifications                          *:MSTeamsNotifications*
         Synthesized activity view: unread chats, mentions, pending
@@ -215,7 +222,8 @@ is untested. DavMail mode is the only supported path right now.
         day, `R` refresh, `q` close.
 
 :MSTeamsTeams                                          *:MSTeamsTeams*
-        Teams and channels.
+        Teams and channels, including teams associated through shared
+        channels.
 
 :MSTeamsFind                                            *:MSTeamsFind*
         Telescope fuzzy find over chats (`<C-b>` unread/all).
