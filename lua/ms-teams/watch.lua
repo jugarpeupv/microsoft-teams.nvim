@@ -168,15 +168,35 @@ local function is_system_message(m)
   return mt ~= nil and mt ~= "" and mt ~= "message"
 end
 
+local EPOCH_UNREAD_MAX_AGE_DAYS = 30
+local function recent_enough(iso)
+  if not iso or iso == "" then return false end
+  local cutoff = os.date("!%Y-%m-%dT%H:%M:%SZ",
+    os.time() - EPOCH_UNREAD_MAX_AGE_DAYS * 86400)
+  return iso > cutoff
+end
+
 local function has_unread(chat)
   local vp = nv(chat.viewpoint)
   local lr = vp and nv(vp.lastMessageReadDateTime)
-  -- Graph's 1970/0001 placeholders mean "no read receipt", not "unread".
-  if not lr or lr == "" or lr:sub(1, 4) == "1970" or lr:sub(1, 4) == "0001" then return false end
+  local epoch = not lr or lr == "" or lr:sub(1, 4) == "1970" or lr:sub(1, 4) == "0001"
   local p = get_preview(chat)
   if not p or is_system_message(p) then return false end
   local lu = nv(p.createdDateTime)
   if not lu then return false end
+  if epoch then
+    -- no read receipt: a recent real message from someone else is unread
+    if not recent_enough(lu) then return false end
+    local pFrom = nv(p.from) and nv(nv(p.from).user)
+    local me_id = (me_cache and me_cache.id) or vim.g.ms_teams_me_id
+    local me_name = (me_cache and me_cache.displayName) or vim.g.ms_teams_me_name
+    if pFrom and ((pFrom.id and me_id and pFrom.id == me_id)
+        or (pFrom.displayName and me_name and pFrom.displayName == me_name)) then
+      return false
+    end
+    if nv(p.isOwned) == true then return false end
+    return true
+  end
   return lu > lr
 end
 

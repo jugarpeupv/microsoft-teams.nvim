@@ -197,15 +197,17 @@ is untested. DavMail mode is the only supported path right now.
         Scopes of the current access token.
 
 :MSTeamsChats                                          *:MSTeamsChats*
-        Recent chats list. Meeting chats are not shown here; use
-        |:MSTeamsSchedule| for meetings. `<CR>` / `<C-v>` / `<C-s>`
-        open the chat under the cursor. `R` refreshes chats and channels;
-        the teams list is reused from its 24-hour cache unless stale.
-        `g?` keymaps, `mp` user detail, `mr`/`mu` mark read/unread.
-        Chats with the same name get a short id suffix. Graph's
-        1970-01-01 read placeholder is treated as unknown, so it does not
-        mark the chat unread. System events (member joined/left, calls,
-        renames) do not mark the chat unread either. Channels carry no
+        Recent chats list, including meeting chats. |:MSTeamsSchedule|
+        opens the calendar view. `<CR>` / `<C-v>` / `<C-s>` open the chat
+        under the cursor. `R` refreshes chats and channels; the teams list
+        is reused from its 24-hour cache unless stale. `g?` keymaps, `mp`
+        user detail, `mr`/`mu` mark read/unread. Chats with the same name
+        get a short id suffix. Graph's
+        1970-01-01/0001 read placeholder means "no read receipt": a real
+        message from someone else within the last 30 days still marks the
+        chat unread, while older history stays unknown. System events
+        (member joined/left, calls, renames) do not mark the chat unread
+        either. Channels carry no
         server read state: their unread mark is inferred from the local
         `mr`/`mu` reference plus cached/open messages, and a paced
         background probe of the latest message covers channels seen

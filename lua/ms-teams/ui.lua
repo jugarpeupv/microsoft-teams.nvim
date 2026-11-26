@@ -272,6 +272,26 @@ local function is_system_message(m)
   return mt ~= nil and mt ~= "" and mt ~= "message"
 end
 
+-- ISO-8601 UTC timestamps compare lexicographically, but fractional seconds
+-- break that ('.' sorts before 'Z'), so normalize to second precision first.
+local function iso_gt(a, b)
+  if type(a) ~= "string" or type(b) ~= "string" or a == "" or b == "" then return false end
+  local na = a:gsub("%.%d+Z$", "Z")
+  local nb = b:gsub("%.%d+Z$", "Z")
+  return na > nb
+end
+
+-- Graph's epoch lastMessageReadDateTime means "no timestamp", not "read".
+-- Without a local reference, a recent real message from someone else is
+-- treated as unread; old history stays unknown so stale chats don't light up.
+local EPOCH_UNREAD_MAX_AGE_DAYS = 30
+local function recent_enough(iso)
+  if not iso or iso == "" then return false end
+  local cutoff = os.date("!%Y-%m-%dT%H:%M:%SZ",
+    os.time() - EPOCH_UNREAD_MAX_AGE_DAYS * 86400)
+  return iso_gt(iso, cutoff)
+end
+
 -- channel ids, including the historical @thread.v2 vs @thread.tacv2 variant
 -- (that suffix change used to produce different cache keys)
 local function channel_ids(cid)
@@ -311,7 +331,13 @@ local function is_message_unread(msg, chat)
     lr = vp and nv(vp.lastMessageReadDateTime)
     from_viewpoint = lr ~= nil
   end
-  if from_viewpoint and is_epoch_read(lr) then return false end
+  if from_viewpoint and is_epoch_read(lr) then
+    local ct = nv(msg.createdDateTime)
+    if not ct or not recent_enough(ct) then return false end
+    local from = nv(msg.from) and nv(nv(msg.from).user)
+    if from and is_from_me(from) then return false end
+    return true
+  end
   local ct = nv(msg.createdDateTime)
   if not lr or not ct then return false end
   if ct <= lr then return false end
@@ -331,15 +357,6 @@ local function is_message_unread_or_review(msg, chat)
   local ct = nv(msg.createdDateTime)
   if not ct then return false end
   return ct > rf
-end
-
--- ISO-8601 UTC timestamps compare lexicographically, but fractional seconds
--- break that ('.' sorts before 'Z'), so normalize to second precision first.
-local function iso_gt(a, b)
-  if type(a) ~= "string" or type(b) ~= "string" or a == "" or b == "" then return false end
-  local na = a:gsub("%.%d+Z$", "Z")
-  local nb = b:gsub("%.%d+Z$", "Z")
-  return na > nb
 end
 
 -- cache keys for a channel, across id variants
@@ -451,11 +468,18 @@ local function has_unread(chat)
     lr = vp and nv(vp.lastMessageReadDateTime)
     from_viewpoint = lr ~= nil
   end
-  if from_viewpoint and is_epoch_read(lr) then
-    -- unknown read state: this placeholder must not mark the chat unread
-    return false
-  end
   local preview = nv(chat.lastMessagePreview)
+  if from_viewpoint and is_epoch_read(lr) then
+    -- Graph uses the epoch placeholder when it has no read timestamp. For a
+    -- real recent message from someone else, treat it as unread; old/absent
+    -- previews stay unknown so stale history does not light up.
+    if not (preview and not is_system_message(preview)) then return false end
+    local lu = nv(preview.createdDateTime)
+    if not lu or not recent_enough(lu) then return false end
+    local pFrom = nv(preview.from) and nv(nv(preview.from).user)
+    if (pFrom and is_from_me(pFrom)) or nv(preview.isOwned) == true then return false end
+    return true
+  end
   if preview and is_system_message(preview) then
     -- Member joined/left, call events, renames, etc. are not new messages in
     -- Teams; only honor an explicit local "mark unread" override.
@@ -933,9 +957,14 @@ local function get_last_read_iso(chat)
   local cache = require("ms-teams.cache")
   local override = nv(chat.chatType) == "channel" and channel_last_read(nv(chat.id))
     or cache.get_last_read(nv(chat.id))
-  if override then return override end
+  if override then
+    if is_epoch_read(override) then return nil end
+    return override
+  end
   local vp = nv(chat.viewpoint)
-  return vp and nv(vp.lastMessageReadDateTime)
+  local lr = vp and nv(vp.lastMessageReadDateTime)
+  if lr and not is_epoch_read(lr) then return lr end
+  return nil
 end
 
 -- coalesce rapid re-renders (tab resolve + search + watch) into one per tick
@@ -2004,14 +2033,7 @@ function M.pick_chats()
     for _, c in ipairs(chats) do
       if c ~= vim.NIL and nv(c.id) and not hidden_set[nv(c.id)] then table.insert(filtered, c) end
     end
-    local function without_meeting_chats(list)
-      local out = {}
-      for _, c in ipairs(list or {}) do
-        if c ~= vim.NIL and nv(c.chatType) ~= "meeting" then table.insert(out, c) end
-      end
-      return out
-    end
-    chats = without_meeting_chats(filtered)
+    chats = filtered
     table.sort(chats, function(a, b)
       -- pin 48:notes siempre arriba como en Teams
       if nv(a.id)=="48:notes" then return true end
@@ -2027,7 +2049,7 @@ function M.pick_chats()
       local idx=nil; for i,c in ipairs(chats) do if nv(c.id)=="48:notes" then idx=i; break end end
       if idx and idx>1 then local n=table.remove(chats, idx); table.insert(chats,1,n) end
     end
-    local all_for_search = without_meeting_chats(all_chats or chats)
+    local all_for_search = all_chats or vim.deepcopy(chats)
     local display = {}
     local is_filtering = current_filter and current_filter ~= ""
     for _, c in ipairs(chats) do
