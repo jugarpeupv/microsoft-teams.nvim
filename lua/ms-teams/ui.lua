@@ -71,6 +71,11 @@ end
 local tab_throttle_until = 0
 local refresh_inflight = false
 
+-- associated teams change rarely; cache for a day and refresh only when stale.
+-- R in the chats list reuses that cache; R in :MSTeamsTeams forces a refresh.
+-- Kept in sync with graph.list_teams' TTL.
+local TEAMS_TTL = graph.TEAMS_CACHE_TTL or 86400
+
 -- channel unread probes: list_channels carries no preview/read state, so the
 -- newest message must be fetched per channel. Those probes are paced and
 -- throttled: a burst trips Graph 429 and retrying extends the penalty.
@@ -193,8 +198,36 @@ local function is_from_me(fromUser)
   return false
 end
 
+-- oneOnOne chat ids are 19:<aad-guid>_<aad-guid>@unq.gbl.spaces. Graph's
+-- $expand=members often returns only the authenticated user, so derive the
+-- other participant from the id.
+local function one_on_one_other_id(chat)
+  if nv(chat.chatType) ~= "oneOnOne" then return nil end
+  local id = nv(chat.id) or ""
+  local a, b = id:match("^19:([%x%-]+)_([%x%-]+)@")
+  if not a or not b or a == b then return nil end
+  local me_id = nil
+  local ok, me = pcall(require("ms-teams.cache").load, "me")
+  if ok and me and me.id then me_id = me.id end
+  if not me_id then me_id = vim.g.ms_teams_me_id end
+  if not me_id then
+    local members = nv(chat.members)
+    if type(members) == "table" then
+      for _, m in ipairs(members) do
+        local uid = nv(m.userId) or nv(m.id)
+        if uid == a or uid == b then me_id = uid; break end
+      end
+    end
+  end
+  if me_id == a then return b end
+  if me_id == b then return a end
+  return nil
+end
+
 local function get_other_user_id(chat)
   if nv(chat.chatType) ~= "oneOnOne" then return nil end
+  local derived = one_on_one_other_id(chat)
+  if derived then return derived end
   local members = nv(chat.members)
   if members and type(members) == "table" and #members > 0 then
     local me = nil
@@ -956,6 +989,90 @@ local function make_snippet(plain, q)
   return snippet, hl_s, hl_e
 end
 
+local function chat_short_id(chat)
+  local id = nv(chat.id) or ""
+  if id == "" then return "" end
+  if nv(chat.chatType) == "oneOnOne" then
+    local other = one_on_one_other_id(chat)
+    if other and other ~= "" then return other:sub(-8) end
+  end
+  local base = id:gsub("@.*$", "")
+  local s = base:sub(-8)
+  if s == "" then s = id:sub(1, 8) end
+  return s
+end
+
+-- ChatMessage.from can carry a user OR an application (bots such as
+-- Workflows): Graph /users does not know those application ids, but the
+-- message still has the display name we want for the 1:1 title.
+local function message_sender_name(m)
+  local from = nv(m and m.from)
+  if type(from) ~= "table" then return nil end
+  for _, key in ipairs({ "user", "application", "device", "conversation" }) do
+    local who = nv(from[key])
+    if type(who) == "table" then
+      local name = nv(who.displayName)
+      if name and name ~= "" then return name end
+    end
+  end
+end
+
+local chat_sender_name_memo = {}
+
+-- newest non-self sender seen in cached/open messages (used when the other
+-- 1:1 aad id cannot be resolved through /users, e.g. bot chats)
+local function cached_other_sender_name(chat)
+  local cid = nv(chat.id)
+  if not cid then return nil end
+  local memo = chat_sender_name_memo[cid]
+  if memo and (os.time() - memo.at) < 60 then return memo.name end
+  local function newest(msgs)
+    local best, best_dt = nil, ""
+    for _, m in ipairs(msgs or {}) do
+      if m ~= vim.NIL and not is_system_message(m) then
+        local from = nv(m.from)
+        local user = type(from) == "table" and nv(from.user) or nil
+        if not (type(user) == "table" and is_from_me(user)) then
+          local name = message_sender_name(m)
+          local dt = nv(m.createdDateTime) or ""
+          if name and (best == nil or dt >= best_dt) then
+            best, best_dt = name, dt
+          end
+        end
+      end
+    end
+    return best
+  end
+  local name = nil
+  local key = "messages_" .. cid:gsub("[^%w%-_:.]", "_"):sub(1, 60)
+  local ok, cached = pcall(require("ms-teams.cache").load, key)
+  if ok and cached and type(cached.messages) == "table" then
+    name = newest(cached.messages)
+  end
+  if not name then
+    local preview = nv(chat.lastMessagePreview)
+    if preview and not is_system_message(preview) then
+      name = newest({ preview })
+    end
+  end
+  if not name then
+    for _, b in ipairs(vim.api.nvim_list_bufs()) do
+      if vim.api.nvim_buf_is_valid(b) then
+        local ok_id, bid = pcall(vim.api.nvim_buf_get_var, b, "ms_teams_chat_id")
+        if ok_id and bid == cid then
+          local ok_raw, raw = pcall(vim.api.nvim_buf_get_var, b, "ms_teams_raw_msgs")
+          if ok_raw and type(raw) == "table" then
+            name = newest(raw)
+            if name then break end
+          end
+        end
+      end
+    end
+  end
+  chat_sender_name_memo[cid] = { name = name, at = os.time() }
+  return name
+end
+
 local function format_chat(chat)
   if nv(chat.id) == "48:notes" then
     local me = get_me()
@@ -965,49 +1082,43 @@ local function format_chat(chat)
   local topic = nv(chat.topic)
   if topic and topic ~= "" then return topic end
   if nv(chat.chatType) == "oneOnOne" then
+    local short = chat_short_id(chat)
     local members = nv(chat.members)
-    if members and type(members) == "table" then
-      local valid = {}
-      for _, m in ipairs(members) do if m ~= vim.NIL and nv(m.displayName) then table.insert(valid, m) end end
-      if #valid == 1 then
-        local n = nv(valid[1].displayName) or "oneOnOne"
-        local email = nv(valid[1].email) or ""
-        local short = nv(chat.id) and nv(chat.id):sub(1,8) or ""
-        -- Graph con $expand=members y limit=500 trunca a 1 miembro en muchos oneOnOne
-        -- si el único miembro coincide con el usuario actual autenticado (get_me), mostramos shortId
-        -- y el plugin lo enriquecerá async vía GET /chats/{id}
-        local me_tmp2 = get_me()
-        local me_n2 = me_tmp2 and me_tmp2.displayName
-        local me_mail = me_tmp2 and (me_tmp2.mail or me_tmp2.userPrincipalName)
-        if n == me_n2 or (me_mail and email ~= "" and email:lower() == me_mail:lower()) then
-          if me_mail and email ~= "" and email:lower() == me_mail:lower() then
-            -- si ya enriquecido o mail coincide, es self chat; si no, es incompleto -> hint
-            return n .. " (You) [" .. short .. "]"
-          else
-            return n .. " [" .. short .. "]"
-          end
-        end
-        return n .. " (You?) [" .. short .. "]"
-      end
-      if #valid == 2 then
-        for _, m in ipairs(valid) do
-          local name = nv(m.displayName)
-          local me = get_me(); local me_name = me and me.displayName; if name and name ~= "" and (not me_name or name ~= me_name) then return name end
-        end
-      end
-      -- fallback: lista miembros sin ti
-      local others = {}
-      for _, m in ipairs(valid) do
-        local name = nv(m.displayName)
-        local me2 = get_me(); local me_n2 = me2 and me2.displayName; if name and (not me_n2 or name ~= me_n2) then table.insert(others, name) end
-      end
-      if #others > 0 then return table.concat(others, ", ") end
-      for _, m in ipairs(valid) do
-        local n = nv(m.displayName)
-        if n and n ~= "" then return n end
+    local valid = {}
+    if type(members) == "table" then
+      for _, m in ipairs(members) do
+        if m ~= vim.NIL and nv(m.displayName) then table.insert(valid, m) end
       end
     end
-    return "oneOnOne [" .. (nv(chat.id) and nv(chat.id):sub(1,8) or "") .. "]"
+    local me = get_me()
+    local me_name = me and me.displayName
+    local me_mail = me and (me.mail or me.userPrincipalName)
+    local function is_me_member(m)
+      local name = nv(m.displayName)
+      local email = nv(m.email)
+      if me_name and name == me_name then return true end
+      if me_mail and email and email ~= "" and email:lower() == me_mail:lower() then return true end
+      return false
+    end
+    -- a real other member wins
+    for _, m in ipairs(valid) do
+      if not is_me_member(m) then return nv(m.displayName) end
+    end
+    -- members only contain self (Graph often truncates 1:1 members) or are
+    -- missing: derive the other aad id from the chat id and resolve its name
+    local other = one_on_one_other_id(chat)
+    if other then
+      local name = resolve_identity_name(other)
+      if not name or name == "" then name = cached_other_sender_name(chat) end
+      if name and name ~= "" then return name end
+      return "oneOnOne [" .. short .. "]"
+    end
+    -- genuine self chat / unknown id layout
+    if #valid == 1 then
+      local n = nv(valid[1].displayName) or "oneOnOne"
+      return n .. " (You) [" .. short .. "]"
+    end
+    return "oneOnOne [" .. short .. "]"
   end
   return (nv(chat.chatType) or "chat") .. (nv(chat.topic) and nv(chat.topic)~="" and (": "..nv(chat.topic)) or "")
 end
@@ -1029,8 +1140,8 @@ end
 local function chat_label(chat, counts)
   local base = format_chat(chat)
   if counts and (counts[base] or 0) > 1 then
-    local id = nv(chat.id)
-    if id and id ~= "" then return base .. " [" .. id:sub(1, 8) .. "]" end
+    local short = chat_short_id(chat)
+    if short ~= "" then return base .. " [" .. short .. "]" end
   end
   return base
 end
@@ -1664,7 +1775,6 @@ function M.pick_chats()
   local current_filter = nil -- shown in header
   local show_all_limit = false -- toggled by gS
   local show_unread_only = false -- toggled by U
-  if vim.g.ms_teams_show_meeting == nil then vim.g.ms_teams_show_meeting = true end
   local enriching = false
   local enriched = {}
   -- channel latest-message probes run in the background after a render. A
@@ -1783,12 +1893,44 @@ function M.pick_chats()
     end
   end, 4000)
   local function ensure_teams_open()
-    local tc = cache.load("teams_associated", 300)
-    if tc and tc.teams and tc.source == "associated" then
+    local tc = cache.load("teams_associated")
+    if tc and tc.teams and #tc.teams > 0 and tc.source == "associated" then
       teams_data = tc.teams
       local cm = cache.load("teams_channels")
       if cm then channels_map = cm end
       gate_check("teams")
+      local fresh = tc._ts and (os.time() - tc._ts) < TEAMS_TTL
+      if not fresh then
+        -- stale: paint the cached list immediately and refresh once in the
+        -- background (never block the first paint, never warn)
+        vim.defer_fn(function()
+          if not vim.api.nvim_buf_is_valid(buf) then return end
+          local function repaint()
+            if not vim.api.nvim_buf_is_valid(buf) then return end
+            local ok, all = pcall(vim.api.nvim_buf_get_var, buf, "ms_teams_all_chats")
+            if ok and all then
+              request_render(all, all, false, current_filter or "", { background = true })
+            end
+          end
+          require("ms-teams.graph").list_teams(function(nt, err, meta)
+            if err or not nt or #nt == 0 then return end
+            if meta and (meta.stale or meta.partial or meta.cached) then
+              if meta and meta.stale then
+                teams_partial_reason = "teams list cached; refresh unavailable (throttled)"
+                repaint()
+              end
+              return
+            end
+            teams_data = nt
+            teams_partial_reason = nil
+            load_all_channels(nt, function(fetched, had_error)
+              if fetched then cache.save("teams_channels", channels_map) end
+              channels_error = had_error or false
+              repaint()
+            end)
+          end)
+        end, 1000)
+      end
       return
     end
     require("ms-teams.graph").list_teams(function(nt, err, meta)
@@ -1797,12 +1939,7 @@ function M.pick_chats()
         teams_partial_reason = (meta and meta.partial)
           and ("teams list partial: associated teams unavailable (" .. tostring(meta.reason or "throttled") .. "); retry later")
           or nil
-        if meta and meta.partial then
-          vim.schedule(function()
-            vim.notify("ms-teams: associated teams unavailable (" .. tostring(meta.reason or "throttled")
-              .. "); showing joined teams. Retry later or press R in :MSTeamsTeams.", vim.log.levels.WARN)
-          end)
-        else
+        if not (meta and (meta.partial or meta.cached)) then
           cache.save("teams_associated", { teams = nt, source = "associated" })
         end
         load_all_channels(nt, function(fetched, had_error)
@@ -1835,15 +1972,16 @@ function M.pick_chats()
       local empty_header = "# Teams chats (0/" .. #(all_chats or chats) .. " shown"
         .. (current_filter and current_filter ~= "" and ' | filter: "' .. current_filter .. '"' or "")
         .. (is_cached and " - cached" or "") .. ")"
-      local empty_lines = { empty_header }
-      local help_hint = keymap_hint("chat_list")
-      if help_hint then table.insert(empty_lines, help_hint) end
-      table.insert(empty_lines, "")
-      table.insert(empty_lines, "_no matches_ — / para buscar, R refresh, q close")
-      table.insert(empty_lines, "")
+      local empty_lines = {
+        empty_header,
+        "",
+        "_no matches_ — / para buscar, R refresh, q close",
+        "",
+      }
       set_list_lines(empty_lines)
       -- still bind vars so / can be retried
       pcall(vim.api.nvim_buf_set_var, buf, "ms_teams_all_chats", all_chats or chats)
+      pcall(vim.api.nvim_buf_set_var, buf, "ms_teams_line_to_entry", {})
       vim.notify("no chats found" .. (current_filter and ' for "' .. current_filter .. '"' or ""), vim.log.levels.WARN)
       return
     end
@@ -1866,7 +2004,14 @@ function M.pick_chats()
     for _, c in ipairs(chats) do
       if c ~= vim.NIL and nv(c.id) and not hidden_set[nv(c.id)] then table.insert(filtered, c) end
     end
-    chats = filtered
+    local function without_meeting_chats(list)
+      local out = {}
+      for _, c in ipairs(list or {}) do
+        if c ~= vim.NIL and nv(c.chatType) ~= "meeting" then table.insert(out, c) end
+      end
+      return out
+    end
+    chats = without_meeting_chats(filtered)
     table.sort(chats, function(a, b)
       -- pin 48:notes siempre arriba como en Teams
       if nv(a.id)=="48:notes" then return true end
@@ -1882,14 +2027,12 @@ function M.pick_chats()
       local idx=nil; for i,c in ipairs(chats) do if nv(c.id)=="48:notes" then idx=i; break end end
       if idx and idx>1 then local n=table.remove(chats, idx); table.insert(chats,1,n) end
     end
-    local all_for_search = all_chats or vim.deepcopy(chats)
+    local all_for_search = without_meeting_chats(all_chats or chats)
     local display = {}
-    -- during an active filter (current_filter ~= nil/"") do NOT hide meetings — lets you find self/meeting chats
     local is_filtering = current_filter and current_filter ~= ""
     for _, c in ipairs(chats) do
-      local pass_meeting = is_filtering or nv(c.chatType) ~= "meeting" or vim.g.ms_teams_show_meeting
       local pass_unread = not show_unread_only or has_unread(c)
-      if pass_meeting and pass_unread then table.insert(display, c) end
+      if pass_unread then table.insert(display, c) end
     end
     -- when filtering, prioritize self-chat (1 member) > oneOnOne > rest, then by recency
     if is_filtering then
@@ -1962,14 +2105,11 @@ function M.pick_chats()
     local header = "# Teams chats (" .. #display .. "/" .. #all_for_search .. " shown"
       .. (current_filter and current_filter ~= "" and ' | filter: "' .. current_filter .. '"' or "")
       .. (show_unread_only and " - unread only" or "")
-      .. (is_cached and " - cached" or "") .. (is_filtering and " - meeting included" or (vim.g.ms_teams_show_meeting and "" or " - meeting hidden, M to show")) .. ")"
+      .. (is_cached and " - cached" or "") .. ")"
     local lines = {}
-    table.insert(lines, header)
-    local help_hint = keymap_hint("chat_list")
-    if help_hint then table.insert(lines, help_hint) end
-    table.insert(lines, "")
     local line_to_chat = {}
     local line_to_entry = {}
+    table.insert(lines, header)
     local unread_lines = {}
     local name_counts = unique_chat_names(display)
       for _, chat in ipairs(display) do
@@ -2261,12 +2401,31 @@ function M.pick_chats()
     end, 50)
     -- enrich oneOnOne chats that still show as oneOnOne due to $expand=lastMessagePreview only (no members)
     do
-      local to_fetch = {}
+      local to_fetch, other_ids, other_seen = {}, {}, {}
       for _, c in ipairs(all_for_search) do
-        if nv(c.chatType) == "oneOnOne" then
-          local fmt = format_chat(c)
-          if fmt:match("^oneOnOne") and not enriched[nv(c.id)] then table.insert(to_fetch, c) end
+        if nv(c.chatType) == "oneOnOne" and nv(c.id) and not enriched[nv(c.id)] then
+          local other = one_on_one_other_id(c)
+          if other then
+            if not resolve_identity_name(other) and not cached_other_sender_name(c)
+                and not other_seen[other] then
+              other_seen[other] = true
+              table.insert(other_ids, other)
+            end
+          elseif format_chat(c):match("^oneOnOne") then
+            table.insert(to_fetch, c)
+          end
         end
+      end
+      if #other_ids > 0 then
+        resolve_names_async(other_ids, function()
+          vim.schedule(function()
+            if not vim.api.nvim_buf_is_valid(buf) then return end
+            local okAll, _ = pcall(vim.api.nvim_buf_get_var, buf, "ms_teams_all_chats")
+            if okAll then
+              request_render(all_for_search, all_for_search, false, current_filter or "", { background = true })
+            end
+          end)
+        end)
       end
       if #to_fetch > 0 and not enriching then
         enriching = true
@@ -2366,13 +2525,12 @@ function M.pick_chats()
       end)
     end)
     set_key(buf, "chat_list", "help", function()
-      open_keymap_float("Chats keymaps", collect_keymap_items("chat_list", {
+      local items = collect_keymap_items("chat_list", {
         { "open", "open in place" },
         { "open_split", "open in horizontal split" },
         { "open_vsplit", "open in vertical split" },
         { "search", "search" },
         { "toggle_unread", "unread" },
-        { "toggle_meeting", "meeting" },
         { "toggle_limit", "show more/less" },
         { "refresh", "refresh (incl. channels)" },
         { "hide", "hide" },
@@ -2381,18 +2539,14 @@ function M.pick_chats()
         { "user_detail", "user detail (1:1)" },
         { "help", "see keymaps" },
         { "close", "close" },
-      }))
+      })
+      open_keymap_float("Chats keymaps", items)
     end, {desc="Teams help"})
     set_key(buf, "chat_list", "toggle_unread", function()
       show_unread_only = not show_unread_only
       render_and_bind(all_for_search, all_for_search, false, current_filter or "")
       vim.notify(show_unread_only and "Showing unread chats only" or "Showing all chats", vim.log.levels.INFO)
     end, {desc="Toggle unread only"})
-    set_key(buf, "chat_list", "toggle_meeting", function()
-      vim.g.ms_teams_show_meeting=not vim.g.ms_teams_show_meeting
-      render_and_bind(all_for_search, all_for_search, false, current_filter or "")
-      vim.notify(vim.g.ms_teams_show_meeting and "Showing meetings" or "Hiding meetings", vim.log.levels.INFO)
-    end, {desc="Toggle show meetings"})
     set_key(buf, "chat_list", "toggle_limit", function()
       show_all_limit = not show_all_limit
       render_and_bind(all_for_search, all_for_search, false, current_filter or "")
@@ -2426,20 +2580,23 @@ function M.pick_chats()
             teams_partial_reason = (meta and meta.partial)
               and ("teams list partial: associated teams unavailable (" .. tostring(meta.reason or "throttled") .. "); retry later")
               or nil
-            if meta and meta.partial then
-              vim.schedule(function()
-                vim.notify("ms-teams: associated teams unavailable (" .. tostring(meta.reason or "throttled")
-                  .. "); showing joined teams. Retry later.", vim.log.levels.WARN)
-              end)
-            else
+            if not (meta and (meta.partial or meta.cached)) then
               cache.save("teams_associated",{teams=nt, source="associated"})
             end
-            load_all_channels(nt, function(fetched, had_error)
-              if fetched then cache.save("teams_channels", channels_map) end
-              channels_error = had_error or false
+            if meta and meta.stale then
+              -- teams were throttled and we are serving the cached list:
+              -- don't fan out channel requests while throttled
               render_and_bind(nc,nc,false,"")
-              vim.notify(string.format("refreshed %d chats + %d teams", #nc, #nt), vim.log.levels.INFO)
-            end, { force = true })
+              vim.notify(string.format("refreshed %d chats (teams cached)", #nc), vim.log.levels.INFO)
+            else
+              load_all_channels(nt, function(fetched, had_error)
+                if fetched then cache.save("teams_channels", channels_map) end
+                channels_error = had_error or false
+                render_and_bind(nc,nc,false,"")
+                local suffix = (meta and meta.cached) and " (teams cached)" or ""
+                vim.notify(string.format("refreshed %d chats + %d teams%s", #nc, #nt, suffix), vim.log.levels.INFO)
+              end, { force = true })
+            end
           else
             render_and_bind(nc,nc,false,"")
             vim.notify(string.format("refreshed %d chats", #nc), vim.log.levels.INFO)
@@ -2767,11 +2924,31 @@ function M.pick_chats()
         end
       end
     end
-    local to_fetch = {}
+    local to_fetch, other_ids, other_seen = {}, {}, {}
     for _, c in ipairs(chats or {}) do
       if c ~= vim.NIL and nv(c.chatType) == "oneOnOne" and nv(c.id) and not enriched[nv(c.id)] then
-        if format_chat(c):match("^oneOnOne") then table.insert(to_fetch, c) end
+        local other = one_on_one_other_id(c)
+        if other then
+          if not resolve_identity_name(other) and not cached_other_sender_name(c)
+              and not other_seen[other] then
+            other_seen[other] = true
+            table.insert(other_ids, other)
+          end
+        elseif format_chat(c):match("^oneOnOne") then
+          table.insert(to_fetch, c)
+        end
       end
+    end
+    if #other_ids > 0 then
+      resolve_names_async(other_ids, function()
+        vim.schedule(function()
+          if not vim.api.nvim_buf_is_valid(buf) then return end
+          local ok, all = pcall(vim.api.nvim_buf_get_var, buf, "ms_teams_all_chats")
+          if ok and all then
+            request_render(all, all, false, current_filter or "", { background = true })
+          end
+        end)
+      end)
     end
     if #to_fetch == 0 then cb(); return end
     local done = false
@@ -7477,9 +7654,7 @@ function M.find_chats(opts)
     local valid_chats = {}
     for _, c in ipairs(chats) do
       if c ~= vim.NIL and nv(c.id) and not hidden_set[nv(c.id)] then
-        if nv(c.chatType) ~= "meeting" or vim.g.ms_teams_show_meeting then
-          table.insert(valid_chats, c)
-        end
+        table.insert(valid_chats, c)
       end
     end
 
@@ -7923,7 +8098,7 @@ end
 
 function M.pick_teams()
   local cache = require("ms-teams.cache")
-  local cached = cache.load("teams_associated", 300)
+  local cached = cache.load("teams_associated")
   if not (cached and cached.source == "associated" and cached.teams and #cached.teams > 0) then
     cached = nil
   end
@@ -7981,13 +8156,16 @@ function M.pick_teams()
     line_map = {}
     if not teams or #teams == 0 then
       local header = "# Teams (" .. #teams .. ")"
+        .. (partial_reason and (" - " .. partial_reason) or "")
         .. (current_filter and current_filter ~= "" and ' | filter: "' .. clean(current_filter) .. '"' or "")
         .. (is_cached and " - cached" or "")
       local empty_lines = { header }
       local hint = teams_hint()
       if hint then table.insert(empty_lines, hint) end
       table.insert(empty_lines, "")
-      table.insert(empty_lines, "_no teams found_ — / para buscar, R refresh, q close")
+      table.insert(empty_lines, partial_reason
+        and ("_" .. partial_reason .. "_")
+        or "_no teams found_ — / para buscar, R refresh, q close")
       table.insert(empty_lines, "")
       vim.api.nvim_buf_set_lines(buf, 0, -1, false, empty_lines)
       return
@@ -8100,22 +8278,28 @@ function M.pick_teams()
   end
   local function refresh_teams()
     require("ms-teams.graph").list_teams(function(new_teams, err, meta)
-      if err then vim.notify("refresh failed: " .. err, vim.log.levels.ERROR); return end
+      if err or not new_teams then
+        partial_reason = "teams refresh failed: " .. tostring(err or "empty list")
+        render_and_bind(teams_data or {}, false)
+        return
+      end
       partial_reason = (meta and meta.partial)
-        and ("associated teams unavailable (" .. tostring(meta.reason or "throttled") .. "); retry later")
+        and ("associated teams unavailable (" .. tostring(meta.reason or "throttled") .. "); using cached list")
         or nil
-      if meta and meta.partial then
-        vim.notify("associated teams unavailable (" .. tostring(meta.reason or "throttled")
-          .. "); showing joined teams. Retry later.", vim.log.levels.WARN)
-      else
+      if not (meta and (meta.partial or meta.cached)) then
         cache.save("teams_associated", { teams = new_teams, source = "associated" })
       end
-      load_all_channels(new_teams, function(fetched)
-        if fetched then cache.save("teams_channels", channels_map) end
+      if meta and meta.stale then
+        -- refresh was throttled: keep cached teams and channels, no fan-out
         render_and_bind(new_teams, false)
-        vim.notify(string.format("refreshed %d teams", #new_teams), vim.log.levels.INFO)
-      end, { force = true })
-    end)
+      else
+        load_all_channels(new_teams, function(fetched)
+          if fetched then cache.save("teams_channels", channels_map) end
+          render_and_bind(new_teams, false)
+          vim.notify(string.format("refreshed %d teams", #new_teams), vim.log.levels.INFO)
+        end, { force = true })
+      end
+    end, { force = true })
   end
   local function bind_keymaps()
     set_key(buf, "teams", "open", function()
@@ -8153,40 +8337,41 @@ function M.pick_teams()
     teams_data = cached.teams
     channels_map = cache.load("teams_channels") or {}
     render_and_bind(teams_data, true)
-    vim.defer_fn(function()
-      require("ms-teams.graph").list_teams(function(new_teams, err, meta)
-        if err or not new_teams then return end
-        partial_reason = (meta and meta.partial)
-          and ("associated teams unavailable (" .. tostring(meta.reason or "throttled") .. "); retry later")
-          or nil
-        if meta and meta.partial then
-          vim.notify("associated teams unavailable (" .. tostring(meta.reason or "throttled")
-            .. "); showing joined teams. Retry later.", vim.log.levels.WARN)
-        else
-          cache.save("teams_associated", { teams = new_teams, source = "associated" })
-        end
-        load_all_channels(new_teams, function(fetched)
-          if fetched then cache.save("teams_channels", channels_map) end
-          if vim.api.nvim_buf_is_valid(buf) and vim.api.nvim_buf_get_name(buf):find("ms%-teams://teams") then
-            render_and_bind(new_teams, false)
-            vim.notify("teams updated (press R)", vim.log.levels.INFO)
+    local fresh = cached._ts and (os.time() - cached._ts) < TEAMS_TTL
+    if not fresh then
+      -- stale cache: show it immediately, refresh once in the background
+      vim.defer_fn(function()
+        require("ms-teams.graph").list_teams(function(new_teams, err, meta)
+          if err or not new_teams or #new_teams == 0 then return end
+          if meta and meta.stale then
+            partial_reason = "teams list cached; refresh unavailable (throttled)"
+            if vim.api.nvim_buf_is_valid(buf) then render_and_bind(teams_data or new_teams, true) end
+            return
           end
+          if meta and (meta.partial or meta.cached) then return end
+          load_all_channels(new_teams, function(fetched)
+            if fetched then cache.save("teams_channels", channels_map) end
+            if vim.api.nvim_buf_is_valid(buf) and vim.api.nvim_buf_get_name(buf):find("ms%-teams://teams") then
+              render_and_bind(new_teams, false)
+            end
+          end)
         end)
-      end)
-    end, 200)
+      end, 200)
+    end
     return
   end
   vim.api.nvim_buf_set_lines(buf, 0, -1, false, { "# Teams", "", "Loading teams...", "" })
   vim.api.nvim_win_set_buf(0, buf)
   require("ms-teams.graph").list_teams(function(teams, err, meta)
-    if err then vim.notify("ms-teams list_teams: " .. tostring(err), vim.log.levels.ERROR); return end
+    if err or not teams or #teams == 0 then
+      partial_reason = "teams unavailable: " .. tostring(err or "empty list")
+      render_and_bind({}, false)
+      return
+    end
     partial_reason = (meta and meta.partial)
-      and ("associated teams unavailable (" .. tostring(meta.reason or "throttled") .. "); retry later")
+      and ("associated teams unavailable (" .. tostring(meta.reason or "throttled") .. "); showing joined teams")
       or nil
-    if meta and meta.partial then
-      vim.notify("associated teams unavailable (" .. tostring(meta.reason or "throttled")
-        .. "); showing joined teams. Retry later.", vim.log.levels.WARN)
-    else
+    if not (meta and (meta.partial or meta.cached)) then
       cache.save("teams_associated", { teams = teams, source = "associated" })
     end
     load_all_channels(teams, function(fetched)

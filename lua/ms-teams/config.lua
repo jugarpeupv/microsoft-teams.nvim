@@ -49,7 +49,6 @@ local M = {}
 ---@field search? string|false
 ---@field help? string|false
 ---@field toggle_unread? string|false
----@field toggle_meeting? string|false
 ---@field toggle_limit? string|false
 ---@field refresh? string|false
 ---@field hide? string|false
@@ -292,7 +291,6 @@ M.defaults = {
       search = "g/",
       help = "g?",
       toggle_unread = "U",
-      toggle_meeting = "M",
       toggle_limit = "gS",
       refresh = "R",
       hide = "<C-x>",

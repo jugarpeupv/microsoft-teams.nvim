@@ -197,14 +197,18 @@ is untested. DavMail mode is the only supported path right now.
         Scopes of the current access token.
 
 :MSTeamsChats                                          *:MSTeamsChats*
-        Recent chats list. `R` refresh, `g?` keymaps, `mp` user detail,
-        `mr`/`mu` mark read/unread. Chats with the same name get a short id
-        suffix. Graph's 1970-01-01 read placeholder is treated as unknown,
-        so it does not mark the chat unread. System events (member
-        joined/left, calls, renames) do not mark the chat unread either.
-        Channels carry no server read state: their unread mark is inferred
-        from the local `mr`/`mu` reference plus cached/open messages, and a
-        paced background probe of the latest message covers channels seen
+        Recent chats list. Meeting chats are not shown here; use
+        |:MSTeamsSchedule| for meetings. `<CR>` / `<C-v>` / `<C-s>`
+        open the chat under the cursor. `R` refreshes chats and channels;
+        the teams list is reused from its 24-hour cache unless stale.
+        `g?` keymaps, `mp` user detail, `mr`/`mu` mark read/unread.
+        Chats with the same name get a short id suffix. Graph's
+        1970-01-01 read placeholder is treated as unknown, so it does not
+        mark the chat unread. System events (member joined/left, calls,
+        renames) do not mark the chat unread either. Channels carry no
+        server read state: their unread mark is inferred from the local
+        `mr`/`mu` reference plus cached/open messages, and a paced
+        background probe of the latest message covers channels seen
         before. `R` rechecks every channel; probes pause automatically
         after a Graph 429.
 
@@ -223,7 +227,8 @@ is untested. DavMail mode is the only supported path right now.
 
 :MSTeamsTeams                                          *:MSTeamsTeams*
         Teams and channels, including teams associated through shared
-        channels.
+        channels. The associated-teams list is cached for 24 hours; `R`
+        refreshes it, and a throttled refresh keeps the cached list.
 
 :MSTeamsFind                                            *:MSTeamsFind*
         Telescope fuzzy find over chats (`<C-b>` unread/all).

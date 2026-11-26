@@ -745,10 +745,106 @@ function M.hide_chat(chat_id, cb)
   end)
 end
 
-function M.list_teams(cb)
+-- associatedTeams changes rarely (direct memberships and shared-channel host
+-- teams). Cache it for a day and, on throttling, keep serving the cached
+-- associated list instead of falling back to joinedTeams (which is a second
+-- request and hides shared-channel host teams anyway).
+local TEAMS_TTL = 86400
+local TEAMS_JOINED_TTL = 3600
+local TEAMS_THROTTLE_COOLDOWN = 900
+local teams_inflight = nil -- { cb, ... } while one request is in flight
+local teams_throttle_until = 0
+M.TEAMS_CACHE_TTL = TEAMS_TTL
+
+local function is_teams_throttle(err)
+  local s = tostring(err or ""):lower()
+  return s:find("toomanyrequests", 1, true) ~= nil
+    or s:find("429", 1, true) ~= nil
+    or s:find("throttl", 1, true) ~= nil
+end
+
+function M.list_teams(cb, opts)
   -- associatedTeams also includes host teams of shared channels, not just
   -- teams the user is a direct member of. That matches the Teams client's
   -- "Teams and channels" list better than joinedTeams.
+  opts = opts or {}
+  local cache = require("ms-teams.cache")
+  local cached = cache.load("teams_associated")
+  local cached_teams = (cached and cached.source == "associated"
+    and type(cached.teams) == "table" and #cached.teams > 0) and cached.teams or nil
+  local fresh = cached_teams and cached._ts
+    and (os.time() - cached._ts) < (opts.ttl or TEAMS_TTL)
+  local function fresh_joined()
+    local jc = cache.load("teams_joined")
+    if jc and type(jc.teams) == "table" and #jc.teams > 0 and jc._ts
+        and (os.time() - jc._ts) < TEAMS_JOINED_TTL then
+      return jc.teams
+    end
+  end
+
+  if fresh and not opts.force then
+    cb(cached_teams, nil, { source = "associated", cached = true })
+    return
+  end
+
+  local now = os.time()
+  if now < teams_throttle_until then
+    if cached_teams then
+      cb(cached_teams, nil, {
+        source = "associated", cached = true, stale = true,
+        partial = true, reason = "throttled",
+      })
+    else
+      local joined = fresh_joined()
+      if joined then
+        cb(joined, nil, {
+          source = "joined", cached = true, stale = true,
+          partial = true, reason = "throttled",
+        })
+      else
+        cb(nil, "[TooManyRequests] teams cache is empty; try again later",
+          { source = "associated", partial = true, reason = "throttled" })
+      end
+    end
+    return
+  end
+
+  -- coalesce concurrent callers (chats list + teams list + background
+  -- refresh) into one Graph request
+  if teams_inflight then
+    table.insert(teams_inflight, cb)
+    return
+  end
+  teams_inflight = { cb }
+  local function finish(teams, err, meta)
+    local waiters = teams_inflight or {}
+    teams_inflight = nil
+    for _, w in ipairs(waiters) do
+      vim.schedule(function() w(teams, err, meta) end)
+    end
+  end
+  local joined_fallback
+  local function stale_or_fallback(err)
+    if is_teams_throttle(err) then
+      teams_throttle_until = os.time() + TEAMS_THROTTLE_COOLDOWN
+    end
+    if cached_teams then
+      finish(cached_teams, nil, {
+        source = "associated", cached = true, stale = true,
+        partial = true, reason = err,
+      })
+      return
+    end
+    local joined = fresh_joined()
+    if joined then
+      finish(joined, nil, {
+        source = "joined", cached = true, stale = true,
+        partial = true, reason = err,
+      })
+      return
+    end
+    joined_fallback(err)
+  end
   local all, seen = {}, {}
   local function collect(j)
     for _, t in ipairs(j.value or {}) do
@@ -759,15 +855,19 @@ function M.list_teams(cb)
       end
     end
   end
-  local function joined_fallback(err)
+  joined_fallback = function(err)
     local fallback = {}
     local function fetch(url)
       graph_request_async("read", "GET", url, nil, function(j, e)
         if not j then
+          if is_teams_throttle(e or err) then
+            teams_throttle_until = os.time() + TEAMS_THROTTLE_COOLDOWN
+          end
           if #fallback > 0 then
-            cb(fallback, nil, { source = "joined", partial = true, reason = e or err })
+            cache.save("teams_joined", { teams = fallback, source = "joined" })
+            finish(fallback, nil, { source = "joined", partial = true, reason = e or err })
           else
-            cb(nil, e or err, { source = "joined", partial = true, reason = e or err })
+            finish(nil, e or err, { source = "joined", partial = true, reason = e or err })
           end
           return
         end
@@ -776,7 +876,10 @@ function M.list_teams(cb)
         if nextLink and nextLink ~= "" then
           fetch(nextLink:gsub("^https://graph.microsoft.com/v1.0", ""))
         else
-          cb(fallback, nil, { source = "joined", partial = true, reason = err })
+          if #fallback > 0 then
+            cache.save("teams_joined", { teams = fallback, source = "joined" })
+          end
+          finish(fallback, nil, { source = "joined", partial = true, reason = err })
         end
       end)
     end
@@ -785,10 +888,19 @@ function M.list_teams(cb)
   local function fetch(url)
     graph_request_async("read", "GET", url, nil, function(j, err)
       if not j then
+        local throttled = is_teams_throttle(err)
+        if throttled then
+          teams_throttle_until = os.time() + TEAMS_THROTTLE_COOLDOWN
+        end
         if #all > 0 then
-          cb(all, nil, { source = "associated", partial = true, reason = err })
+          -- partial page: keep what we got, but mark it stale when throttled so
+          -- callers skip the channel fan-out and the next call respects cooldown
+          finish(all, nil, {
+            source = "associated", partial = true, stale = throttled or nil,
+            reason = err,
+          })
         else
-          joined_fallback(err)
+          stale_or_fallback(err)
         end
         return
       end
@@ -797,9 +909,10 @@ function M.list_teams(cb)
       if nextLink and nextLink ~= "" then
         fetch(nextLink:gsub("^https://graph.microsoft.com/v1.0", ""))
       elseif #all > 0 then
-        cb(all, nil, { source = "associated" })
+        cache.save("teams_associated", { teams = all, source = "associated" })
+        finish(all, nil, { source = "associated" })
       else
-        joined_fallback(nil)
+        stale_or_fallback(nil)
       end
     end)
   end
