@@ -1537,6 +1537,124 @@ local function build_message_lines(m, chat)
   local mtype = nv(m.messageType)
   local edetail = nv(m.eventDetail)
   local rendered_file = false
+  -- Adaptive Cards (bots/workflows, link previews, meeting invites) arrive as
+  -- an attachment whose JSON body is never shown by the raw Graph message.
+  -- Flatten the common element types into markdown instead of printing the
+  -- opaque "[Attachment: application/vnd.microsoft.card.adaptive]" line.
+  local function render_adaptive_card(content)
+    local card = content
+    if type(card) == "string" then
+      local raw = card:gsub("^\239\187\191", "")
+      local ok, decoded = pcall(vim.json.decode, raw)
+      if not ok or type(decoded) ~= "table" then return false end
+      card = decoded
+    end
+    if type(card) ~= "table" or card == vim.NIL then return false end
+    local added = false
+    local function add(line)
+      added = true
+      table.insert(lines, line)
+    end
+    local walk
+    local function add_actions(actions, depth)
+      if depth > 8 or type(actions) ~= "table" then return end
+      for _, a in ipairs(actions) do
+        if type(a) == "table" and a ~= vim.NIL then
+          local title = nv(a.title) or nv(a.text)
+          local typ = nv(a.type) or ""
+          local url = nv(a.url)
+          if title and title ~= "" then
+            if typ == "Action.OpenUrl" and url and url ~= "" then
+              add("  [" .. title .. "](" .. url .. ")")
+            elseif typ == "Action.ShowCard" and type(nv(a.card)) == "table" then
+              add("  **" .. title .. "**")
+              walk(nv(nv(a.card).body), depth + 1)
+            else
+              add("  [" .. title .. "]")
+            end
+          end
+        end
+      end
+    end
+    local function add_text(el)
+      local text = nv(el.text)
+      if not text and type(nv(el.inlines)) == "table" then
+        local parts = {}
+        for _, inl in ipairs(nv(el.inlines)) do
+          if type(inl) == "table" and nv(inl.text) then table.insert(parts, nv(inl.text)) end
+        end
+        text = table.concat(parts)
+      end
+      if type(text) ~= "string" or text == "" then return end
+      local size = nv(el.size) or ""
+      local large = size == "large" or size == "extraLarge"
+      local bold = large or nv(el.weight) == "bolder"
+      local subtle = nv(el.isSubtle) == true
+      if large and #lines > 0 and lines[#lines] ~= "" then add("") end
+      for _, line in ipairs(vim.split(text:gsub("\r\n", "\n"), "\n", { plain = true })) do
+        if line == "" then
+          if #lines > 0 and lines[#lines] ~= "" then add("") end
+        else
+          local out = line
+          if bold and not out:match("^%*%*") then out = "**" .. out .. "**" end
+          if subtle and not bold then out = "_" .. out .. "_" end
+          add("  " .. out)
+        end
+      end
+      if large and #lines > 0 and lines[#lines] ~= "" then add("") end
+    end
+    local function add_image(url, alt)
+      url = nv(url)
+      if type(url) ~= "string" or url == "" or url:sub(1, 5) == "data:" then return end
+      table.insert(img_srcs, url)
+      local name = nv(alt)
+      if not name or name == "" then name = url:sub(1, 40) end
+      add(string.format("  [Image: %s - press gx to open]", name))
+    end
+    walk = function(items, depth)
+      if depth > 8 or type(items) ~= "table" then return end
+      for _, el in ipairs(items) do
+        if type(el) == "table" and el ~= vim.NIL then
+          local typ = nv(el.type) or ""
+          if typ == "TextBlock" or typ == "RichTextBlock" then
+            add_text(el)
+          elseif typ == "FactSet" then
+            for _, f in ipairs(nv(el.facts) or {}) do
+              if type(f) == "table" then
+                local name, value = nv(f.title), nv(f.value)
+                if name or value then
+                  add("  - **" .. tostring(name or "") .. "**: " .. tostring(value or ""))
+                end
+              end
+            end
+          elseif typ == "Image" then
+            add_image(nv(el.url), nv(el.altText))
+          elseif typ == "ActionSet" then
+            add_actions(nv(el.actions), depth + 1)
+          elseif typ == "Container" or typ == "Column" or typ == "ColumnSet" then
+            local bg = nv(el.backgroundImage)
+            if type(bg) == "table" then add_image(nv(bg.url), nil) end
+            walk(nv(el.items) or nv(el.columns), depth + 1)
+          elseif typ == "Table" then
+            walk(nv(el.rows), depth + 1)
+          elseif typ == "TableRow" then
+            walk(nv(el.cells), depth + 1)
+          elseif typ == "TableCell" then
+            walk(nv(el.items), depth + 1)
+          else
+            walk(nv(el.items) or nv(el.columns), depth + 1)
+          end
+        end
+      end
+    end
+    walk(nv(card.body), 0)
+    add_actions(nv(card.actions), 0)
+    local select = nv(card.selectAction)
+    if type(select) == "table" and nv(select.url) then
+      add("  [Open](" .. nv(select.url) .. ")")
+    end
+    return added
+  end
   local function render_attachments()
     if atts and type(atts) == "table" and #atts > 0 then
       for _, a in ipairs(atts) do
@@ -1574,6 +1692,11 @@ local function build_message_lines(m, chat)
           table.insert(lines, string.format("  [File: %s (%s) - press gx to open]", fname, host))
           rendered_file = true
         elseif ct == "messageReference" then goto ac
+        elseif ct == "application/vnd.microsoft.card.adaptive"
+            or ct:find("adaptive", 1, true) then
+          if not render_adaptive_card(nv(a.content)) then
+            table.insert(lines, "  [Attachment: " .. ct .. "]")
+          end
         else table.insert(lines, "  " .. string.format("[Attachment: %s]", ct)) end
         ::ac::
       end
@@ -2034,10 +2157,21 @@ function M.pick_chats()
       if c ~= vim.NIL and nv(c.id) and not hidden_set[nv(c.id)] then table.insert(filtered, c) end
     end
     chats = filtered
+    -- Teams' "Unread first" section sort: unread chats before read ones,
+    -- then most recent activity inside each group. Compute once so the
+    -- comparator does not hit the cache/unread heuristics repeatedly.
+    local sort_unread = {}
+    for _, c in ipairs(chats) do
+      local cid = nv(c.id)
+      if cid then sort_unread[cid] = has_unread(c) end
+    end
     table.sort(chats, function(a, b)
       -- pin 48:notes siempre arriba como en Teams
       if nv(a.id)=="48:notes" then return true end
       if nv(b.id)=="48:notes" then return false end
+      local au = sort_unread[nv(a.id)] == true
+      local bu = sort_unread[nv(b.id)] == true
+      if au ~= bu then return au end
       local ap = nv(a.lastMessagePreview) and nv(nv(a.lastMessagePreview).createdDateTime)
       local bp = nv(b.lastMessagePreview) and nv(nv(b.lastMessagePreview).createdDateTime)
       local al = ap or nv(a.lastUpdatedDateTime) or ""
@@ -2053,7 +2187,13 @@ function M.pick_chats()
     local display = {}
     local is_filtering = current_filter and current_filter ~= ""
     for _, c in ipairs(chats) do
-      local pass_unread = not show_unread_only or has_unread(c)
+      local pass_unread = true
+      if show_unread_only then
+        local cid = nv(c.id)
+        local u = cid and sort_unread[cid]
+        if u == nil then u = has_unread(c) end
+        pass_unread = u == true
+      end
       if pass_unread then table.insert(display, c) end
     end
     -- when filtering, prioritize self-chat (1 member) > oneOnOne > rest, then by recency
@@ -2085,7 +2225,14 @@ function M.pick_chats()
       display = t
     end
     local unread_by_id = {}
-    for _, c in ipairs(all_for_search) do if has_unread(c) then unread_by_id[nv(c.id)] = true end end
+    for _, c in ipairs(all_for_search) do
+      local cid = nv(c.id)
+      if cid then
+        local u = sort_unread[cid]
+        if u == nil then u = has_unread(c) end
+        if u then unread_by_id[cid] = true end
+      end
+    end
     -- channel unread: list_channels objects carry no preview/viewpoint. Prefer
     -- the paced latest-message probe state; when it is missing or stale, local
     -- evidence (last_read override + cached/open messages) still has to win,
@@ -2142,7 +2289,10 @@ function M.pick_chats()
       local lnum = #lines
       line_to_chat[lnum] = chat
       line_to_entry[lnum] = {type="chat", chat=chat}
-      if has_unread(chat) then unread_lines[lnum] = true end
+      local chat_cid = nv(chat.id)
+      local chat_unread = chat_cid and sort_unread[chat_cid]
+      if chat_unread == nil then chat_unread = has_unread(chat) end
+      if chat_unread then unread_lines[lnum] = true end
     end
     -- Teams section at bottom
     local sorted_teams = nil
@@ -2154,7 +2304,6 @@ function M.pick_chats()
       if teams_partial_reason then
         table.insert(lines, "  _" .. teams_partial_reason .. "_")
       end
-      local teams_header_lnum = #lines - 1
       sorted_teams = vim.deepcopy(teams_data)
       table.sort(sorted_teams, function(a,b) return (a.displayName or ""):lower() < (b.displayName or ""):lower() end)
       for _, team in ipairs(sorted_teams) do
@@ -2166,25 +2315,12 @@ function M.pick_chats()
             chat_by_chid[nv(c.id)] = c
           end
         end
-        local team_has_unread = false
-        -- first check via chats
-        for cid, ch_chat in pairs(chat_by_chid) do
-          if unread_by_id[cid] then team_has_unread = true; break end
-        end
-        -- also check channels_map entries via enrichment state (channel
-        -- objects from list_channels carry no preview/viewpoint data)
-        if not team_has_unread then
-          for _, ch in ipairs(channels) do
-            if ch ~= vim.NIL and channel_is_unread(nv(ch.id)) then team_has_unread = true; break end
-          end
-        end
         table.insert(lines, "## " .. clean(team.displayName) .. " (" .. #channels .. ")")
         if #channels == 0 and channels_error then
           table.insert(lines, "  _channels unavailable (throttled?) — press R to retry_")
         end
         local t_lnum = #lines
         line_to_entry[t_lnum] = {type="team", team=team}
-        if team_has_unread then unread_lines[t_lnum] = true end
         -- render individual channels under team (no indent, channel icon
         -- prefix like chats) with per-channel highlight
         table.sort(channels, function(a,b) return (nv(a.displayName) or ""):lower() < (nv(b.displayName) or ""):lower() end)
@@ -3082,6 +3218,7 @@ function M.update_chat_list_unread_state(chat_id, is_unread)
             end
           end
         end
+        pcall(vim.api.nvim_buf_set_var, b, "ms_teams_line_to_chat", line_to_chat)
       end
       -- Also update Teams section channel/team lines (channels are not in
       -- line_to_chat; their unread state lives in ms_teams_channel_unread)
@@ -3091,35 +3228,11 @@ function M.update_chat_list_unread_state(chat_id, is_unread)
         if not (ok_chan and type(chan_map) == "table") then chan_map = {} end
         chan_map[chat_id] = is_unread
         pcall(vim.api.nvim_buf_set_var, b, "ms_teams_channel_unread", chan_map)
-        local teams_seen = {}
         for lnum, e in pairs(line_to_entry) do
           if type(e) == "table" and e.type == "channel" and e.channel and nv(e.channel.id) == chat_id then
             vim.api.nvim_buf_clear_namespace(b, ns, lnum - 1, lnum)
             if is_unread then
               vim.api.nvim_buf_add_highlight(b, ns, hl_group, lnum - 1, 0, eol_col(b, lnum))
-            end
-            if e.team and nv(e.team.id) then teams_seen[nv(e.team.id)] = true end
-          end
-        end
-        -- recompute parent team headers: lit if any of their channels is unread
-        for tid, _ in pairs(teams_seen) do
-          for lnum, e in pairs(line_to_entry) do
-            if type(e) == "table" and e.type == "team" and e.team and nv(e.team.id) == tid then
-              local team_unread = false
-              for _, e2 in pairs(line_to_entry) do
-                if type(e2) == "table" and e2.team and nv(e2.team.id) == tid then
-                  if e2.type == "channel" and e2.channel then
-                    local cid2 = nv(e2.channel.id)
-                    if cid2 and chan_map[cid2] then team_unread = true; break end
-                  elseif e2.type == "chat" and e2.chat and nv(e2.chat.chatType) == "channel" then
-                    if has_unread(e2.chat) then team_unread = true; break end
-                  end
-                end
-              end
-              vim.api.nvim_buf_clear_namespace(b, ns, lnum - 1, lnum)
-              if team_unread then
-                vim.api.nvim_buf_add_highlight(b, ns, hl_group, lnum - 1, 0, eol_col(b, lnum))
-              end
             end
           end
         end
@@ -3138,6 +3251,7 @@ function M.update_chat_list_unread_state(chat_id, is_unread)
             end
           end
         end
+        pcall(vim.api.nvim_buf_set_var, b, "ms_teams_all_chats", all_chats)
       end
     end
   end
@@ -3159,6 +3273,20 @@ function M.update_chat_list_unread_state(chat_id, is_unread)
         end
       end
       if changed then pcall(cache.save, "chats", loaded) end
+    end
+  end
+  -- Unread-first ordering can move rows after mr/mu/watch updates. Repaint
+  -- the list in the background; request_render coalesces bursts.
+  for _, b in ipairs(vim.api.nvim_list_bufs()) do
+    if vim.api.nvim_buf_is_valid(b)
+        and vim.api.nvim_buf_get_name(b):find("ms%-teams://.*chats") then
+      local ok_all, all = pcall(vim.api.nvim_buf_get_var, b, "ms_teams_all_chats")
+      local ok_render, render = pcall(vim.api.nvim_buf_get_var, b, "ms_teams_render_and_bind")
+      if ok_all and type(all) == "table" and ok_render and type(render) == "function" then
+        vim.schedule(function()
+          if vim.api.nvim_buf_is_valid(b) then pcall(render, all, all, false) end
+        end)
+      end
     end
   end
 end
@@ -8236,14 +8364,9 @@ function M.pick_teams()
     for _, team in ipairs(sorted) do
       if count >= max_teams then break end
       local channels = channels_map[team.id] or {}
-      local team_has_unread = false
-      for _, ch in ipairs(channels) do
-        if ch ~= vim.NIL and channel_unread_teams(nv(ch.id)) then team_has_unread = true; break end
-      end
       table.insert(lines, "## " .. clean(team.displayName) .. " (" .. #channels .. ")")
       lnum = #lines
       line_map[lnum] = { type = "team", team = team }
-      if team_has_unread then unread_lines[lnum] = true end
       local channel_icon_teams = get_chat_type_icon({ chatType = "channel" })
       for _, ch in ipairs(channels) do
         if ch ~= vim.NIL and nv(ch.id) then

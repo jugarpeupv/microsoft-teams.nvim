@@ -73,6 +73,25 @@ function M.setup(opts)
   vim.api.nvim_create_user_command("MSTeamsWatchRestart", function() require("ms-teams.watch").restart() end, { desc = "Teams watch restart" })
   vim.api.nvim_create_user_command("MSTeamsDebugUnread", function(opts) ui.debug_unread_state(opts.args) end, { nargs = "?", desc = "Teams diagnose unread state across bufvars, disk cache and fresh fetch" })
 
+  -- ms-teams windows must be resizable horizontally even if another plugin /
+  -- session restored 'winfixwidth' for the markdown window.
+  local function clear_ms_teams_winfixwidth()
+    for _, win in ipairs(vim.api.nvim_list_wins()) do
+      if vim.api.nvim_win_is_valid(win) then
+        local b = vim.api.nvim_win_get_buf(win)
+        if vim.api.nvim_buf_is_valid(b)
+            and vim.api.nvim_buf_get_name(b):find("^ms%-teams://") then
+          pcall(vim.api.nvim_set_option_value, "winfixwidth", false, { win = win })
+        end
+      end
+    end
+  end
+  vim.api.nvim_create_autocmd({ "BufEnter", "BufWinEnter", "WinEnter", "VimEnter", "SessionLoadPost" }, {
+    group = vim.api.nvim_create_augroup("MsTeamsNoWinFixWidth", { clear = true }),
+    callback = clear_ms_teams_winfixwidth,
+  })
+  vim.schedule(clear_ms_teams_winfixwidth)
+
   -- autostart if configured: watch.enabled=true
   -- timer runs via vim.uv (vim.loop) -> sigue disparando aunque el foco esté en Chrome,
   -- mientras el proceso nvim siga vivo. No necesita focus.

@@ -109,6 +109,10 @@ local function any_contains(tbl, needle)
   for _, l in ipairs(tbl) do if l:find(needle, 1, true) then return true end end
   return false
 end
+local function any_prefix(tbl, prefix)
+  for _, l in ipairs(tbl) do if l:sub(1, #prefix) == prefix then return true end end
+  return false
+end
 
 ui.pick_chats()
 local chats_buf = vim.api.nvim_get_current_buf()
@@ -136,7 +140,7 @@ assert(chan_map[CH_SYSTEM] == false, "system-only channel was marked unread afte
 
 local hl = highlighted_lines(chats_buf)
 assert(any_contains(hl, "-General"), "unread channel not highlighted in chat list")
-assert(any_contains(hl, "Engineering Team"), "parent team not highlighted in chat list")
+assert(not any_prefix(hl, "## "), "team header highlighted in chat list")
 assert(any_contains(hl, "-ProbeOnly"), "probe-only unread channel not highlighted in chat list")
 assert(any_contains(hl, "-Variant"), "id-variant unread channel not highlighted in chat list")
 assert(not any_contains(hl, "SystemOnly"), "system-only channel highlighted in chat list")
@@ -149,7 +153,7 @@ assert(vim.wait(3000, function()
 end, 50), "teams list did not render in time")
 local thl = highlighted_lines(teams_buf)
 assert(any_contains(thl, "-General"), "unread channel not highlighted in :MSTeamsTeams")
-assert(any_contains(thl, "Engineering Team"), "parent team not highlighted in :MSTeamsTeams")
+assert(not any_prefix(thl, "## "), "team header highlighted in :MSTeamsTeams")
 assert(not any_contains(thl, "SystemOnly"), "system-only channel highlighted in :MSTeamsTeams")
 print("CHANNEL_UNREAD_OK")
 vim.fn.delete(tmp, "rf")
